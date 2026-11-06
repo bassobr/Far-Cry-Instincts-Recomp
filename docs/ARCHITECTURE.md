@@ -1,13 +1,66 @@
 # Architecture
 
-The result is a standalone 64-bit `FarCryInstincts.exe`. It contains the game's code, translated ahead of time
-into C++, and loads only the original game's data from `assets\` (the disc image or the extracted files).
+The result is a 64-bit `FarCryInstincts.exe` without any game code, and next to it `game_code\game_code.dll` with
+the game's code, translated ahead of time into C++. The executable loads only the original game's data from
+`assets\` (the disc image or the extracted files). The DLL is built from the player's own `default.xbe`: by the
+executable itself on its first start (a release), or by CMake (the developer build).
 
 ```
-assets\default.xbe ──► fci-recomp ──► generated\*.cpp ──┐
-                                                        ├──► FarCryInstincts.exe ◄── assets\ (levels, sound, video)
-src\runtime, src\kernel, src\xdk, src\gpu, ... ─────────┘
+assets\default.xbe ──► fci-recomp ──► *.cpp ──► clang ──► lld-link ──► game_code\game_code.dll
+                                                             ▲              │ fci_game_code (tables)
+                                  compiler\FarCryInstincts.lib              ▼
+src\runtime, src\kernel, src\xdk, src\gpu, ... ─────────────────────► FarCryInstincts.exe ◄── assets\ (levels, sound, video)
 ```
+
+### The interface between the executable and the DLL
+
+Declared in `src/runtime/guest.h`:
+
+- The DLL has exactly one export, `fci_game_code` (`rt::GameCode`): a version, the ABI hash, the hash of the XBE it
+  was translated from, the first-start build key, the table of recompiled functions, the table of originals
+  (`o_XXXXXXXX`, the recompiled bodies of the functions host code replaces), and pointers to its hot data.
+- The executable exports the runtime functions (`FCI_RT_API`) and the host replacements. The replacements are
+  declared in `hle_hooks.h`, which `fci-recomp --host-headers` writes from `config/hle.txt` without an XBE. It also
+  exports the C runtime functions the generated code calls (`memcpy`, `floor`, `_setjmp`, ...) from its own static
+  C runtime. The DLL links against the executable's import library, `compiler\FarCryInstincts.lib`.
+- The DLL has no C runtime of its own (`/NOENTRY /NODEFAULTLIB`, `/GS- /Zl`). It is compiled without the MSVC and
+  Windows SDK headers (`-nostdinc`), against the small headers in `src/runtime/freestanding/`; they declare the C
+  functions as the UCRT does, so clang still treats them as builtins and generates the same code.
+- What was inline before stays inline: memory accesses, the MMIO check and the flag helpers. The dispatch table of
+  indirect calls and the preemption flag live in the DLL, so the hot code reads them RIP-relative, as in a static
+  build. Apart from the stack cookies the generated machine code is the same as when it was linked into the
+  executable.
+- `FCI_ABI_HASH` is a SHA-256 over `guest.h`, the freestanding headers, the recompiler, the XBE loader, the
+  configuration and the compiler flags, computed by CMake (line endings do not matter). It is built into the
+  executable (`fci_abi.h`) and into the DLL. A DLL with another hash, another XBE hash or another build key is
+  stale and is built again; the relaunch between levels (`FCI_RELAUNCHED`) only loads it.
+
+### The first start
+
+`src/app/game_code.cpp` (adapted from SCDA-XBERecomp) builds the DLL when it is missing or stale, using the
+`compiler\` folder beside the executable:
+
+1. `compiler\fci-recomp.exe` translates the `default.xbe` it finds (extracted, or read from the `.iso`) with the
+   configuration in `compiler\config\`.
+2. `compiler\clang.exe` (LLVM 19.1.5) compiles the 130 files in parallel with the same flags and the same PGO profile
+   as the developer build (`compiler\config\game_code.profdata`). It runs one process per logical core, at most one
+   per 640 MB of free memory (a compiler peaks at about 340 MB), the largest files first, at below-normal priority,
+   in a job object, so closing the window or a crash ends the compilers too.
+3. `compiler\lld-link.exe` links the objects against `compiler\FarCryInstincts.lib`.
+
+A progress window shows the share done and the remaining time. A mutex keeps two starts from building at once.
+The work happens in `game_code\work\`. Finished objects are kept until the link, so an interrupted build continues
+on the next start. The folder is deleted after a successful build. The log is `game_code\build.log`, and a failure
+shows its last lines. Then the game starts. On a Ryzen 9 7950X3D (32 threads) the build takes about 41 s; on a
+Steam Deck OLED (Proton 10, 8 compilers) about 5.8 min. It needs about 1 GB of disk space while it runs and about
+60 MB afterwards.
+
+| Environment variable | Effect |
+|---|---|
+| `FCI_REBUILD_GAME_CODE=1` | builds the DLL again even when it is current |
+| `FCI_GAME_CODE_JOBS=<n>` | runs this many compilers at once |
+| `FCI_GAME_CODE_PARTITIONS=<n>` | splits the code into this many files instead of 128 (`fci-recomp --partitions`) |
+| `FCI_KEEP_GAME_CODE_BUILD=1` | keeps `game_code\work\` (sources, objects) after the build |
 
 ## 1. Recompiler (`tools/recomp`)
 
@@ -19,10 +72,11 @@ src\runtime, src\kernel, src\xdk, src\gpu, ... ─────────┘
    them. A report goes to `generated/analysis.txt`.
 3. **Symbols.** `config/symbols.txt` holds the addresses of the XDK 5849 library functions in this XBE, found
    offline with XbSymbolDatabase and converted by `tools/symbols.py`; `config/symbols_fci.txt` adds symbols found by
-   hand. The names become extra entry points and `SYM_<name>` constants for the host code (`generated/image_symbols.h`).
+   hand. The names become extra entry points and `SYM_<name>` constants for the host code (`image_symbols.h`,
+   written by `fci-recomp --host-headers` from the configuration alone).
 4. **Code generation.** Every function becomes a C++ function `void f_XXXXXXXX(Cpu& c)`; the semantics helpers are
-   in `src/runtime/guest.h`. The output is split into 128 files (`generated/code_NNN.cpp`) plus the dispatch table
-   (`generated/table.cpp`).
+   in `src/runtime/guest.h`. The output is split into 128 files (`generated/code_NNN.cpp`) plus the tables and the
+   DLL's export (`generated/table.cpp`).
    - The guest registers, the x87 stack and the XMM/MMX registers live in `Cpu`. Inside a function they are held in
      locals and written back only where control leaves it (calls, returns, tail jumps). Recompiled functions use
      clang's `preserve_none` convention.
@@ -35,7 +89,7 @@ src\runtime, src\kernel, src\xdk, src\gpu, ... ─────────┘
      they are handed over in `Cpu`.
    - Branches inside a function are `goto`, jump tables `switch`, jumps into other functions tail calls. Loop back
      edges are preemption points for the scheduler. Direct calls call `f_XXXXXXXX` directly, indirect ones go through
-     `rt::Call` and the table `rt::kFunctions`, kernel imports through `rt::KernelCall(ordinal)`.
+     `rt::CallIndirect` (the table lookup inline) or `rt::Call`, kernel imports through `rt::KernelCall(ordinal)`.
    - `lock` instructions and `xchg`, `xadd`, `cmpxchg` with a memory operand are atomic on the host.
    - The CRT's `_setjmp3`/`longjmp` (Lua's protected calls) get host landing points; `_ftol2` is emitted inline.
    - Instructions that cannot be translated become `rt::Unimplemented` (a run-time trap).

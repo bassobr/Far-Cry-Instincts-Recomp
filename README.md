@@ -1,9 +1,10 @@
 # Far Cry Instincts Recomp
 
 An unofficial native PC port of the original Xbox version of *Far Cry Instincts*, made by static recompilation. The
-game's x86 code is translated ahead of time into C++ and compiled into a standalone 64-bit Windows executable,
-`FarCryInstincts.exe`. The Xbox kernel, Direct3D 8 and DirectSound are reimplemented on Windows, with graphics on
-Direct3D 11. At run time the executable loads only the data of your own copy of the game.
+game's x86 code is translated ahead of time into C++ and compiled into native 64-bit Windows code. The Xbox kernel,
+Direct3D 8 and DirectSound are reimplemented on Windows, with graphics on Direct3D 11. `FarCryInstincts.exe`
+contains none of the game's code: on its first start it translates and compiles the code of your own copy of the
+game, once, into `game_code\game_code.dll`. At run time it loads only the data of your copy.
 
 This project follows the approach of, and adapts a large amount of code from,
 **[SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp)** by TGP482 and Joshhhuaaa. Many thanks to them, and to
@@ -12,8 +13,9 @@ the other open-source projects listed under [Credits](#credits).
 ## Legal
 
 - You need your own, legally obtained copy of the original Xbox game *Far Cry Instincts*.
-- Nothing from the game is included in this repository: no executable, no code, no data, no textures, no shaders.
-  The recompiled code is generated on your machine from your copy of `default.xbe` and is never committed.
+- Nothing from the game is included in this repository or in its releases: no executable, no code, no data, no
+  textures, no shaders. The recompiled code is generated on your machine from your copy of `default.xbe` and is
+  never committed or distributed.
 - The optional Far Cry (PC) water data is read at run time from your own installation and is never included or
   stored.
 - This project is not affiliated with or endorsed by Ubisoft, Crytek or Microsoft. All trademarks belong to their
@@ -53,10 +55,31 @@ the other open-source projects listed under [Credits](#credits).
 - Plays straight from the disc image (`.iso`); saves go to `data\hdd\` next to the executable
 - Steam Deck support (Proton) with its own default preset
 
+## Installation
+
+1. Download the latest release from the
+   [Releases page](https://github.com/bassobr/Far-Cry-Instincts-Recomp/releases) and unpack it into a folder of
+   your choice.
+2. Put your game into the `assets` folder of the release: its disc image (`.iso`), or the disc's extracted files
+   (`default.xbe` with the folders next to it). See [Providing the game](#providing-the-game).
+3. Run `FarCryInstincts.exe`.
+
+The first start compiles the game's code for your PC, once: the bundled recompiler and compiler (`compiler\`)
+translate your `default.xbe` into `game_code\game_code.dll` next to the executable. A window shows the progress.
+It takes about 1 minute on a current desktop PC and about 6 minutes on a Steam Deck, and needs about 1 GB of free
+disk space while it runs (60 MB afterwards). Later starts load the compiled code at once. If the build fails, a
+window shows the end of `game_code\build.log`. Settings can be changed in the menu on **F10** (controller:
+**Back + Start**) while the game runs.
+
+A release contains nothing from the game: the executable, Microsoft's `d3dcompiler_47.dll`, the `compiler\`
+folder (LLVM's `clang.exe` and `lld-link.exe`, the recompiler `fci-recomp.exe`, the executable's import library,
+headers and the recompiler's configuration with the PGO profile) and the documents. Each release has a
+`SHA256SUMS` file and a build provenance attestation (see [SECURITY.md](SECURITY.md)).
+
 ## Requirements
 
 **To play:** Windows 10 or 11 (64-bit), or Linux / Steam Deck with Proton; a GPU with Direct3D 11 (feature level
-11_0).
+11_0); about 1 GB of free disk space for the first start.
 
 **To build:**
 - Visual Studio 2022 or the Build Tools for Visual Studio 2022 with *Desktop development with C++*, the *C++ Clang
@@ -66,8 +89,9 @@ the other open-source projects listed under [Credits](#credits).
 
 ## Providing the game
 
-Put the game into a folder named `assets` in the repository root. Building needs the extracted `default.xbe`;
-playing works from either form:
+Put the game into a folder named `assets`: next to `FarCryInstincts.exe` for a release, in the repository root for
+a build from source. A release works from either form; building from source with `build.bat` needs the extracted
+`default.xbe`:
 
 - **Extracted files:** `default.xbe` with the disc's folders and files next to it in `assets\`. The included helper
   extracts a disc image:
@@ -87,16 +111,20 @@ playing works from either form:
 The executable looks for `assets\` next to itself and in the folders above it, so the build output finds the
 repository's `assets\` folder.
 
-## Building
+## Building from source
 
 ```
 build.bat
 ```
 
 `build.bat` sets up the Visual Studio environment, builds the recompiler `fci-recomp`, translates
-`assets\default.xbe` into `generated\` (128 C++ files, about 200 MB) and compiles everything into
-`out\build\release\FarCryInstincts.exe`. It also copies Microsoft's `d3dcompiler_47.dll` from the Windows SDK next to
-the executable. Other presets: `build.bat debug`, `build.bat precise` (exact guest state at faults, slower).
+`assets\default.xbe` into `generated\` (128 C++ files, about 350 MB) and compiles the result into
+`out\build\release\game_code\game_code.dll`. It also builds `out\build\release\FarCryInstincts.exe` (the runtime alone,
+about 7 MB, no game code) and the `compiler\` folder next to it (recompiler, the executable's import library, headers,
+configuration: the layout of a release), and copies Microsoft's `d3dcompiler_47.dll` from the Windows SDK next to the
+executable. Without `assets\default.xbe` only the executable is built, and it compiles the game code on its first
+start like a release, once LLVM's `clang.exe` and `lld-link.exe` are in its `compiler\` folder (see below). Other
+presets: `build.bat debug`, `build.bat precise` (exact guest state at faults, slower).
 
 To check the recompiler's instruction semantics against the host CPU:
 
@@ -105,9 +133,25 @@ out\build\release\fci-semtest.exe
 ```
 
 `build.bat tools` builds only `fci-recomp` and `fci-semtest` into `out\build\tools\`, without the game; it needs no
-`assets\` folder. CI builds this preset and runs the semantics test, without any game files. Releases never contain
-the game, its recompiled code or an executable built from it: `FarCryInstincts.exe` is always built from your own
-`default.xbe`.
+`assets\` folder.
+
+### Release folder
+
+CI builds the release without any game files (`.github/workflows/release.yml`), with the official LLVM 19.1.5
+release that the release also bundles:
+
+```
+powershell -File tools\get_llvm.ps1 -Out C:\llvm
+cmake --preset release -DCMAKE_C_COMPILER=C:/llvm/bin/clang-cl.exe -DCMAKE_CXX_COMPILER=C:/llvm/bin/clang-cl.exe ^
+      -DCMAKE_LINKER=C:/llvm/bin/lld-link.exe -DCMAKE_MT=C:/llvm/bin/llvm-mt.exe -DFCI_LLVM_DIR=C:/llvm
+cmake --build --preset release --target dist
+```
+
+Run this from a Visual Studio developer prompt (x64). `tools\get_llvm.ps1` downloads LLVM and checks it against a
+pinned SHA-256. The `dist` target runs `tools\dist.ps1 -Llvm C:\llvm -Zip`, which assembles
+`out\dist\FarCryInstincts-Recomp-v<VERSION>-win64\` and its zip with `SHA256SUMS`, and refuses anything that comes
+from the game (`game_code\`, generated sources, objects, PDBs, `.xbe`/`.iso`, shaders, an executable containing
+recompiled functions). The bundled clang must have the major version that wrote `config\game_code.profdata` (19).
 
 ### PGO profile
 
@@ -119,9 +163,10 @@ exists. The profile belongs to one version of the generated code. After a change
 powershell -File tools\pgo.ps1
 ```
 
-The script builds the instrumented preset `pgo-gen`, plays a scripted single-player run for 250 seconds and merges
-the counters into `config\game_code.profdata`. A stale profile is not an error: functions whose code changed are
-compiled without profile data (correct, only slower).
+The script builds the instrumented preset `pgo-gen` (only the DLL is instrumented; it brings its own C runtime for
+that), plays a scripted single-player run for 250 seconds and merges the counters into `config\game_code.profdata`.
+A stale profile is not an error: functions whose code changed are compiled without profile data (correct, only
+slower).
 
 | CMake option | Effect |
 |---|---|
@@ -131,9 +176,9 @@ compiled without profile data (correct, only slower).
 
 ## Running
 
-Run `out\build\release\FarCryInstincts.exe`. To use it elsewhere, copy `FarCryInstincts.exe` and
-`d3dcompiler_47.dll` and put an `assets` folder with the game next to them (or above them). The log is written to
-`fci.log` next to the executable; `FCI_CONSOLE=1` opens a console window for it.
+Run `out\build\release\FarCryInstincts.exe`. To use a build from source elsewhere, copy `FarCryInstincts.exe`,
+`d3dcompiler_47.dll` and the `game_code\` folder and put an `assets` folder with the game next to them (or above
+them). The log is written to `fci.log` next to the executable; `FCI_CONSOLE=1` opens a console window for it.
 
 **Default keyboard and mouse controls (player 1):** WASD move, mouse look (click into the window to capture the
 mouse), right / left mouse button = left / right trigger, Space = A, C = B, E = X, Q = Y, F = White, G = Black,
@@ -224,11 +269,12 @@ fc1_path = D:\Games\Far Cry
 ## Steam Deck and Linux (Proton)
 
 The Windows executable runs under Proton (tested with Proton 10.0 on a Steam Deck OLED). It needs
-`d3dcompiler_47.dll` next to it (the build copies it there; Wine's own HLSL compiler cannot handle everything the
-renderer generates) and the `assets` folder next to it or above it.
+`d3dcompiler_47.dll` next to it (the release has it; Wine's own HLSL compiler cannot handle everything the renderer
+generates) and the `assets` folder next to it or above it. The first start compiles the game code under Proton too
+(about 6 minutes on the Deck).
 
-1. Copy a folder to the Deck, for example `~/Games/FarCryInstincts/` with `FarCryInstincts.exe`,
-   `d3dcompiler_47.dll` and `assets/` (the `.iso` alone is enough).
+1. Copy the unpacked release folder to the Deck, for example as `~/Games/FarCryInstincts/`, with the game in
+   `assets/` (the `.iso` alone is enough).
 2. In Desktop Mode, add the executable to Steam with *Add a Non-Steam Game*.
 3. Under *Properties → Compatibility*, force Proton 10.0 or newer.
 4. Start it in Game Mode. The built-in controls are detected through SDL3 (use the *Gamepad* Steam Input layout),
@@ -249,7 +295,8 @@ code. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Known issues
 
-- Building needs the extracted `default.xbe`; the disc image alone is enough only for playing.
+- Building from source with `build.bat` needs the extracted `default.xbe`; a release (and its first start) works from
+  the disc image alone.
 - Display mode, monitor, resolution, render scale, MSAA, anisotropic filtering, shadow resolution, HDR on/off and
   a few other settings take effect after a restart.
 - With background shader compilation (`shader_async = 1`), an object may be missing for one to three frames the
