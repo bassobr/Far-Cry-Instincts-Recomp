@@ -71,13 +71,14 @@ jobs:
           sha256sum -c SHA256SUMS
           ZIP="FarCryInstincts-Recomp-${GITHUB_REF_NAME}-win64.zip"
           unzip -Z1 "$ZIP"
-          for f in FarCryInstincts.exe d3dcompiler_47.dll compiler/clang.exe compiler/lld-link.exe compiler/fci-recomp.exe \
+          for f in FarCryInstincts.exe compiler/clang.exe compiler/lld-link.exe compiler/fci-recomp.exe \
                    compiler/FarCryInstincts.lib compiler/LLVM-LICENSE.txt assets/README.txt LICENSE THIRD_PARTY_NOTICES.md; do
             unzip -Z1 "$ZIP" | grep -qx "[^/]*/$f" || { echo "missing $f" >&2; exit 1; }
           done
-          # the executable and the profile are expected; game code, generated sources and game files are not
-          if unzip -Z1 "$ZIP" | grep -iE 'game_code\.dll|game_code/|generated/|work/|\.(xbe|iso|xiso|cpp|obj|pdb|profraw|hlsl|dds|png|bmp|pak)$'; then
-            echo "game code, game files or files derived from the game in the package" >&2; exit 1
+          # the executable and the profile are expected; game code, generated sources, game files and DLLs are not
+          # (d3dcompiler_47.dll is the system's: Windows' own, Proton's builtin)
+          if unzip -Z1 "$ZIP" | grep -iE '\.dll$|game_code/|generated/|work/|\.(xbe|iso|xiso|cpp|obj|pdb|profraw|hlsl|dds|png|bmp|pak)$'; then
+            echo "game code, game files, files derived from the game or a DLL in the package" >&2; exit 1
           fi
           # an executable with the game code linked in names its recompiled functions (f_/o_<guest address>)
           if unzip -p "$ZIP" '*/FarCryInstincts.exe' | grep -qaE '\?[fo]_[0-9A-F]{8}@@'; then

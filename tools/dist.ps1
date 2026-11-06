@@ -4,6 +4,7 @@
 #   powershell -File tools\dist.ps1 -Llvm C:\llvm [-Build out\build\release] [-Out out\dist] [-Zip]
 # -Build is a build of the release preset (with or without assets\default.xbe: game_code\ is never packed).
 # Refuses anything game-derived: no game_code.dll, no generated code, no shader cache, no xbe/iso.
+# Packs no DLL at all: the HLSL compiler d3dcompiler_47.dll is the system's (Windows 8.1 and later, Proton's builtin).
 param(
     [Parameter(Mandatory = $true)][string]$Llvm,   # tools\get_llvm.ps1's -Out: bin\clang.exe, bin\lld-link.exe, LICENSE.TXT
     [string]$Build = "",
@@ -25,7 +26,6 @@ $compiler = Join-Path $Build "compiler"
 # what goes into the release, nothing else: destination (relative to the release folder) -> source
 $files = [ordered]@{
     "FarCryInstincts.exe"                   = Join-Path $Build "FarCryInstincts.exe"
-    "d3dcompiler_47.dll"                    = Join-Path $Build "d3dcompiler_47.dll"
     "compiler\clang.exe"                    = Join-Path $Llvm "bin\clang.exe"
     "compiler\lld-link.exe"                 = Join-Path $Llvm "bin\lld-link.exe"
     "compiler\LLVM-LICENSE.txt"             = Join-Path $Llvm "LICENSE.TXT"
@@ -77,7 +77,7 @@ $assetsNote = "Put the game here: its disc image (.iso), or the disc's extracted
 $forbidden = Get-ChildItem -LiteralPath $stage -Recurse -Force | Where-Object {
     $_.Name -match '^(game_code|generated|work|shader_cache|textures|data|asset_fc1)$' -or
     $_.Name -match '\.(xbe|iso|xiso|profraw|hlsl|dds|png|bmp|pak|pdb|obj|dll\.tmp)$' -or
-    ($_.Name -match '\.dll$' -and $_.Name -ne "d3dcompiler_47.dll") -or
+    $_.Name -match '\.dll$' -or
     ($_.Name -match '\.cpp$') -or
     ($_.Name -eq "funcs.h")
 }

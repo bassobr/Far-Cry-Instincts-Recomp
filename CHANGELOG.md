@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.1 (2026-11-06)
+
+- The release no longer contains Microsoft's `d3dcompiler_47.dll`. The game uses the system's HLSL compiler: the
+  copy in `System32` on Windows (8.1, 10, 11), Proton's builtin one (vkd3d-shader) on the Steam Deck and Linux.
+- Proton's compiler lacks `EvaluateAttributeCentroid`, which the pixel shaders of W-buffered draws (with polygon
+  offset) used; they now get the centroid depth through a `centroid` input instead, the same value on every
+  compiler. All shaders compile under Proton 10 without Microsoft's DLL.
+- If a shader still fails to compile (another Proton version, for example), the game shows a message box once per run
+  and goes on; under Proton it explains how to install Microsoft's compiler with protontricks
+  (`protontricks <id> d3dcompiler_47`, also in the README).
+- Proton's compiler needs no setup but is a little slower: its shaders cost the Steam Deck's GPU about 3 % more in
+  single player and 8 % in split screen (about 69 instead of 76 fps), and it compiles shaders about 3.4 times slower.
+  Installing Microsoft's compiler into the game's Proton prefix with protontricks gets that back (README, Steam Deck).
+- Shaders are compiled once more after the update (their source changed, so the shader cache gets new entries).
+
 ## 0.1.0 (2026-11-06)
 
 - First release. `FarCryInstincts.exe` contains no game code: on the first start it translates the player's own

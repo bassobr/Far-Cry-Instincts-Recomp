@@ -71,10 +71,11 @@ disk space while it runs (60 MB afterwards). Later starts load the compiled code
 window shows the end of `game_code\build.log`. Settings can be changed in the menu on **F10** (controller:
 **Back + Start**) while the game runs.
 
-A release contains nothing from the game: the executable, Microsoft's `d3dcompiler_47.dll`, the `compiler\`
-folder (LLVM's `clang.exe` and `lld-link.exe`, the recompiler `fci-recomp.exe`, the executable's import library,
-headers and the recompiler's configuration with the PGO profile) and the documents. Each release has a
-`SHA256SUMS` file and a build provenance attestation (see [SECURITY.md](SECURITY.md)).
+A release contains nothing from the game: the executable, the `compiler\` folder (LLVM's `clang.exe` and
+`lld-link.exe`, the recompiler `fci-recomp.exe`, the executable's import library, headers and the recompiler's
+configuration with the PGO profile) and the documents. The HLSL compiler (`d3dcompiler_47.dll`) is the system's:
+Windows 8.1, 10 and 11 have it in `System32`, Proton has its own. Each release has a `SHA256SUMS` file and a build
+provenance attestation (see [SECURITY.md](SECURITY.md)).
 
 ## Requirements
 
@@ -122,9 +123,10 @@ build.bat
 `out\build\release\game_code\game_code.dll`. It also builds `out\build\release\FarCryInstincts.exe` (the runtime alone,
 about 7 MB, no game code) and the `compiler\` folder next to it (recompiler, the executable's import library, headers,
 configuration: the layout of a release), and copies Microsoft's `d3dcompiler_47.dll` from the Windows SDK next to the
-executable. Without `assets\default.xbe` only the executable is built, and it compiles the game code on its first
-start like a release, once LLVM's `clang.exe` and `lld-link.exe` are in its `compiler\` folder (see below). Other
-presets: `build.bat debug`, `build.bat precise` (exact guest state at faults, slower).
+executable (for local tests; a release does not ship it). Without `assets\default.xbe` only the executable is built,
+and it compiles the game code on its first start like a release, once LLVM's `clang.exe` and `lld-link.exe` are in its
+`compiler\` folder (see below). Other presets: `build.bat debug`, `build.bat precise` (exact guest state at faults,
+slower).
 
 To check the recompiler's instruction semantics against the host CPU:
 
@@ -176,9 +178,8 @@ slower).
 
 ## Running
 
-Run `out\build\release\FarCryInstincts.exe`. To use a build from source elsewhere, copy `FarCryInstincts.exe`,
-`d3dcompiler_47.dll` and the `game_code\` folder and put an `assets` folder with the game next to them (or above
-them). The log is written to `fci.log` next to the executable; `FCI_CONSOLE=1` opens a console window for it.
+Run `out\build\release\FarCryInstincts.exe`. To use a build from source elsewhere, copy `FarCryInstincts.exe` and the
+`game_code\` folder and put an `assets` folder with the game next to them (or above them). The log is written to `fci.log` next to the executable; `FCI_CONSOLE=1` opens a console window for it.
 
 **Default keyboard and mouse controls (player 1):** WASD move, mouse look (click into the window to capture the
 mouse), right / left mouse button = left / right trigger, Space = A, C = B, E = X, Q = Y, F = White, G = Black,
@@ -268,9 +269,9 @@ fc1_path = D:\Games\Far Cry
 
 ## Steam Deck and Linux (Proton)
 
-The Windows executable runs under Proton (tested with Proton 10.0 on a Steam Deck OLED). It needs
-`d3dcompiler_47.dll` next to it (the release has it; Wine's own HLSL compiler cannot handle everything the renderer
-generates) and the `assets` folder next to it or above it. The first start compiles the game code under Proton too
+The Windows executable runs under Proton (tested with Proton 10.0 on a Steam Deck OLED). It needs the `assets` folder
+next to it or above it. Shaders are compiled by Proton's own HLSL compiler (its builtin `d3dcompiler_47`, based on
+vkd3d-shader); nothing has to be installed for it. The first start compiles the game code under Proton too
 (about 6 minutes on the Deck).
 
 1. Copy the unpacked release folder to the Deck, for example as `~/Games/FarCryInstincts/`, with the game in
@@ -279,6 +280,28 @@ generates) and the `assets` folder next to it or above it. The first start compi
 3. Under *Properties → Compatibility*, force Proton 10.0 or newer.
 4. Start it in Game Mode. The built-in controls are detected through SDL3 (use the *Gamepad* Steam Input layout),
    and the game uses the display's native mode (1280x800, 90 Hz on the OLED model, 60 Hz on the LCD model).
+
+**Better performance with Microsoft's HLSL compiler (optional).** Proton's compiler works, but its shaders are a
+little slower on the GPU, and it compiles shaders about 3.4 times slower (the first time each shader is needed;
+afterwards it comes from the shader cache). Measured on a Steam Deck OLED (Proton 10, Steam Deck defaults, shader
+cache filled):
+
+| Proton's builtin compiler vs Microsoft's | builtin | Microsoft's |
+|---|---|---|
+| single player, 90 fps limit: fps / 1 % low | 88.5–88.7 / 72.6–73.6 (cold cache) | 88.8–88.9 / 73.4–73.7 (cold cache) |
+| single player, no fps limit: fps / GPU ms per frame | 103.8 / 9.64 | 106.8 / 9.36 |
+| split screen (two players): fps / GPU ms per frame | 67.7–69.4 / 14.5–14.9 | 74.1–77.1 / 13.0–13.6 |
+| ambient occlusion pass, split screen: GPU ms | 4.0 | 3.5–3.7 |
+
+At the Deck's 90 fps limit single player plays the same; split screen gains about 10 %. To use Microsoft's compiler,
+install it into the game's Proton prefix with [protontricks](https://github.com/Matoking/protontricks) (on the Deck
+from Discover, as a Flatpak): `protontricks -l` lists the games with their app IDs (a non-Steam shortcut appears as
+`Non-Steam shortcut: FarCryInstincts.exe (<id>)`), then `protontricks <id> d3dcompiler_47` installs it. The log's
+`render: HLSL compiler …` line names the compiler in use.
+
+If a shader fails to compile (an older or different Proton whose HLSL compiler lacks something), the game shows a
+message box once and goes on; objects may be invisible and `fci.log` shows `compile failed`. The same protontricks
+step fixes it.
 
 On a Steam Deck (detected from the firmware's board and product names, or `SteamDeck=1`) some defaults change:
 `ao = gtao`, `shadow_scale = 4`, `frame_queue = 2`, `lod_distance = 1`, `view_distance = 1`. Values set in the ini

@@ -13,7 +13,6 @@ licences and copyright notices follow. Licence headers inside individual source 
 | [Zydis](https://github.com/zyantific/zydis) v4.1.1 | MIT | x86 decoder; fetched by CMake and linked into `fci-recomp` and `fci-semtest` |
 | [Zycore](https://github.com/zyantific/zycore-c) (Zydis dependency) | MIT | Support library of Zydis, linked with it |
 | [LLVM](https://llvm.org) 19.1.5 | Apache-2.0 WITH LLVM-exception | The official release's `clang.exe` and `lld-link.exe`, unmodified, bundled in a release's `compiler\` folder; they build the game code on the player's PC |
-| `d3dcompiler_47.dll` (Microsoft) | Windows SDK licence terms (Distributable Code) | Microsoft's HLSL compiler from the Windows SDK, unmodified, next to the executable |
 
 ## SCDA-XBERecomp
 
@@ -523,15 +522,9 @@ SOFTWARE.
 
 ## d3dcompiler_47.dll
 
-Microsoft's HLSL compiler, copyright Microsoft Corporation, is shipped unmodified next to the executable. It is not
-covered by this project's licence. Microsoft lists it as Distributable Code of the Windows SDK that may be
-redistributed with classic Windows applications (https://learn.microsoft.com/en-us/legal/windows-sdk/redist), under
-the Microsoft Software License Terms for the Windows SDK. Among other things, those terms allow distributing the
-file only unmodified and as part of a program that adds significant primary functionality to it, with Microsoft's
-copyright notices intact, without using Microsoft's trademarks for the program, and only to run on a Microsoft
-operating system; distributors and end users must agree to terms that protect it at least as much as those terms.
-The full terms come with the Windows SDK (`Windows Kits\10\Licenses\<version>\sdk_license.rtf`). Use the copy in a
-release only under them.
+No copy is shipped. The executable uses the system's HLSL compiler `d3dcompiler_47.dll`: on Windows the one in
+`System32` (part of Windows 8.1, 10 and 11), under Proton or Wine their builtin one (vkd3d-shader). Microsoft's
+compiler is not covered by this project's licence.
 
 ## References (no code included)
 
