@@ -1,10 +1,14 @@
 // fci-recomp: translates the x86 code of Far Cry Instincts' default.xbe into C++.
 //   fci-recomp <default.xbe> <output dir> [config dir]
 //   fci-recomp --semtest <file.cpp>   only the instruction semantics test (tools/semtest), no XBE needed
+//   fci-recomp --host-headers <config dir> <output dir>   only what the executable compiles against, no XBE
 // The config dir holds symbols.txt (XDK symbols, tools/symbols.py), symbols_fci.txt (found by hand) and
 // hle.txt (the symbols host code replaces, one name per line).
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <fstream>
 #include <sstream>
 
@@ -65,10 +69,28 @@ bool LoadHooks(const std::filesystem::path& path) {
 
 }  // namespace
 
+bool LoadConfig(const std::filesystem::path& config) {
+    if (!LoadSymbols(config / "symbols.txt")) std::fprintf(stderr, "warning: no %s\n", (config / "symbols.txt").string().c_str());
+    LoadSymbols(config / "symbols_fci.txt");
+    if (std::filesystem::exists(config / "hle.txt") && !LoadHooks(config / "hle.txt")) return false;
+    std::printf("%zu symbols, %zu host replacements\n", recomp::Symbols().size(), recomp::Hooks().size());
+    return true;
+}
+
 int main(int argc, char** argv) {
+    // --partitions N anywhere: the number of code_NNN.cpp files (default 128, CMakeLists.txt's FCI_PARTITIONS)
+    int partitions = kPartitions;
+    for (int i = 1; i + 1 < argc; i++)
+        if (std::string(argv[i]) == "--partitions") {
+            partitions = std::max(1, std::atoi(argv[i + 1]));
+            for (int k = i; k + 2 < argc; k++) argv[k] = argv[k + 2];
+            argc -= 2;
+            break;
+        }
     if (argc < 3) {
-        std::fprintf(stderr, "usage: fci-recomp <default.xbe> <output dir> [config dir]\n"
-                             "       fci-recomp --semtest <file.cpp>\n");
+        std::fprintf(stderr, "usage: fci-recomp <default.xbe> <output dir> [config dir] [--partitions N]\n"
+                             "       fci-recomp --semtest <file.cpp>\n"
+                             "       fci-recomp --host-headers <config dir> <output dir>\n");
         return 1;
     }
     // the test cases are fixed instructions (semtest.cpp), translated without a program around them
@@ -77,6 +99,12 @@ int main(int argc, char** argv) {
         recomp::Analysis analysis(image, {});
         recomp::Codegen codegen(image, analysis);
         return recomp::WriteSemanticsTest(codegen, argv[2]) > 0 ? 0 : 1;
+    }
+    // what the executable is compiled against, from the configuration alone (CI builds it without game files)
+    if (std::string(argv[1]) == "--host-headers") {
+        if (argc < 4 || !LoadConfig(argv[2])) return 1;
+        recomp::WriteHostHeaders(argv[3]);
+        return 0;
     }
     xbe::Image image;
     std::string error;
@@ -90,13 +118,7 @@ int main(int argc, char** argv) {
     std::filesystem::path out = argv[2];
     std::filesystem::create_directories(out);
 
-    if (argc > 3) {
-        std::filesystem::path config = argv[3];
-        if (!LoadSymbols(config / "symbols.txt")) std::fprintf(stderr, "warning: no %s\n", (config / "symbols.txt").string().c_str());
-        LoadSymbols(config / "symbols_fci.txt");
-        if (std::filesystem::exists(config / "hle.txt") && !LoadHooks(config / "hle.txt")) return 1;
-        std::printf("%zu symbols, %zu host replacements\n", recomp::Symbols().size(), recomp::Hooks().size());
-    }
+    if (argc > 3 && !LoadConfig(argv[3])) return 1;
 
     recomp::Analysis analysis(image, kCodeSections);
     for (const auto& [name, sym] : recomp::Symbols())
@@ -108,10 +130,10 @@ int main(int argc, char** argv) {
                 (out / "analysis.txt").string().c_str());
 
     recomp::Codegen codegen(image, analysis);
-    codegen.Write(out, kPartitions);
+    codegen.Write(out, partitions, image.content_hash);
     size_t traps = 0;
     for (const auto& [mn, n] : codegen.unimplemented) traps += n;
-    std::printf("C++ written to %s (%d files), %zu instructions emitted as traps:\n", out.string().c_str(), kPartitions,
+    std::printf("C++ written to %s (%d files), %zu instructions emitted as traps:\n", out.string().c_str(), partitions,
                 traps);
     for (const auto& [mn, n] : codegen.unimplemented) std::printf("  %-12s %zu\n", mn.c_str(), n);
 

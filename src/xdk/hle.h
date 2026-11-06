@@ -1,5 +1,6 @@
 // Host implementations of XDK library functions (HLE). A function named in config/hle.txt is replaced: the
-// recompiler emits f_<address> as a call to hle::<name> and keeps the recompiled body as o_<address>.
+// recompiler emits f_<address> as a call to hle::<name> (exported by the executable, hle_hooks.h) and keeps the
+// recompiled body as o_<address> in the game code DLL.
 // The macros follow SCDA-XBERecomp's (MIT, TGP482 and Joshhhuaaa) so its code ports with few changes.
 #pragma once
 
@@ -8,18 +9,19 @@
 #include <functional>
 #include <initializer_list>
 
-#include "funcs.h"
+#include "hle/original.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
 #include "runtime/guest.h"
 #include "runtime/log.h"
+#include "runtime/runtime.h"
 #include "runtime/thread.h"
 
 #define XDK_CAT_(a, b) a##b
 #define XDK_CAT(a, b) XDK_CAT_(a, b)
 #define SYM(name) XDK_CAT(0x, SYM_##name)           // address of a symbol of config/symbols*.txt
-#define GUEST(name) XDK_CAT(f_, SYM_##name)          // the function as the guest calls it (a host one if replaced)
-#define GUEST_ORIG(name) XDK_CAT(o_, SYM_##name)     // the recompiled body of a replaced function
+#define GUEST(name) (::rt::Lookup(SYM(name)))        // the function as the guest calls it (a host one if replaced)
+#define GUEST_ORIG(name) GUEST_ORIG_AT(SYM(name))   // the recompiled body of a replaced function
 
 #include "xdk/xdk.h"
 

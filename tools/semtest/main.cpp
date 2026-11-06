@@ -44,8 +44,6 @@ void FSave(Cpu& FCI_NOESCAPE, uint32_t) {}
 void FRestore(Cpu& FCI_NOESCAPE, uint32_t) {}
 void SetMxcsr(Cpu& FCI_NOESCAPE c, uint32_t v) { c.mxcsr = v; }
 int32_t CvtToInt(const Cpu& FCI_NOESCAPE c, float v) { return FToInt<int32_t>(std::nearbyint(double(v))); }
-const FunctionEntry kFunctions[1] = {};
-const size_t kFunctionCount = 0;
 }  // namespace rt
 
 namespace {

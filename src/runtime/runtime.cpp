@@ -16,31 +16,78 @@
 #include "runtime/runtime.h"
 #include "runtime/thread.h"
 
+// The C runtime functions the game code DLL calls (it links without one, see runtime/freestanding): the executable's
+// own static C runtime, exported by name. The generated setjmp and the longjmp in Call below are thus one
+// implementation, and the math the same code as when the game code was linked into the executable.
+#pragma comment(linker, "/EXPORT:_setjmp")
+#pragma comment(linker, "/EXPORT:memcpy")
+#pragma comment(linker, "/EXPORT:memmove")
+#pragma comment(linker, "/EXPORT:memset")
+#pragma comment(linker, "/EXPORT:memcmp")
+#pragma comment(linker, "/EXPORT:sqrt")
+#pragma comment(linker, "/EXPORT:sqrtf")
+#pragma comment(linker, "/EXPORT:sin")
+#pragma comment(linker, "/EXPORT:sinf")
+#pragma comment(linker, "/EXPORT:cos")
+#pragma comment(linker, "/EXPORT:cosf")
+#pragma comment(linker, "/EXPORT:tan")
+#pragma comment(linker, "/EXPORT:tanf")
+#pragma comment(linker, "/EXPORT:atan")
+#pragma comment(linker, "/EXPORT:atan2")
+#pragma comment(linker, "/EXPORT:atan2f")
+#pragma comment(linker, "/EXPORT:exp")
+#pragma comment(linker, "/EXPORT:exp2")
+#pragma comment(linker, "/EXPORT:log")
+#pragma comment(linker, "/EXPORT:log2")
+#pragma comment(linker, "/EXPORT:log10")
+#pragma comment(linker, "/EXPORT:pow")
+#pragma comment(linker, "/EXPORT:floor")
+#pragma comment(linker, "/EXPORT:floorf")
+#pragma comment(linker, "/EXPORT:ceil")
+#pragma comment(linker, "/EXPORT:ceilf")
+#pragma comment(linker, "/EXPORT:trunc")
+#pragma comment(linker, "/EXPORT:truncf")
+#pragma comment(linker, "/EXPORT:round")
+#pragma comment(linker, "/EXPORT:nearbyint")
+#pragma comment(linker, "/EXPORT:nearbyintf")
+#pragma comment(linker, "/EXPORT:rint")
+#pragma comment(linker, "/EXPORT:fmod")
+#pragma comment(linker, "/EXPORT:fmodf")
+#pragma comment(linker, "/EXPORT:remainder")
+#pragma comment(linker, "/EXPORT:ldexp")
+#pragma comment(linker, "/EXPORT:frexp")
+#pragma comment(linker, "/EXPORT:__chkstk")
+
 namespace rt {
 
 namespace {
 
-std::vector<GuestFunction> g_table;  // indexed by guest address - g_dispatch_base
+std::vector<GuestFunction> g_table;  // indexed by guest address - g_base
+uint32_t g_base = 0;
+volatile int g_preempt_stand_in = 0;
 
 }  // namespace
 
-DispatchEntry const* g_dispatch = nullptr;
-uint32_t g_dispatch_base = 0, g_dispatch_size = 0;
+volatile int* g_preempt_flag = &g_preempt_stand_in;
 
-void InitDispatch(uint32_t image_base, uint32_t image_size) {
+void InitDispatch(const GameCode& code, uint32_t image_base, uint32_t image_size) {
     g_table.assign(image_size, nullptr);
-    for (size_t i = 0; i < kFunctionCount; i++) {
-        uint32_t a = kFunctions[i].address;
-        if (a >= image_base && a - image_base < image_size) g_table[a - image_base] = kFunctions[i].function;
+    for (uint32_t i = 0; i < code.function_count; i++) {
+        uint32_t a = code.functions[i].address;
+        if (a >= image_base && a - image_base < image_size) g_table[a - image_base] = code.functions[i].function;
     }
-    g_dispatch = g_table.data();
-    g_dispatch_base = image_base;
-    g_dispatch_size = image_size;
-    Log("dispatch: %zu functions", kFunctionCount);
+    g_base = image_base;
+    // the generated code reads the DLL's copies
+    *code.dispatch = g_table.data();
+    *code.dispatch_base = image_base;
+    *code.dispatch_size = image_size;
+    *code.preempt = *g_preempt_flag;
+    g_preempt_flag = code.preempt;
+    Log("dispatch: %u functions", code.function_count);
 }
 
 GuestFunction Lookup(uint32_t address) {
-    uint32_t i = address - g_dispatch_base;
+    uint32_t i = address - g_base;
     return i < g_table.size() ? g_table[i] : nullptr;
 }
 

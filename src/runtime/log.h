@@ -17,5 +17,7 @@ void FlushLog();
 void PrintStack(void* context, void* thread = nullptr);
 std::string FormatStack(void* context, void* thread = nullptr);  // without taking the log lock
 std::string SymbolAt(uint64_t host_address);  // "f_004B01C8+0x1A1"
+// after a DLL was loaded (the game code): its symbols for the above
+void RefreshSymbols();
 
 }  // namespace rt

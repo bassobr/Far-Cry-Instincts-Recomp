@@ -1,0 +1,14 @@
+// <cstddef> for the game code DLL (compiled without the MSVC and Windows SDK headers, see <cmath> here)
+#pragma once
+
+using size_t = __SIZE_TYPE__;
+using ptrdiff_t = __PTRDIFF_TYPE__;
+using nullptr_t = decltype(nullptr);
+
+namespace std {
+using ::nullptr_t;
+using ::ptrdiff_t;
+using ::size_t;
+}  // namespace std
+
+#define offsetof(type, member) __builtin_offsetof(type, member)

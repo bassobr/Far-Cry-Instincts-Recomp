@@ -12,6 +12,7 @@ screenshots/
 # (normally inside out/, listed here in case it is started from elsewhere)
 FarCryInstincts.ini
 FarCryInstincts.ini.tmp
+game_code/
 shader_cache/
 textures/
 data/hdd/

@@ -1,5 +1,12 @@
 // Everything the recompiled code needs: the guest CPU state, guest memory and the x86 semantics
 // that are easier to write once here than to emit inline.
+//
+// The recompiled code is its own DLL (game_code.dll, built from the player's default.xbe on the first start, see
+// src/app/game_code.cpp), compiled with nothing but clang and this header: the C and C++ headers it includes come
+// from src/runtime/freestanding there (-nostdinc). Everything here that the generated code inlines stays inline; the
+// runtime functions it calls out to are exported by the executable (FCI_RT_API) and imported through its import
+// library; the hot data (dispatch table, preemption flag) lives in the DLL itself, so reading it costs no import
+// indirection. FCI_GAME_CODE: compiling generated code (the DLL, the semantics test); FCI_GAME_DLL: the DLL.
 #pragma once
 
 #include <setjmp.h>
@@ -10,6 +17,15 @@
 #include <cstring>
 
 #define RT_INLINE __forceinline
+
+#if defined(FCI_GAME_DLL)
+// not dllimport: a call stays a direct call (to the linker's jmp [__imp_...] thunk), so the code is the same as when
+// the game code was linked into the executable; dllimport made clang hoist the import address into a register for
+// repeated calls, one register less in the hot code around them, for calls that are all cold
+#define FCI_RT_API
+#else
+#define FCI_RT_API __declspec(dllexport)
+#endif
 
 // The Cpu a recompiled function gets is never kept by anything it calls (noescape = LLVM nocapture). Together with
 // __restrict (FCI_RESTRICT) and -capture-tracking-max-uses-to-explore (CMakeLists.txt) this lets the compiler prove
@@ -63,11 +79,11 @@ constexpr uint32_t kMmioBase = 0xFD000000;
 // They keep every host register (preserve_all, which needs C linkage), so the rarely taken check in each guest memory
 // access costs the hot code around it no spills.
 #define FCI_MMIO_CC __attribute__((preserve_all))
-extern "C" uint32_t FCI_MMIO_CC MmioRead(uint32_t a, unsigned size);
-extern "C" void FCI_MMIO_CC MmioWrite(uint32_t a, uint32_t v, unsigned size);
+extern "C" FCI_RT_API uint32_t FCI_MMIO_CC MmioRead(uint32_t a, unsigned size);
+extern "C" FCI_RT_API void FCI_MMIO_CC MmioWrite(uint32_t a, uint32_t v, unsigned size);
 // a guest access of up to 4 bytes, RAM or hardware (the cold path of LoadBase/StoreBase: one call, no spills)
-extern "C" uint32_t FCI_MMIO_CC GuestRead(uint32_t a, unsigned size);
-extern "C" void FCI_MMIO_CC GuestWrite(uint32_t a, uint32_t v, unsigned size);
+extern "C" FCI_RT_API uint32_t FCI_MMIO_CC GuestRead(uint32_t a, unsigned size);
+extern "C" FCI_RT_API void FCI_MMIO_CC GuestWrite(uint32_t a, uint32_t v, unsigned size);
 
 template <typename T>
 RT_INLINE T Load(uint32_t a) {
@@ -212,15 +228,17 @@ struct alignas(16) Cpu {
     uint32_t rets[128][2];  // function, eax at its return
 };
 
-void DumpTrace(const Cpu& c);
+FCI_RT_API void DumpTrace(const Cpu& c);
 
 // eflags bits, the same masks Zydis uses
 enum : uint32_t { CF = 1u << 0, PF = 1u << 2, AF = 1u << 4, ZF = 1u << 6, SF = 1u << 7, OF = 1u << 11 };
 
 // implemented by the runtime
-void Call(Cpu& FCI_NOESCAPE c, uint32_t target);  // indirect call or jump; the return address is already pushed
-// the dispatch table Call looks in (runtime.cpp): recompiled function by guest address - g_dispatch_base
+FCI_RT_API void Call(Cpu& FCI_NOESCAPE c, uint32_t target);  // indirect call or jump; the return address is already pushed
 using DispatchEntry = void(FCI_GUEST_CC*)(Cpu& FCI_NOESCAPE);
+#ifdef FCI_GAME_CODE
+// the dispatch table Call looks in (runtime.cpp fills it): recompiled function by guest address - g_dispatch_base;
+// defined in the generated table.cpp, so the generated code reads it without an import indirection
 extern DispatchEntry const* g_dispatch;
 extern uint32_t g_dispatch_base, g_dispatch_size;
 // Call with the table lookup inline: a recompiled target is called straight from the generated code
@@ -231,23 +249,27 @@ RT_INLINE void CallIndirect(Cpu& c, uint32_t target) {
             return f(c);
     Call(c, target);
 }
+// set when another guest context waits for the CPU; checked at loop back-edges (scheduler.h); in table.cpp too
+extern volatile int g_preempt;
+#else
+// the executable reaches the game code's copy (GameCode::preempt; a stand-in until the DLL is loaded)
+extern volatile int* g_preempt_flag;
+#endif
 // a host setjmp buffer for a guest setjmp that returned to pc with the stack at c.esp; a jump to pc with the
 // same stack (the end of the guest's longjmp) resumes there
-jmp_buf* Landing(Cpu& FCI_NOESCAPE c, uint32_t pc);
+FCI_RT_API jmp_buf* Landing(Cpu& FCI_NOESCAPE c, uint32_t pc);
 // after setjmp: a second return (the guest's longjmp) comes back with the Cpu changed behind the compiler's back
 // (nothing it can see touched it, see FCI_NOESCAPE), so everything it holds in registers is read again from c
 RT_INLINE void SetjmpBarrier(Cpu& c) { asm volatile("" : : "r"(&c) : "memory"); }
 
-// set when another guest context waits for the CPU; checked at loop back-edges (scheduler.h)
-extern volatile int g_preempt;
-void Preempt(Cpu& FCI_NOESCAPE c);
-void KernelCall(Cpu& FCI_NOESCAPE c, uint32_t ordinal);
-void Unimplemented(Cpu& FCI_NOESCAPE c, uint32_t address, const char* text);
-uint64_t ReadTsc();
-void Cpuid(Cpu& FCI_NOESCAPE c);         // answers as the Xbox's Pentium III
-void DebugService(Cpu& FCI_NOESCAPE c);  // int 0x2D: eax selects print or breakpoint
-uint32_t PortIn(Cpu& FCI_NOESCAPE c, uint16_t port, int bits);
-void PortOut(Cpu& FCI_NOESCAPE c, uint16_t port, uint32_t value, int bits);
+FCI_RT_API void Preempt(Cpu& FCI_NOESCAPE c);
+FCI_RT_API void KernelCall(Cpu& FCI_NOESCAPE c, uint32_t ordinal);
+FCI_RT_API void Unimplemented(Cpu& FCI_NOESCAPE c, uint32_t address, const char* text);
+FCI_RT_API uint64_t ReadTsc();
+FCI_RT_API void Cpuid(Cpu& FCI_NOESCAPE c);         // answers as the Xbox's Pentium III
+FCI_RT_API void DebugService(Cpu& FCI_NOESCAPE c);  // int 0x2D: eax selects print or breakpoint
+FCI_RT_API uint32_t PortIn(Cpu& FCI_NOESCAPE c, uint16_t port, int bits);
+FCI_RT_API void PortOut(Cpu& FCI_NOESCAPE c, uint16_t port, uint32_t value, int bits);
 
 // ---------------------------------------------------------------------------------------------
 // integer alu
@@ -459,7 +481,7 @@ RT_INLINE void Imul8(C&& c, Flags& f, uint32_t m, uint8_t b) {
     f.cf = f.of = p != int16_t(int8_t(p));
 }
 
-void DivideError(Cpu& FCI_NOESCAPE c);
+FCI_RT_API void DivideError(Cpu& FCI_NOESCAPE c);
 
 template <typename C>
 RT_INLINE void Div32(Cpu& cpu, C&& c, uint32_t b) {
@@ -644,10 +666,10 @@ RT_INLINE void FExamine(Cpu& c) {
     c.fsw = (c.fsw & ~(kC0 | kC1 | kC2 | kC3)) | cc;
 }
 
-double LoadF80(uint32_t a);
-void StoreF80(uint32_t a, double v);
-void FSave(Cpu& FCI_NOESCAPE c, uint32_t a);
-void FRestore(Cpu& FCI_NOESCAPE c, uint32_t a);
+FCI_RT_API double LoadF80(uint32_t a);
+FCI_RT_API void StoreF80(uint32_t a, double v);
+FCI_RT_API void FSave(Cpu& FCI_NOESCAPE c, uint32_t a);
+FCI_RT_API void FRestore(Cpu& FCI_NOESCAPE c, uint32_t a);
 
 // ---------------------------------------------------------------------------------------------
 // sse
@@ -661,9 +683,9 @@ RT_INLINE Xmm Shufps(const Xmm& a, const Xmm& b, uint8_t imm) {
 RT_INLINE float MaxF(float a, float b) { return a > b ? a : b; }
 RT_INLINE float MinF(float a, float b) { return a < b ? a : b; }
 
-int32_t CvtToInt(const Cpu& FCI_NOESCAPE c, float v);  // rounds per mxcsr
+FCI_RT_API int32_t CvtToInt(const Cpu& FCI_NOESCAPE c, float v);  // rounds per mxcsr
 RT_INLINE int32_t CvttToInt(float v) { return FToInt<int32_t>(v); }
-void SetMxcsr(Cpu& FCI_NOESCAPE c, uint32_t v);
+FCI_RT_API void SetMxcsr(Cpu& FCI_NOESCAPE c, uint32_t v);
 
 // ---------------------------------------------------------------------------------------------
 // mmx: 64-bit registers handled lane by lane
@@ -755,14 +777,37 @@ RT_INLINE uint32_t Pmovmskb(uint64_t a) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// table of recompiled functions, emitted by fci-recomp
+// the game code DLL's interface to the executable, emitted by fci-recomp (table.cpp)
 
 using GuestFunction = DispatchEntry;
 struct FunctionEntry {
     uint32_t address;
     GuestFunction function;
 };
-extern const FunctionEntry kFunctions[];
-extern const size_t kFunctionCount;
+
+// What game_code.dll exports (as fci_game_code, its only export) and the executable checks before it runs
+// anything: a DLL whose abi, xbe or build differs from what the executable expects is stale and is built again.
+// kGameCodeVersion counts changes of this struct; FCI_ABI_HASH (CMakeLists.txt) covers everything else the two
+// sides must agree on (this header, the freestanding headers, the recompiler, config/hle.txt and the symbols,
+// the compiler flags).
+constexpr uint32_t kGameCodeVersion = 1;
+struct GameCode {
+    uint32_t version;   // kGameCodeVersion
+    uint32_t size;      // sizeof(GameCode)
+    uint64_t abi;       // FCI_ABI_HASH the DLL was compiled with
+    uint64_t xbe;       // xbe::ContentHash of the default.xbe it was translated from
+    uint64_t build;     // FCI_BUILD_KEY: compiler, flags and profile of the first-start build; 0 from CMake
+    const FunctionEntry* functions;  // every recompiled function, by address
+    uint32_t function_count;
+    uint32_t original_count;
+    const FunctionEntry* originals;  // the recompiled bodies (o_<address>) of the functions host code replaces
+    // the hot data the generated code reads directly, filled in by the executable (rt::InitDispatch)
+    volatile int* preempt;
+    DispatchEntry const** dispatch;
+    uint32_t* dispatch_base;
+    uint32_t* dispatch_size;
+    // instrumented build (FCI_PGO=generate): clang's __llvm_profile_write_file in the DLL, else null
+    int (*write_profile)();
+};
 
 }  // namespace rt

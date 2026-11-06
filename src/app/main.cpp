@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 
+#include "app/game_code.h"
 #include "audio/apu.h"
 #include "gpu/nv2a.h"
 #include "kernel/disc.h"
@@ -22,10 +23,6 @@
 #include "xbe/xbe.h"
 
 namespace fs = std::filesystem;
-
-#ifdef FCI_PGO_GENERATE
-extern "C" int __llvm_profile_write_file(void);  // clang's profile runtime
-#endif
 
 namespace {
 
@@ -182,9 +179,14 @@ int main() {
     if (image.title_id != kTitleId)
         rt::Log("game: title %08X is not the Far Cry Instincts this build was made from (%08X)", image.title_id, kTitleId);
 
+    // the guest window first, so nothing loaded from here on can land in it
     if (!mem::Init()) return 1;
+    // the recompiled code: game_code\game_code.dll, built from this xbe first if it is missing or stale
+    if (!app::PrepareGameCode(exe_dir, image)) return 1;
+    const rt::GameCode& code = *rt::LoadedGameCode();
+
     mem::LoadImage(image);
-    rt::InitDispatch(image.base, uint32_t(image.memory.size()));
+    rt::InitDispatch(code, image.base, uint32_t(image.memory.size()));
 
     kernel::MountDisc(std::move(game.disc));
     kernel::SetDevicePaths(game.dvd, exe_dir / "data" / "hdd");
@@ -197,20 +199,18 @@ int main() {
     gpu::Init();
     apu::Init();
 
-#ifdef FCI_PGO_GENERATE
-    // instrumented build (cmake -DFCI_PGO=generate): the game never exits, so FCI_PGO_WRITE=<seconds> writes the
+    // instrumented game code (cmake -DFCI_PGO=generate): the game never exits, so FCI_PGO_WRITE=<seconds> writes the
     // counters of the recompiled code then (to LLVM_PROFILE_FILE, default default.profraw next to the exe)
     char pgo_write[16] = {};
-    if (GetEnvironmentVariableA("FCI_PGO_WRITE", pgo_write, sizeof pgo_write)) {
+    if (code.write_profile && GetEnvironmentVariableA("FCI_PGO_WRITE", pgo_write, sizeof pgo_write)) {
         const DWORD ms = DWORD(std::atof(pgo_write) * 1000);
         CreateThread(nullptr, 0, [](void* p) -> DWORD {
             Sleep(DWORD(uintptr_t(p)));
-            const int r = __llvm_profile_write_file();
+            const int r = rt::LoadedGameCode()->write_profile();
             rt::Log("pgo: profile %s", r == 0 ? "written" : "NOT written");
             return 0;
         }, reinterpret_cast<void*>(uintptr_t(ms)), 0, nullptr);
     }
-#endif
 
     // the kernel runs the entry point on a fresh system thread
     rt::GuestThread* boot = rt::CreateGuestThread(1024 * 1024, 0, image.entry, 0, 0, false);

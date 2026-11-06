@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "app/menu.h"  // settings menu
-#include "funcs.h"
+#include "hle/original.h"
 #include "hle/host_pad.h"
 #include "hle/pc_input.h"
 #include "kernel/kernel.h"
@@ -288,19 +288,20 @@ void Connect(uint32_t type) {
 void XGetDevices(Cpu& c) {
     Connect(Arg(c, 0));
     Trace("XGetDevices", c, 1);
-    o_005BEE47(c);
+    GUEST_ORIG_AT(0x005BEE47u)(c);
 }
 
 void XGetDeviceChanges(Cpu& c) {
     Connect(Arg(c, 0));
     Trace("XGetDeviceChanges", c, 3);
-    o_005BEE69(c);
+    GUEST_ORIG_AT(0x005BEE69u)(c);
 }
 
 void XInputOpen(Cpu& c) {
     uint32_t type = Arg(c, 0), port = Arg(c, 1);
     Trace("XInputOpen", c, 4);
-    if (type != kGamepadType || port >= uint32_t(kPorts) || !(ConnectedPorts() & (1u << port))) return o_005C5926(c);
+    if (type != kGamepadType || port >= uint32_t(kPorts) || !(ConnectedPorts() & (1u << port)))
+        return GUEST_ORIG_AT(0x005C5926u)(c);
     if (!g_handle[port]) {
         g_handle[port] = mem::AllocSystem(0x100);
         rt::Log("xinput: gamepad on port %u opened, handle %08X", port, g_handle[port]);
@@ -310,14 +311,14 @@ void XInputOpen(Cpu& c) {
 
 void XInputClose(Cpu& c) {
     int port = PortOf(Arg(c, 0));
-    if (port < 0) return o_005C597C(c);
+    if (port < 0) return GUEST_ORIG_AT(0x005C597Cu)(c);
     rt::Log("xinput: gamepad on port %d closed", port);
     Return(c, 0, 1);
 }
 
 void XInputGetState(Cpu& c) {
     int port = PortOf(Arg(c, 0));
-    if (port < 0) return o_005C5988(c);
+    if (port < 0) return GUEST_ORIG_AT(0x005C5988u)(c);
     uint32_t state = Arg(c, 1);
     Pad p = ReadHost(port);
     if (port == 0) TracePad(p), Diagnostics();
@@ -332,7 +333,7 @@ void XInputGetState(Cpu& c) {
 // rumble: XINPUT_FEEDBACK is a 66 byte header (status, event) followed by the two motor speeds
 void XInputSetState(Cpu& c) {
     int port = PortOf(Arg(c, 0));
-    if (port < 0) return o_005C59FB(c);
+    if (port < 0) return GUEST_ORIG_AT(0x005C59FBu)(c);
     uint32_t feedback = Arg(c, 1);
     host::Rumble(port, R16(feedback + 66), R16(feedback + 68));
     W32(feedback, kErrorSuccess);
@@ -342,7 +343,7 @@ void XInputSetState(Cpu& c) {
 }
 
 void XInputPoll(Cpu& c) {
-    if (PortOf(Arg(c, 0)) < 0) return o_005C6220(c);
+    if (PortOf(Arg(c, 0)) < 0) return GUEST_ORIG_AT(0x005C6220u)(c);
     Return(c, kErrorSuccess, 1);
 }
 

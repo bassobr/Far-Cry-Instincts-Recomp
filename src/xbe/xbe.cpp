@@ -33,6 +33,7 @@ bool Image::Load(const std::string& path, std::string* error) {
 
 bool Image::Load(std::vector<uint8_t> file, const std::string& path, std::string* error) {
     file_ = std::move(file);
+    content_hash = ContentHash(file_.data(), file_.size());
     if (file_.size() < 0x178 || std::memcmp(file_.data(), "XBEH", 4) != 0) {
         *error = path + " is not an XBE";
         return false;

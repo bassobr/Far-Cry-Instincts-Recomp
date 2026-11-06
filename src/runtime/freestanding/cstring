@@ -1,0 +1,19 @@
+// <cstring> for the game code DLL (compiled without the MSVC and Windows SDK headers, see <cmath> here): the C
+// functions as vcruntime_string.h declares them; calls that stay calls go to the executable's exports.
+#pragma once
+
+#include <cstddef>
+
+extern "C" {
+void* __cdecl memcpy(void* dst, const void* src, size_t n);
+void* __cdecl memmove(void* dst, const void* src, size_t n);
+void* __cdecl memset(void* dst, int value, size_t n);
+int __cdecl memcmp(const void* a, const void* b, size_t n);
+}
+
+namespace std {
+using ::memcmp;
+using ::memcpy;
+using ::memmove;
+using ::memset;
+}  // namespace std

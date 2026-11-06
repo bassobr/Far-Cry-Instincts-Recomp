@@ -15,8 +15,6 @@
 
 namespace rt {
 
-volatile int g_preempt = 0;
-
 namespace {
 
 // IRQL decides who may take the CPU from whom, as on the real kernel: a context at DISPATCH_LEVEL or above
@@ -78,7 +76,7 @@ Waiter* Pick(int above) {
 }
 
 void Grant(Waiter* next) {
-    if (g_interrupts.empty() && g_threads.empty()) g_preempt = 0;
+    if (g_interrupts.empty() && g_threads.empty()) *g_preempt_flag = 0;
     next->granted = true;  // the CPU passes over without ever being free
     next->cv.notify_one();
 }
@@ -104,7 +102,7 @@ void QuantumTimer() {
     for (;;) {
         Sleep(2);
         std::lock_guard lock(g_lock);
-        if (!g_threads.empty() || !g_interrupts.empty()) g_preempt = 1;
+        if (!g_threads.empty() || !g_interrupts.empty()) *g_preempt_flag = 1;
     }
 }
 
@@ -122,7 +120,7 @@ void AcquireCpu(bool interrupt) {
         Took();
         return;
     }
-    if (level >= kDispatch) g_preempt = 1;
+    if (level >= kDispatch) *g_preempt_flag = 1;
     Wait(lock, level, false);
 }
 
@@ -154,7 +152,7 @@ void Preempt(Cpu& FCI_NOESCAPE) {
     Waiter* next = Pick(level);
     if (!next) {
         // nothing may run above this level now; lowering the IRQL or the quantum timer looks again
-        g_preempt = 0;
+        *g_preempt_flag = 0;
         return;
     }
     // an interrupt or DPC returns the CPU to the context it interrupted; threads take turns

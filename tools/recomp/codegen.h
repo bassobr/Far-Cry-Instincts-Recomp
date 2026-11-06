@@ -34,12 +34,17 @@ struct XmmSummary {
     uint16_t reads = 0, exit = 0;
 };
 
+// what the executable needs from the configuration alone (no xbe): image_symbols.h (SYM_<name>, config/symbols*.txt)
+// and hle_hooks.h/.cpp (the host replacements it exports to the DLL, config/hle.txt and hooks.h)
+void WriteHostHeaders(const std::filesystem::path& dir);
+
 class Codegen {
 public:
     Codegen(const xbe::Image& image, const Analysis& analysis) : image_(image), analysis_(analysis) {}
 
-    // writes funcs.h, table.cpp and code_NNN.cpp into `dir`
-    void Write(const std::filesystem::path& dir, int partitions);
+    // writes funcs.h, table.cpp and code_NNN.cpp into `dir`; xbe_hash (xbe::ContentHash of the
+    // file translated) goes into the DLL's rt::GameCode
+    void Write(const std::filesystem::path& dir, int partitions, uint64_t xbe_hash);
 
     // instructions emitted as runtime traps, by mnemonic
     std::map<std::string, size_t> unimplemented;

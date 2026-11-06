@@ -102,6 +102,8 @@ void InitLog() {
     SymInitialize(GetCurrentProcess(), nullptr, TRUE);
 }
 
+void RefreshSymbols() { SymRefreshModuleList(GetCurrentProcess()); }
+
 void Log(const char* fmt, ...) {
     char buf[4096];
     // FCI_LOG_TIME=1: every line starts with the seconds since start (to compare timings between runs)

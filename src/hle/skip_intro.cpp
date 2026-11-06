@@ -8,7 +8,7 @@
 #include <string>
 
 #include "app/settings.h"
-#include "funcs.h"
+#include "hle/original.h"
 #include "gpu/fmv.h"  // PC features: fmv_scale
 #include "runtime/guest.h"
 #include "runtime/log.h"
@@ -36,7 +36,7 @@ void BinkOpen(rt::Cpu& c) {
     uint32_t name = rt::R32(c.esp + 4);
     if (!SkipVideo(name)) {
         std::string path(name ? reinterpret_cast<const char*>(rt::Host(name)) : "");
-        o_005A9A20(c);
+        GUEST_ORIG_AT(0x005A9A20u)(c);
         // PC features, fmv_scale: which video is open and its size (struct BINK: +0 width, +4 height)
         if (c.eax) gpu::fmv::Opened(path.c_str(), rt::R32(c.eax), rt::R32(c.eax + 4));
         return;

@@ -1,0 +1,113 @@
+// <cmath> for the game code DLL, which is compiled without the MSVC and Windows SDK headers (-nostdinc): the C
+// functions as the UCRT declares them (clang recognizes them as library builtins, so the code is the same as with
+// the real header), float overloads as MSVC's <cmath> has them, and the classification functions as MSVC's headers
+// define them for clang. Calls that stay calls are resolved by the executable, which exports its C runtime's
+// functions (src/runtime/runtime.cpp). Adapted from SCDA-XBERecomp's freestanding headers (MIT, TGP482 and
+// Joshhhuaaa).
+#pragma once
+
+#include <cstddef>
+
+// corecrt_math.h
+#define INFINITY ((float)(1e+300 * 1e+300))
+#define NAN (__builtin_nanf(""))
+#define FP_INFINITE 1
+#define FP_NAN 2
+#define FP_NORMAL (-1)
+#define FP_SUBNORMAL (-2)
+#define FP_ZERO 0
+
+extern "C" {
+double __cdecl sqrt(double);
+double __cdecl sin(double);
+double __cdecl cos(double);
+double __cdecl tan(double);
+double __cdecl atan(double);
+double __cdecl atan2(double, double);
+double __cdecl exp(double);
+double __cdecl exp2(double);
+double __cdecl log(double);
+double __cdecl log2(double);
+double __cdecl log10(double);
+double __cdecl pow(double, double);
+double __cdecl fabs(double);
+double __cdecl floor(double);
+double __cdecl ceil(double);
+double __cdecl trunc(double);
+double __cdecl round(double);
+double __cdecl nearbyint(double);
+double __cdecl rint(double);
+double __cdecl fmod(double, double);
+double __cdecl remainder(double, double);
+double __cdecl ldexp(double, int);
+double __cdecl frexp(double, int*);
+float __cdecl sqrtf(float);
+float __cdecl sinf(float);
+float __cdecl cosf(float);
+float __cdecl tanf(float);
+float __cdecl atan2f(float, float);
+float __cdecl fabsf(float);
+float __cdecl floorf(float);
+float __cdecl ceilf(float);
+float __cdecl truncf(float);
+float __cdecl nearbyintf(float);
+float __cdecl fmodf(float, float);
+}
+
+namespace std {
+using ::atan;
+using ::atan2;
+using ::ceil;
+using ::cos;
+using ::exp;
+using ::exp2;
+using ::fabs;
+using ::floor;
+using ::fmod;
+using ::frexp;
+using ::ldexp;
+using ::log;
+using ::log10;
+using ::log2;
+using ::nearbyint;
+using ::pow;
+using ::remainder;
+using ::rint;
+using ::round;
+using ::sin;
+using ::sqrt;
+using ::tan;
+using ::trunc;
+inline float sqrt(float v) noexcept { return ::sqrtf(v); }
+inline float sin(float v) noexcept { return ::sinf(v); }
+inline float cos(float v) noexcept { return ::cosf(v); }
+inline float tan(float v) noexcept { return ::tanf(v); }
+inline float atan2(float a, float b) noexcept { return ::atan2f(a, b); }
+inline float fabs(float v) noexcept { return ::fabsf(v); }
+inline float floor(float v) noexcept { return ::floorf(v); }
+inline float ceil(float v) noexcept { return ::ceilf(v); }
+inline float trunc(float v) noexcept { return ::truncf(v); }
+inline float nearbyint(float v) noexcept { return ::nearbyintf(v); }
+inline float fmod(float a, float b) noexcept { return ::fmodf(a, b); }
+
+template <typename T>
+inline int fpclassify(T v) noexcept {
+    return __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, v);
+}
+template <typename T>
+inline bool isnan(T v) noexcept {
+    return __builtin_isnan(v);
+}
+template <typename T>
+inline bool isinf(T v) noexcept {
+    return __builtin_isinf(v);
+}
+template <typename T>
+inline bool isfinite(T v) noexcept {
+    return __builtin_isfinite(v);
+}
+template <typename T>
+inline bool signbit(T v) noexcept {
+    return __builtin_signbit(v);
+}
+}  // namespace std
