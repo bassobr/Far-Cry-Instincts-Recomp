@@ -1,0 +1,12 @@
+# GitHub Actions (SHA-pinned); regular updates grouped weekly. The CMake dependencies (Zydis, SDL3,
+# Dear ImGui) are pinned by tag in CMakeLists.txt and updated by hand.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"

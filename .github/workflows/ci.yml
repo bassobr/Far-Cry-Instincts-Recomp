@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  # CI has no game files and never gets any: the tools preset builds the recompiler and the semantics test,
+  # whose cases fci-recomp writes without default.xbe. The game executable is only ever built locally.
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No game files in the repository
+        shell: bash
+        run: |
+          if git ls-files | grep -iE '^(assets|asset_fc1|generated)/|\.(xbe|iso|xiso)$|(^|/)FarCryInstincts\.exe$'; then
+            echo "game files or files derived from the game are tracked" >&2; exit 1
+          fi
+      - name: Build fci-recomp and fci-semtest
+        shell: cmd
+        run: build.bat tools
+      - name: Semantics test
+        run: out\build\tools\fci-semtest.exe
+      - name: Package (artifact only)
+        run: tools\package.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tools-zip
+          path: |
+            out/dist/*.zip
+            out/dist/SHA256SUMS
