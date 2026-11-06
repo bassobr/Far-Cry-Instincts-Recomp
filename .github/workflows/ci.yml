@@ -6,10 +6,12 @@ on:
 permissions:
   contents: read
 jobs:
-  # CI has no game files and never gets any: the tools preset builds the recompiler and the semantics test,
-  # whose cases fci-recomp writes without default.xbe. The game executable is only ever built locally.
+  # CI has no game files and never gets any. Without assets/default.xbe the release preset builds the executable
+  # (no game code), fci-recomp and fci-semtest; the game code is only ever built on a player's PC or locally.
+  # windows-2022: VS 2022's STL accepts clang 19, so the pinned LLVM 19.1.5 (the major that consumes
+  # config/game_code.profdata, and the one a release bundles) builds everything.
   build-test:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -17,19 +19,30 @@ jobs:
       - name: No game files in the repository
         shell: bash
         run: |
-          if git ls-files | grep -iE '^(assets|asset_fc1|generated)/|\.(xbe|iso|xiso)$|(^|/)FarCryInstincts\.exe$'; then
+          if git ls-files | grep -iE '^(assets|asset_fc1|generated|game_code)/|\.(xbe|iso|xiso)$|(^|/)(FarCryInstincts\.exe|game_code\.dll)$'; then
             echo "game files or files derived from the game are tracked" >&2; exit 1
           fi
-      - name: Build fci-recomp and fci-semtest
+      - name: Cache the LLVM download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: llvm-download
+          key: llvm-19.1.5-x86_64-pc-windows-msvc
+      - name: LLVM (pinned, checksum verified)
+        run: tools\get_llvm.ps1 -Out C:\llvm -Cache llvm-download
+      - name: Build the executable, fci-recomp and fci-semtest
         shell: cmd
-        run: build.bat tools
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake --preset release -DCMAKE_C_COMPILER=C:/llvm/bin/clang-cl.exe -DCMAKE_CXX_COMPILER=C:/llvm/bin/clang-cl.exe -DCMAKE_LINKER=C:/llvm/bin/lld-link.exe -DCMAKE_MT=C:/llvm/bin/llvm-mt.exe -DFCI_LLVM_DIR=C:/llvm || exit /b 1
+          cmake --build --preset release || exit /b 1
       - name: Semantics test
-        run: out\build\tools\fci-semtest.exe
-      - name: Package (artifact only)
-        run: tools\package.ps1
+        run: out\build\release\fci-semtest.exe
+      - name: Release folder and zip (artifact only)
+        run: tools\dist.ps1 -Llvm C:\llvm -Zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: tools-zip
+          name: release-zip-unsigned
           path: |
             out/dist/*.zip
             out/dist/SHA256SUMS

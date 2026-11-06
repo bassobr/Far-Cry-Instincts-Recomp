@@ -7,11 +7,14 @@ on:
 permissions:
   contents: read
 jobs:
-  # Releases hold the recompiler and the semantics test only. Never the game, its recompiled code
-  # (generated/), FarCryInstincts.exe or anything else built from or extracted from default.xbe:
-  # there are no game files here, and tools/package.ps1 refuses them.
+  # A release is FarCryInstincts.exe without any game code, plus the compiler folder it builds the game code with on
+  # the player's first start (src/app/game_code.cpp): the pinned official LLVM release (tools/get_llvm.ps1),
+  # fci-recomp, the executable's import library, the headers and the configuration. Never the game, its recompiled
+  # code (generated/, game_code.dll) or anything else built or extracted from default.xbe: there are no game files
+  # here, without assets/default.xbe CMake builds no game code, and tools/dist.ps1 and the check below refuse it.
+  # windows-2022: VS 2022's STL accepts clang 19, so the pinned LLVM 19.1.5 builds everything.
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,16 +27,28 @@ jobs:
           if [ "v$V" != "$GITHUB_REF_NAME" ]; then
             echo "Tag $GITHUB_REF_NAME does not match VERSION $V" >&2; exit 1
           fi
-      - name: Build fci-recomp and fci-semtest
+      - name: Cache the LLVM download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: llvm-download
+          key: llvm-19.1.5-x86_64-pc-windows-msvc
+      # the same LLVM builds the executable and is bundled: the major version that consumes config/game_code.profdata
+      - name: LLVM (pinned, checksum verified)
+        run: tools\get_llvm.ps1 -Out C:\llvm -Cache llvm-download
+      - name: Build the executable, fci-recomp and fci-semtest
         shell: cmd
-        run: build.bat tools
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake --preset release -DCMAKE_C_COMPILER=C:/llvm/bin/clang-cl.exe -DCMAKE_CXX_COMPILER=C:/llvm/bin/clang-cl.exe -DCMAKE_LINKER=C:/llvm/bin/lld-link.exe -DCMAKE_MT=C:/llvm/bin/llvm-mt.exe -DFCI_LLVM_DIR=C:/llvm || exit /b 1
+          cmake --build --preset release || exit /b 1
       - name: Semantics test
-        run: out\build\tools\fci-semtest.exe
-      - name: Package
-        run: tools\package.ps1
+        run: out\build\release\fci-semtest.exe
+      - name: Release folder and zip
+        run: tools\dist.ps1 -Llvm C:\llvm -Zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: tools-zip
+          name: release-zip
           path: |
             out/dist/*.zip
             out/dist/SHA256SUMS
@@ -48,21 +63,31 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: tools-zip
+          name: release-zip
       - name: Check the package
         run: |
           sha256sum -c SHA256SUMS
-          unzip -Z1 far-cry-instincts-recomp-tools-*.zip
-          if unzip -Z1 far-cry-instincts-recomp-tools-*.zip | grep -iE 'FarCryInstincts\.exe|generated/|assets/|\.(xbe|iso|xiso|profdata|hlsl|dds|png|pak)$'; then
-            echo "game files or files derived from the game in the package" >&2; exit 1
+          ZIP="FarCryInstincts-Recomp-${GITHUB_REF_NAME}-win64.zip"
+          unzip -Z1 "$ZIP"
+          for f in FarCryInstincts.exe d3dcompiler_47.dll compiler/clang.exe compiler/lld-link.exe compiler/fci-recomp.exe \
+                   compiler/FarCryInstincts.lib compiler/LLVM-LICENSE.txt assets/README.txt LICENSE THIRD_PARTY_NOTICES.md; do
+            unzip -Z1 "$ZIP" | grep -qx "[^/]*/$f" || { echo "missing $f" >&2; exit 1; }
+          done
+          # the executable and the profile are expected; game code, generated sources and game files are not
+          if unzip -Z1 "$ZIP" | grep -iE 'game_code\.dll|game_code/|generated/|work/|\.(xbe|iso|xiso|cpp|obj|pdb|profraw|hlsl|dds|png|bmp|pak)$'; then
+            echo "game code, game files or files derived from the game in the package" >&2; exit 1
+          fi
+          # an executable with the game code linked in names its recompiled functions (f_/o_<guest address>)
+          if unzip -p "$ZIP" '*/FarCryInstincts.exe' | grep -qaE '\?[fo]_[0-9A-F]{8}@@'; then
+            echo "FarCryInstincts.exe contains recompiled game code" >&2; exit 1
           fi
       # Keyless build provenance (Sigstore): gh attestation verify <zip> -R bassobr/Far-Cry-Instincts-Recomp
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: far-cry-instincts-recomp-tools-*.zip
+          subject-path: FarCryInstincts-Recomp-*.zip
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" far-cry-instincts-recomp-tools-*.zip SHA256SUMS \
+          gh release create "${GITHUB_REF_NAME}" FarCryInstincts-Recomp-*.zip SHA256SUMS \
             --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes
