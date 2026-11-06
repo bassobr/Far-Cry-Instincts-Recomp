@@ -58,6 +58,10 @@ bool g_context = false;       // ImGui's context and Win32 backend exist (under 
 std::atomic<bool> g_pad_armed{false};  // the pad's buttons were all let go since the menu opened
 int g_pad_step = 0;                    // the controller's left / right this frame (FeedPads)
 ImGuiID g_nav_row = 0, g_nav_row_prev = 0;  // the option row focused this frame and the last
+std::atomic<bool> g_save_failed{false};     // the last save could not write FarCryInstincts.ini (shown in the panel)
+
+// every change goes into the file at once; a failure (a folder without write access) is shown, not only logged
+void SaveSettings() { g_save_failed = !settings::Save(); }
 
 std::string Lower(std::string s) {
     for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch)));
@@ -300,7 +304,9 @@ const Setting kSettings[] = {
      [] { return Choices{{"auto", "AUTO"}, {"full", "FULL"}, {"half", "HALF"}}; }, When::Restart,
      "Auto: half resolution above 720 lines."},
     // general
-    {"skip_intro", "SKIP INTRO VIDEOS", "0", OnOff, When::NextStart, "Skip the Ubisoft, Crytek and intro videos."},
+    {"skip_intro", "SKIP STARTUP VIDEOS", "0", OnOff, When::Live,
+     "Skip the Ubisoft, Crytek and Far Cry Instincts logo videos at start. The story's cutscenes (the opening on the "
+     "boat) are part of the levels and can't be skipped, as on the Xbox."},
     {"pause_on_focus_loss", "PAUSE ON FOCUS LOSS", "0", OnOff, When::Live,
      "Hold the game while the window is in the background."},
     {"texture_dump", "TEXTURE DUMPING", "0", OnOff, When::Restart, "Write every game texture to textures\\dump."},
@@ -448,7 +454,7 @@ void Change(const Setting& s, const std::string& value) {
     if (!restart) ApplyLive(s);
     rt::Log("settings menu: %s = %s (%s)", s.key, value.c_str(),
             restart ? (s.when == When::NextStart ? "next start" : "after a restart") : "applied");
-    settings::Save();
+    SaveSettings();
 }
 
 // ---- the panel (after SCDA's) ----
@@ -678,7 +684,7 @@ void DrawKeyboard() {
         if (cleared >= 0 && idle && cleared < int(keys.size())) {
             hle::pc::SetBinding(t, cleared, 0);
             rt::Log("settings menu: bind_%s cleared key %d", hle::pc::BindingName(t), cleared + 1);
-            settings::Save();
+            SaveSettings();
         }
     }
 }
@@ -736,7 +742,7 @@ void DrawController() {
         if (cleared >= 0 && idle && cleared < int(buttons.size())) {
             hle::host::SetBinding(t, cleared, -1);
             rt::Log("settings menu: pad_bind_%s cleared button %d", hle::host::BindingName(t), cleared + 1);
-            settings::Save();
+            SaveSettings();
         }
     }
 }
@@ -755,7 +761,7 @@ void PollPadCapture(int t) {
         hle::host::SetBinding(t, g_capture_slot, button);
         rt::Log("settings menu: pad_bind_%s button %d = %s", hle::host::BindingName(t), g_capture_slot + 1,
                 hle::host::ButtonName(button));
-        settings::Save();
+        SaveSettings();
     }
     g_capture = -1;
     g_capture_pad = false;
@@ -775,7 +781,7 @@ void PollCapture() {
         hle::pc::SetBinding(t, g_capture_slot, code);
         rt::Log("settings menu: bind_%s key %d = %s", hle::pc::BindingName(t), g_capture_slot + 1,
                 hle::pc::KeyName(code).c_str());
-        settings::Save();
+        SaveSettings();
     }
     g_capture = -1;
     g_pick_frame = ImGui::GetFrameCount();
@@ -798,7 +804,7 @@ void Defaults() {
         }
     }
     rt::Log("settings menu: defaults for the %s page", kPages[g_page]);
-    settings::Save();
+    SaveSettings();
 }
 
 // one tab a page, as wide as they share the line; LB / RB step them as SCDA's do
@@ -874,6 +880,8 @@ void DrawPanel() {
         std::string note;
         if (g_capture < 0 && *g_hint) note = g_hint_restart ? "Saved; takes effect after a restart." : "Applies at once and is saved.";
         if (g_hint_env) note += "  FCI_ environment variable set: it wins over the saved value at start.";
+        if (g_save_failed) note = "Could not write FarCryInstincts.ini beside the game (no write access?): changes are lost "
+                                  "when the game closes.";
         ImGui::TextUnformatted(note.c_str());
         ImGui::PopStyleColor();
         float bw = em * 8;
@@ -1304,7 +1312,7 @@ void MenuFrame() {
 void MenuClosed() {
     hle::pc::SettleAfterMenu();
     hle::SettlePads();
-    settings::Save();
+    SaveSettings();
 }
 
 }  // namespace app

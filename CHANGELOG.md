@@ -1,7 +1,17 @@
 # Changelog
 
-## 0.1.2 (unreleased)
+## 0.1.2 (2026-11-06)
 
+- Wider field of view (`fov` above 1) no longer cuts the light of lamps and other dynamic lights off in straight lines
+  at the sides of the screen (bright or dark bands on walls and windows indoors, e.g. in the boat's cabin). The engine
+  clips each light to a screen rectangle that did not follow the `fov` factor; with `fov` other than 1 the 3D draws
+  now use their whole view (in split screen, each player's half). `fov = 1` is unchanged.
+- `skip_intro` is read at every video, so turning it on in the F10 menu (now "Skip startup videos") takes effect at
+  once instead of at the next start. Its help text says what it covers: the three logo videos, not the story's
+  cutscenes, which the game can't skip.
+- The log names the settings file it read (or that there is none) and whether `skip_intro` is on; the menu says when
+  it cannot write `FarCryInstincts.ini`. A UTF-8 byte order mark (Notepad) no longer hides the file's first setting.
+- `tools/tests/skip_intro.ps1`: end-to-end test of the setting (menu, settings file, next start).
 - The release ships Microsoft's `d3dcompiler_47.dll` again, next to the executable. Proton loads it instead of its
   builtin compiler, so the Steam Deck needs no protontricks step and gets the full GPU performance (split screen about
   8 % faster than with Proton's compiler). The Proton shader fix and the message box of 0.1.1 stay as a safety net.

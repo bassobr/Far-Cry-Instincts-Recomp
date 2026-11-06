@@ -46,15 +46,23 @@ const std::map<std::string, std::string>& Ini() {
     static std::once_flag once;
     std::call_once(once, [] {
         std::ifstream in(IniPath());
-        if (!in) return;
+        // the full path in the log: a tester's log shows which file was (not) read
+        std::string where;
+        for (wchar_t ch : IniPath()) where += ch < 128 ? char(ch) : '?';
+        if (!in) {
+            rt::Log("settings: no %s (defaults)", where.c_str());
+            return;
+        }
         std::string line;
         while (std::getline(in, line)) {
             line = Trim(line.substr(0, line.find_first_of("#;")));
             size_t eq = line.find('=');
             if (line.empty() || line[0] == '[' || eq == std::string::npos) continue;
-            values[Lower(Trim(line.substr(0, eq)))] = Trim(line.substr(eq + 1));
+            std::string key = Lower(Trim(line.substr(0, eq)));
+            if (key.compare(0, 3, "\xEF\xBB\xBF") == 0) key.erase(0, 3);  // a UTF-8 BOM before the first key (Notepad)
+            values[key] = Trim(line.substr(eq + 1));
         }
-        rt::Log("settings: %zu values from FarCryInstincts.ini", values.size());
+        rt::Log("settings: %zu values from %s", values.size(), where.c_str());
     });
     return values;
 }

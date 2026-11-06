@@ -224,7 +224,7 @@ there.
 | `fmv_scale` | `fill` | Videos on widescreen: `fill` (as large as fits without cropping) or `4:3` |
 | `colour_blind` | `0` | `0` off, `1` protanopia, `2` deuteranopia, `3` tritanopia |
 | `fps_counter` | `0` | `1` = show frame rate and frame times |
-| `skip_intro` | `0` | `1` = skip the startup videos |
+| `skip_intro` | `0` | `1` = skip the three logo videos at start (Ubisoft, Crytek, Far Cry Instincts); not the story's cutscenes |
 | `pause_on_focus_loss` | `0` | `1` = pause game, sound and rumble while the window is in the background |
 | `mouse_sensitivity` | `1` | 1 = 0.1 degrees per mouse count; `mouse_sensitivity_x` / `_y` per axis |
 | `mouse_invert_y` | `0` | `1` = inverted vertical mouse look |
@@ -316,6 +316,10 @@ code. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   xiso images.
 - Launching as a non-Steam game in the Steam Deck's Game Mode has not been fully verified; the game itself runs
   under Proton.
+- With `fov` above about 1.1 on 21:9 (about 1.45 on 16:9) the view widens no further: the game's camera caps its
+  field of view.
+- The story's cutscenes, such as the opening on the boat, are scripted sequences in the levels and can't be skipped
+  (as on the Xbox); `skip_intro` covers the logo videos at start.
 - Online play (Xbox Live, system link) is not supported.
 
 ## Credits

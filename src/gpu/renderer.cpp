@@ -2995,6 +2995,33 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         g_ds.raster = r;
     }
     D3D11_RECT scissor = surf.clip;
+    // ---- PC features: fov ----
+    // FCI draws the light of each dynamic light as an additive pass over the objects it reaches, cut to a scissor
+    // rectangle (a surface clip smaller than the target) that the engine works out from the light's sphere. That
+    // rectangle does not follow fov != 1 (pcmode::FovScale; Hor+ alone it does): it no longer matches the picture,
+    // and the light ends in straight lines at the sides (cabins, rooms). There the 3D draws (W-buffered, vertex
+    // program) on the frame buffer keep only their view's rectangle (viewport constants c58/c59: scale, offset;
+    // a split screen's view stays inside its half); the light's own falloff ends it as before. fov = 1: unchanged.
+    if (w_buffer && surf.color && surf.width >= 640 && (s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3) == 2 &&
+        pcmode::FovScale() != 1.0f) {
+        const float* scale = s.constants[58];
+        const float* offset = s.constants[59];
+        const float hw = std::fabs(scale[0]), hh = std::fabs(scale[1]);
+        const float vx = offset[0] - 0.53125f, vy = offset[1] - 0.53125f;  // the view's centre (see below)
+        if (hw >= 16.0f && hh >= 16.0f && vx - hw >= -1.0f && vy - hh >= -1.0f && vx + hw <= float(surf.width) + 1.0f &&
+            vy + hh <= float(surf.height) + 1.0f) {  // constants that describe a view on this target
+            // guest pixels to host pixels as the surface clip goes (BindSurfaces)
+            const float sx = surf.scale * surf.wide * float(surf.scale_x), sy = surf.scale * float(surf.scale_y);
+            // the offset holds the XDK's pixel centre bias (+0.53125): the view is offset - 0.53125 +- scale
+            const LONG x0 = LONG(std::floor((vx - hw) * sx + 0.01f)), x1 = LONG(std::ceil((vx + hw) * sx - 0.01f));
+            const LONG y0 = LONG(std::floor((vy - hh) * sy + 0.01f)), y1 = LONG(std::ceil((vy + hh) * sy - 0.01f));
+            const LONG w = LONG(HostWidthOf(surf.width, surf.scale, surf.wide));
+            const LONG h = LONG(HostHeightOf(surf.height, surf.scale));
+            scissor = {std::max<LONG>(x0, 0), std::max<LONG>(y0, 0), std::min(x1, w), std::min(y1, h)};
+            if (scissor.left >= scissor.right || scissor.top >= scissor.bottom) scissor = surf.clip;
+        }
+    }
+    // ---- end PC features: fov ----
     if (narrowed) {
         // PC features: a narrowed 2D draw stays inside the 4:3 middle, as it stayed inside the console's screen
         // (HUD parts the game slides off screen must not show up beside it)
@@ -3136,6 +3163,9 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                 s.Reg(SET_COMBINER_FACTOR1 + 24), s.Reg(SET_COMBINER_FACTOR1 + 28));
         rt::Log("    alpha test %u func %X ref %u", s.Reg(SET_ALPHA_TEST_ENABLE), s.Reg(SET_ALPHA_FUNC),
                 s.Reg(SET_ALPHA_REF) & 0xFF);
+        rt::Log("    surface clip %08X %08X window clip type %X %08X %08X", s.Reg(SET_SURFACE_CLIP_HORIZONTAL),
+                s.Reg(SET_SURFACE_CLIP_VERTICAL), s.Reg(SET_WINDOW_CLIP_TYPE), s.Reg(SET_WINDOW_CLIP_HORIZONTAL),
+                s.Reg(SET_WINDOW_CLIP_VERTICAL));
         static const std::string trace_consts = [] {
             char value[256] = {};
             GetEnvironmentVariableA("FCI_TRACE_CONSTS", value, sizeof value);
