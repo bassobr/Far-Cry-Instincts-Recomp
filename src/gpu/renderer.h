@@ -9,7 +9,16 @@
 
 #include "gpu/kelvin.h"
 
+struct ID3D10Blob;
+
 namespace gpu::render {
+
+// D3DCompile (same arguments) for every HLSL compile of the exe. A failure is logged; the first of a run also shows
+// a message box (from its own thread, the game goes on): the HLSL compiler is the system's (Windows' own, Proton's
+// builtin), and one that lacks something leaves objects invisible. Under Wine/Proton the box explains protontricks.
+long CompileHlsl(const void* source, size_t size, const char* name, const void* defines, void* include,
+                 const char* entry, const char* target, unsigned flags1, unsigned flags2, ID3D10Blob** code,
+                 ID3D10Blob** errors);
 
 void DrawPrimitives(const kelvin::State& s, const kelvin::Draw& d);
 void Clear(const kelvin::State& s, uint32_t flags);

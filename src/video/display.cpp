@@ -19,6 +19,7 @@
 #include "app/focus_pause.h"  // PC comfort features
 #include "app/menu.h"         // settings menu
 #include "gpu/nv2a.h"
+#include "gpu/renderer.h"  // CompileHlsl
 #include "kernel/kernel.h"  // relaunch handover
 #include "hle/host_pad.h"  // controllers: motors off at exit
 #include "runtime/guest.h"
@@ -245,10 +246,10 @@ bool InitSwap() {
     g_swap.device->CreateTexture2D(&td, nullptr, &g_swap.frame);
     g_swap.device->CreateShaderResourceView(g_swap.frame.Get(), nullptr, &g_swap.frame_srv);
     Microsoft::WRL::ComPtr<ID3DBlob> vs, ps, errors;
-    if (FAILED(D3DCompile(kShaders, sizeof kShaders - 1, "display", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &vs,
-                          &errors)) ||
-        FAILED(D3DCompile(kShaders, sizeof kShaders - 1, "display", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &ps,
-                          &errors))) {
+    if (FAILED(gpu::render::CompileHlsl(kShaders, sizeof kShaders - 1, "display", nullptr, nullptr, "vs_main", "vs_5_0",
+                                        0, 0, &vs, &errors)) ||
+        FAILED(gpu::render::CompileHlsl(kShaders, sizeof kShaders - 1, "display", nullptr, nullptr, "ps_main", "ps_5_0",
+                                        0, 0, &ps, &errors))) {
         rt::Log("display: shader compile failed: %s, using GDI",
                 errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
         g_swap = {};

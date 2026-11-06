@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "app/settings.h"
+#include "gpu/renderer.h"  // CompileHlsl
 #include "runtime/log.h"
 
 namespace gpu::fps {
@@ -82,8 +83,8 @@ bool InitPipeline(ID3D11Device* device) {
     ComPtr<ID3DBlob> code, errors;
     auto compile = [&](const char* entry, const char* profile) {
         code.Reset(), errors.Reset();
-        HRESULT hr = D3DCompile(kShaders, sizeof kShaders - 1, "fps", nullptr, nullptr, entry, profile, 0, 0, &code,
-                                &errors);
+        HRESULT hr = gpu::render::CompileHlsl(kShaders, sizeof kShaders - 1, "fps", nullptr, nullptr, entry, profile, 0,
+                                              0, &code, &errors);
         if (FAILED(hr)) rt::Log("fps: %s: %s", entry, errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
         return SUCCEEDED(hr);
     };

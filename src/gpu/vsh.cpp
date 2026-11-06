@@ -21,6 +21,7 @@ struct VSOut {
     float4 t2 : TEXCOORD2;
     float4 t3 : TEXCOORD3;
     float wdepth : WDEPTH;  // w / zmax: the depth W-buffering stores, linear in eye space
+    float wdepth_c : WDEPTH1;  // the same, centroid-interpolated in the pixel shader (psh.cpp)
 };
 )";
 
@@ -319,6 +320,7 @@ std::string Generate(const State& s, uint16_t enabled, const uint8_t* formats) {
     o.t2 = O[11];
     o.t3 = O[12];
     o.wdepth = w * screen.z;
+    o.wdepth_c = o.wdepth;
     // W-buffering stores and clips w, not z: the first person view's projection puts the hands in front of
     // its near plane (z < 0), which must not cut them away
     if (screen.w == 2) o.pos.z = REVERSED_C / screen.z;  // performance: reversed depth, c / (w / zmax) after the divide

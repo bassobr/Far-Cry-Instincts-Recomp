@@ -879,8 +879,8 @@ ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile, uint64_
     ComPtr<ID3DBlob> code, errors;
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceCounter(&t0);
-    HRESULT hr = D3DCompile(source.data(), source.size(), profile, nullptr, nullptr, "main", profile,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors);
+    HRESULT hr = CompileHlsl(source.data(), source.size(), profile, nullptr, nullptr, "main", profile,
+                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors);
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&freq);
     {
@@ -1832,8 +1832,37 @@ struct Ring {
     }
 };
 
-// The HLSL compiler in use. Under Wine/Proton the builtin d3dcompiler_47 (vkd3d-shader) lacks parts of HLSL; the
-// build puts Microsoft's redistributable d3dcompiler_47.dll next to the exe, which the loader takes first
+// Safety net (CompileHlsl): the first failed HLSL compile of a run shows one message box, from a thread of its own so
+// that neither the render thread nor the background shader workers wait for it
+std::atomic<bool> g_hlsl_failure_shown{false};
+
+bool UnderWine() {
+    return GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+}
+
+void ShowHlslFailure() {
+    if (g_hlsl_failure_shown.exchange(true)) return;
+    const bool wine = UnderWine();
+    rt::Log("render: HLSL compile failed, showing a message box once (%s)", wine ? "Wine/Proton" : "Windows");
+    std::thread([wine] {
+        const wchar_t* text =
+            wine ? L"A shader could not be compiled. Proton's own HLSL compiler (d3dcompiler_47) does not handle "
+                   L"everything this game generates, so some objects may be invisible.\n\n"
+                   L"Fix: install Microsoft's compiler into the game's Proton prefix with protontricks:\n"
+                   L"    protontricks -l\n"
+                   L"(lists the app ID of the Far Cry Instincts shortcut), then\n"
+                   L"    protontricks <app ID> d3dcompiler_47\n\n"
+                   L"Details are in fci.log next to FarCryInstincts.exe. The game continues."
+                 : L"A shader could not be compiled by the system's HLSL compiler (d3dcompiler_47.dll), so some "
+                   L"objects may be invisible.\n\n"
+                   L"Details are in fci.log next to FarCryInstincts.exe. The game continues.";
+        MessageBoxW(nullptr, text, L"Far Cry Instincts", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    }).detach();
+}
+
+// The HLSL compiler in use. A release ships none: Windows' own in System32, under Wine/Proton the builtin
+// d3dcompiler_47 (vkd3d-shader, which lacks parts of HLSL: no isfinite, no EvaluateAttributeCentroid; the generated
+// HLSL avoids them). A d3dcompiler_47.dll next to the exe (the developer build copies the Windows SDK's) is taken first
 // (application directory) unless a DLL override says otherwise.
 void LogShaderCompiler() {
     HMODULE module = GetModuleHandleW(L"d3dcompiler_47.dll");
@@ -1854,6 +1883,16 @@ void LogShaderCompiler() {
     auto wine = reinterpret_cast<WineVersion>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version"));
     rt::Log("render: HLSL compiler %ls (version %u.%u.%u.%u)%s%s", path, v[0], v[1], v[2], v[3], wine ? ", Wine " : "",
             wine ? wine() : "");
+    // test of the safety net: FCI_TEST_SHADER_FAILURE=1 compiles a broken shader once
+    char test[4] = {};
+    if (GetEnvironmentVariableA("FCI_TEST_SHADER_FAILURE", test, sizeof test) && test[0] == '1') {
+        static const char kBroken[] = "float4 main() : SV_Target { return no_such_function(); }";
+        ComPtr<ID3DBlob> code, errors;
+        if (FAILED(CompileHlsl(kBroken, sizeof kBroken - 1, "test", nullptr, nullptr, "main", "ps_5_0", 0, 0, &code,
+                               &errors)))
+            rt::Log("render: FCI_TEST_SHADER_FAILURE: %s",
+                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+    }
 }
 
 bool Ready() {
@@ -1876,11 +1915,11 @@ bool Ready() {
     if (g_hle) ao::Prepare(g_device.Get());  // ambient occlusion shaders compile in the background
     g_clear_constants = MakeConstantBuffer(32);
     ComPtr<ID3DBlob> code, errors;
-    if (SUCCEEDED(D3DCompile(kClearShader, std::strlen(kClearShader), "clear", nullptr, nullptr, "vs", "vs_5_0", 0, 0,
-                             &code, &errors)))
+    if (SUCCEEDED(CompileHlsl(kClearShader, std::strlen(kClearShader), "clear", nullptr, nullptr, "vs", "vs_5_0", 0, 0,
+                              &code, &errors)))
         g_device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_clear_vs);
-    if (SUCCEEDED(D3DCompile(kClearShader, std::strlen(kClearShader), "clear", nullptr, nullptr, "ps", "ps_5_0", 0, 0,
-                             &code, &errors)))
+    if (SUCCEEDED(CompileHlsl(kClearShader, std::strlen(kClearShader), "clear", nullptr, nullptr, "ps", "ps_5_0", 0, 0,
+                              &code, &errors)))
         g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_clear_ps);
     rt::Log("render: Direct3D 11 device ready");
     return true;
@@ -1910,11 +1949,11 @@ void Reinterpret(Target& src, Target& dst) {
     static ComPtr<ID3D11Buffer> constants;
     if (!vs) {
         ComPtr<ID3DBlob> code, errors;
-        if (SUCCEEDED(D3DCompile(kReinterpretShader, std::strlen(kReinterpretShader), "alias", nullptr, nullptr, "vs",
-                                 "vs_5_0", 0, 0, &code, &errors)))
+        if (SUCCEEDED(CompileHlsl(kReinterpretShader, std::strlen(kReinterpretShader), "alias", nullptr, nullptr, "vs",
+                                  "vs_5_0", 0, 0, &code, &errors)))
             g_device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &vs);
-        if (SUCCEEDED(D3DCompile(kReinterpretShader, std::strlen(kReinterpretShader), "alias", nullptr, nullptr, "ps",
-                                 "ps_5_0", 0, 0, &code, &errors)))
+        if (SUCCEEDED(CompileHlsl(kReinterpretShader, std::strlen(kReinterpretShader), "alias", nullptr, nullptr, "ps",
+                                  "ps_5_0", 0, 0, &code, &errors)))
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &ps);
         constants = MakeConstantBuffer(32);
     }
@@ -2092,14 +2131,14 @@ ScalePass& Scaler() {
     static ScalePass p;
     if (!p.vs) {
         ComPtr<ID3DBlob> code, errors;
-        if (SUCCEEDED(D3DCompile(kScaleShader, std::strlen(kScaleShader), "scale", nullptr, nullptr, "vs", "vs_5_0", 0, 0,
-                                 &code, &errors)))
+        if (SUCCEEDED(CompileHlsl(kScaleShader, std::strlen(kScaleShader), "scale", nullptr, nullptr, "vs", "vs_5_0", 0,
+                                  0, &code, &errors)))
             g_device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &p.vs);
-        if (SUCCEEDED(D3DCompile(kScaleShader, std::strlen(kScaleShader), "scale", nullptr, nullptr, "shrink", "ps_5_0",
-                                 0, 0, &code, &errors)))
+        if (SUCCEEDED(CompileHlsl(kScaleShader, std::strlen(kScaleShader), "scale", nullptr, nullptr, "shrink",
+                                  "ps_5_0", 0, 0, &code, &errors)))
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &p.shrink);
-        if (SUCCEEDED(D3DCompile(kScaleShader, std::strlen(kScaleShader), "scale", nullptr, nullptr, "grow", "ps_5_0", 0,
-                                 0, &code, &errors)))
+        if (SUCCEEDED(CompileHlsl(kScaleShader, std::strlen(kScaleShader), "scale", nullptr, nullptr, "grow", "ps_5_0",
+                                  0, 0, &code, &errors)))
             g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &p.grow);
         p.constants = MakeConstantBuffer(16);
     }
@@ -3470,6 +3509,20 @@ void SetGammaRamp(const uint8_t ramp[768]) { present::SetGamma(ramp); }
 std::recursive_mutex& ContextLock() {
     static std::recursive_mutex lock;
     return lock;
+}
+
+
+long CompileHlsl(const void* source, size_t size, const char* name, const void* defines, void* include,
+                 const char* entry, const char* target, unsigned flags1, unsigned flags2, ID3D10Blob** code,
+                 ID3D10Blob** errors) {
+    HRESULT hr = D3DCompile(source, size, name, static_cast<const D3D_SHADER_MACRO*>(defines),
+                            static_cast<ID3DInclude*>(include), entry, target, flags1, flags2, code, errors);
+    if (FAILED(hr)) {
+        rt::Log("render: HLSL %s %s %s: compile failed (%08X)", name ? name : "?", entry ? entry : "?",
+                target ? target : "?", unsigned(hr));
+        ShowHlslFailure();
+    }
+    return hr;
 }
 
 }  // namespace gpu::render

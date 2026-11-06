@@ -174,6 +174,9 @@ std::string Generate(const State& s, const Config& config) {
             if (at != std::string::npos) input.insert(at, "nointerpolation ");
         }
     }
+    // the centroid copy of the W-buffer depth (below): as an interpolation mode, not EvaluateAttributeCentroid, which
+    // Wine's / Proton's builtin HLSL compiler (vkd3d-shader) lacks
+    input.insert(input.find("float wdepth_c"), "centroid ");
     out += input;
     // W-buffering: the depth is w (scaled to the depth range by D3D's projection), linear in eye space, which
     // keeps far geometry apart (z/w in 24 bits cannot: water and shore fought at a distance). w / zmax is tiny
@@ -191,12 +194,12 @@ std::string Generate(const State& s, const Config& config) {
     switch (config.depth) {
     case Depth::kW:
         out += "\nfloat4 main(VSOut input, bool front : SV_IsFrontFace, out float depth : SV_Depth) : SV_Target {\n"
-               "    depth = saturate(EvaluateAttributeCentroid(input.wdepth) + depth_bias.x + depth_bias.y * "
+               "    depth = saturate(input.wdepth_c + depth_bias.x + depth_bias.y * "
                "max(abs(ddx(input.wdepth)), abs(ddy(input.wdepth))));\n";
         break;
     case Depth::kReversedW:
         out += "\nfloat4 main(VSOut input, bool front : SV_IsFrontFace, out float depth : SV_Depth) : SV_Target {\n"
-               "    depth = " + c_value + " / max(EvaluateAttributeCentroid(input.wdepth) + depth_bias.x + depth_bias.y * "
+               "    depth = " + c_value + " / max(input.wdepth_c + depth_bias.x + depth_bias.y * "
                "max(abs(ddx(input.wdepth)), abs(ddy(input.wdepth))), " + c_value + ");\n";
         break;
     case Depth::kReversedZ:

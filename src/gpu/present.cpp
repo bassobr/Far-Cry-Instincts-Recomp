@@ -30,7 +30,7 @@
 #include "gpu/fmv.h"          // PC features: fmv_scale
 #include "gpu/fps_overlay.h"  // PC features: fps_counter
 #include "gpu/nv2a.h"
-#include "gpu/renderer.h"  // performance: ContextLock
+#include "gpu/renderer.h"  // performance: ContextLock; CompileHlsl
 #include "gpu/smaa_shader.h"
 #include "gpu/smaa_textures.h"
 #include "runtime/log.h"
@@ -167,8 +167,8 @@ bool InitColourBlind() {
     if (FAILED(g_device->CreateBuffer(&cb, &init, &g_colour_cb))) return false;
     if (!g_colour_blind) return true;
     ComPtr<ID3DBlob> code, errors;
-    if (FAILED(D3DCompile(kColourShaders, sizeof kColourShaders - 1, "present_colour", nullptr, nullptr, "ps_gamma_cb",
-                          "ps_5_0", 0, 0, &code, &errors)))
+    if (FAILED(gpu::render::CompileHlsl(kColourShaders, sizeof kColourShaders - 1, "present_colour", nullptr, nullptr,
+                                        "ps_gamma_cb", "ps_5_0", 0, 0, &code, &errors)))
         return rt::Log("present: ps_gamma_cb: %s", errors ? (const char*)errors->GetBufferPointer() : "?"), false;
     g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_gamma_cb);
     rt::Log("present: colour blind mode %s: %.3f %.3f %.3f / %.3f %.3f %.3f / %.3f %.3f %.3f", kNames[g_colour_blind],
@@ -227,8 +227,8 @@ bool InitPipeline() {
     ComPtr<ID3DBlob> code, errors;
     auto compile = [&](const char* entry, const char* profile) -> bool {
         code.Reset(), errors.Reset();
-        HRESULT hr = D3DCompile(kShaders, sizeof kShaders - 1, "present", nullptr, nullptr, entry, profile, 0, 0,
-                                &code, &errors);
+        HRESULT hr = gpu::render::CompileHlsl(kShaders, sizeof kShaders - 1, "present", nullptr, nullptr, entry,
+                                              profile, 0, 0, &code, &errors);
         if (FAILED(hr))
             rt::Log("present: %s: %s", entry, errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
         return SUCCEEDED(hr);
@@ -329,12 +329,12 @@ bool InitSmaa() {
     const char* ps[3] = {"smaa_edges", "smaa_weights", "smaa_blend"};
     for (int i = 0; i < 3; i++) {
         ComPtr<ID3DBlob> code, errors;
-        if (FAILED(D3DCompile(hlsl.data(), hlsl.size(), "smaa", nullptr, nullptr, vs[i], "vs_5_0",
-                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+        if (FAILED(gpu::render::CompileHlsl(hlsl.data(), hlsl.size(), "smaa", nullptr, nullptr, vs[i], "vs_5_0",
+                                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
             return rt::Log("present: SMAA %s: %s", vs[i], errors ? (const char*)errors->GetBufferPointer() : "?"), false;
         g_device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_smaa.vs[i]);
-        if (FAILED(D3DCompile(hlsl.data(), hlsl.size(), "smaa", nullptr, nullptr, ps[i], "ps_5_0",
-                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
+        if (FAILED(gpu::render::CompileHlsl(hlsl.data(), hlsl.size(), "smaa", nullptr, nullptr, ps[i], "ps_5_0",
+                                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
             return rt::Log("present: SMAA %s: %s", ps[i], errors ? (const char*)errors->GetBufferPointer() : "?"), false;
         g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_smaa.ps[i]);
     }
@@ -490,8 +490,8 @@ float g_display_white = 0, g_display_peak = 0;  // settings menu: what Windows r
 
 bool InitHdrShader() {
     ComPtr<ID3DBlob> code, errors;
-    if (FAILED(D3DCompile(kHdrShaders, sizeof kHdrShaders - 1, "present_hdr", nullptr, nullptr, "ps_hdr", "ps_5_0", 0,
-                          0, &code, &errors)))
+    if (FAILED(gpu::render::CompileHlsl(kHdrShaders, sizeof kHdrShaders - 1, "present_hdr", nullptr, nullptr, "ps_hdr",
+                                        "ps_5_0", 0, 0, &code, &errors)))
         return rt::Log("present: ps_hdr: %s", errors ? (const char*)errors->GetBufferPointer() : "?"), false;
     D3D11_BUFFER_DESC cb{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
     D3D11_SUBRESOURCE_DATA init{g_hdr_params, 0, 0};
@@ -499,8 +499,8 @@ bool InitHdrShader() {
               SUCCEEDED(g_device->CreateBuffer(&cb, &init, &g_hdr_cb));
     // settings menu: the panel over the HDR10 picture
     code.Reset(), errors.Reset();
-    if (SUCCEEDED(D3DCompile(kHdrShaders, sizeof kHdrShaders - 1, "present_hdr", nullptr, nullptr, "ps_ui_hdr",
-                             "ps_5_0", 0, 0, &code, &errors)))
+    if (SUCCEEDED(gpu::render::CompileHlsl(kHdrShaders, sizeof kHdrShaders - 1, "present_hdr", nullptr, nullptr,
+                                           "ps_ui_hdr", "ps_5_0", 0, 0, &code, &errors)))
         g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_ps_ui_hdr);
     return ok;
 }

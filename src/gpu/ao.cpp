@@ -24,6 +24,7 @@
 #include <string>
 
 #include "app/settings.h"
+#include "gpu/renderer.h"  // CompileHlsl
 #include "runtime/log.h"
 
 namespace gpu::ao {
@@ -277,8 +278,8 @@ ComPtr<ID3D11PixelShader> Pixel(const char* entry, bool ms) {
     std::string text = std::string(ms ? "#define MS 1\n" : "") + kHlsl;
     ComPtr<ID3DBlob> code, errors;
     ComPtr<ID3D11PixelShader> ps;
-    if (FAILED(D3DCompile(text.data(), text.size(), "ao", nullptr, nullptr, entry, "ps_5_0",
-                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
+    if (FAILED(gpu::render::CompileHlsl(text.data(), text.size(), "ao", nullptr, nullptr, entry, "ps_5_0",
+                                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
         rt::Log("ao: %s compile failed: %s", entry, errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
         return nullptr;
     }
@@ -298,7 +299,8 @@ void InitOnce(ID3D11Device* device) {
     g.init = true;
     g.device = device;
     ComPtr<ID3DBlob> code, errors;
-    if (FAILED(D3DCompile(kHlsl, std::strlen(kHlsl), "ao", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &code, &errors)) ||
+    if (FAILED(gpu::render::CompileHlsl(kHlsl, std::strlen(kHlsl), "ao", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &code,
+                                        &errors)) ||
         FAILED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g.vs))) {
         g.failed = true;
         return;
