@@ -1,0 +1,39 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    },
+    {
+      "name": "precise",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/out/build/precise",
+      "cacheVariables": { "FCI_PRECISE": "ON" }
+    },
+    {
+      "name": "debug",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/out/build/debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "pgo-gen",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/out/build/pgo-gen",
+      "cacheVariables": { "FCI_PGO": "generate" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "precise", "configurePreset": "precise" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "pgo-gen", "configurePreset": "pgo-gen" }
+  ]
+}

@@ -1,0 +1,26 @@
+# game files and everything derived from them stay local
+*.iso
+assets/
+asset_fc1/
+generated/
+out/
+build/
+screenshots/
+*.bmp
+
+# written next to the executable or into the working directory when the game runs
+# (normally inside out/, listed here in case it is started from elsewhere)
+FarCryInstincts.ini
+FarCryInstincts.ini.tmp
+shader_cache/
+textures/
+data/hdd/
+fci.log
+gpu.log
+apu.log
+audio.raw
+hdr_*.raw
+hdr_*.txt
+mem_*.bin
+shader_*.hlsl
+*.profraw

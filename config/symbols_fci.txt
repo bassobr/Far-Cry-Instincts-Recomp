@@ -1,0 +1,36 @@
+# Symbols found by hand (not in XbSymbolDatabase), same format as symbols.txt
+
+# DirectSound (src/xdk/dsound.cpp): CDirectSoundStream's vtables as its constructor 0x0057E627 stores them,
+# the full HRTF tables the filter pick at 0x00580144 reads (index of filters, filters with the ITD byte)
+var DSound_StreamVtable = 0x005EE3DC
+var DSound_StreamVtable2 = 0x005EE3CC
+var DSound_HrtfFilters = 0x005879A0
+var DSound_HrtfIndex = 0x00598F60
+# ---- graphics HLE (src/xdk/d3d8.cpp): D3D symbols located by hand; SCDA-XBERecomp's names where it has them ----
+fun D3D_InitHardwareState = 0x0050B380  # CDevice::Init: SET_OBJECT, DMA contexts, semaphore offset pushes
+fun D3D_InitDefaultState = 0x0050B490  # SCDA D3D_InitDefaultState: default transforms, render and stage states
+fun D3D_InternalAddRef = 0x0050C3E0  # SCDA D3D_InternalAddRef
+fun D3D_InternalRelease = 0x0050C580  # SCDA D3D_InternalRelease
+fun D3D_DestroyResourceDeferred = 0x00510A20  # the RunPushBuffer patch record the GPU interrupt applies late
+var D3D_Device = 0x00517580  # the static CDevice, D3D_g_pDevice points at it
+var D3D_DirtyFlags = 0x005170D8  # lazy state flags (CDevice::Init ORs 0xFF7F7F in)
+var D3D_g_GpuRegisters = 0x005170CC  # the NV2A register base D3D reads
+var D3D_g_PushBufferSize = 0x00519D14  # D3D_SetPushBufferSize, default 0x80000
+var D3D_g_PushBufferSegment = 0x00519D10  # default 0x8000
+var D3D_g_DeviceCreated = 0x00517EB8
+var D3D_g_FixedFunctionShader = 0x00519BF8  # the device's vertex shader record for FVF draws (CDevice::Init)
+# ---- end graphics HLE ----
+# ---- PC features (src/xdk/game.cpp) ----
+fun Game_CameraUpdate = 0x002A84E0  # CCamera update, camera in ebx: projection and frustum from fov +0x38, aspect +0x384
+fun Game_FirstPersonProjection = 0x002469E0  # renderer in eax: projection of first person items from fov +0x698, viewport and pixel aspect +0x6AC
+# ---- end PC features ----
+# ---- PC shadows (src/xdk/shadows.cpp) ----
+fun Game_ShadowPass = 0x00458C80  # (engine, ?, view environment: camera +0, sun shadow radius +0x34, ...; 7 args, ret 0x1C): shadow casting lights, their cameras and depth passes
+fun Game_ShadowReceiveTest = 0x0047A2C0  # sector in eax, camera position in ecx (ret 0x14): receives the sun shadow when (distance - 46) <= [engine+0x10B4]
+# ---- end PC shadows ----
+# ---- PC level of detail (src/xdk/lod.cpp) ----
+fun Game_EngineCVars = 0x00481B30  # block in eax (0x108 bytes, [0x006B4AB8]): registers the 3D engine's console variables bound to its fields (e_obj_lod_ratio +0xF8, e_obj_view_dist_ratio +0xFC, e_obj_sprite_switch_dist_ratio +0x100)
+# ---- end PC level of detail ----
+# ---- start level (src/hle/start_level.cpp, FCI_START_LEVEL) ----
+fun Game_PushCommand = 0x00012000  # (edx = command text, game; ret 4): queues a game command (StartLevel, ReturnToMenu, ...) at game+0x3A4
+# ---- end start level ----

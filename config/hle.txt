@@ -1,0 +1,106 @@
+# XDK functions replaced by host code (src/xdk); one symbol name per line
+D3DDevice_SetFlickerFilter  # smoke test of the HLE path (src/xdk/smoke.cpp)
+
+# DirectSound: the XDK library on the host mixer (src/xdk/dsound.cpp), FCI_LLE_AUDIO=1 keeps the recompiled one
+DirectSoundCreate
+IDirectSound_Release
+DirectSoundUseFullHRTF
+IDirectSound_GetSpeakerConfig
+IDirectSound_SetEffectData
+IDirectSound_EnableHeadphones
+IDirectSound_SetMixBinHeadroom
+IDirectSound_CommitDeferredSettings
+IDirectSound_SetDopplerFactor
+IDirectSound_SetRolloffFactor
+IDirectSound_SetVelocity
+IDirectSound_SetI3DL2Listener
+IDirectSound_SetPosition
+IDirectSound_SetOrientation
+DirectSoundDoWork
+XAudioDownloadEffectsImage
+DirectSoundCreateBuffer
+IDirectSound_CreateSoundBuffer
+IDirectSoundBuffer_Release
+IDirectSoundBuffer_Unlock
+IDirectSoundBuffer_SetBufferData
+IDirectSoundBuffer_Play
+IDirectSoundBuffer_Stop
+IDirectSoundBuffer_SetLoopRegion
+IDirectSoundBuffer_GetStatus
+IDirectSoundBuffer_GetCurrentPosition
+IDirectSoundBuffer_SetCurrentPosition
+IDirectSoundBuffer_Lock
+IDirectSoundBuffer_SetVolume
+IDirectSoundBuffer_SetFrequency
+IDirectSoundBuffer_SetFilter
+IDirectSoundBuffer_SetHeadroom
+IDirectSoundBuffer_SetMixBinVolumes_8
+IDirectSoundBuffer_SetMixBins
+IDirectSoundBuffer_SetMaxDistance
+IDirectSoundBuffer_SetMinDistance
+IDirectSoundBuffer_SetPosition
+IDirectSoundBuffer_SetVelocity
+IDirectSoundBuffer_SetI3DL2Source
+DirectSoundCreateStream
+CDirectSoundStream_AddRef
+CDirectSoundStream_Release
+CDirectSoundStream_GetInfo
+CDirectSoundStream_GetStatus__r2
+CDirectSoundStream_Process
+CDirectSoundStream_Discontinuity
+CDirectSoundStream_Flush
+CDirectSoundStream_FlushEx
+CDirectSoundStream_Pause
+CDirectSoundStream_SetVolume
+CDirectSoundStream_SetFrequency
+CDirectSoundStream_SetFilter
+CDirectSoundStream_SetHeadroom
+CDirectSoundStream_SetMixBinVolumes_8
+CDirectSoundStream_SetMixBins
+CDirectSoundStream_SetMaxDistance
+CDirectSoundStream_SetMinDistance
+CDirectSoundStream_SetPosition
+CDirectSoundStream_SetVelocity
+CDirectSoundStream_SetI3DL2Source
+IDirectSoundStream_FlushEx
+IDirectSoundStream_Pause
+IDirectSoundStream_SetVolume
+IDirectSoundStream_SetFrequency
+IDirectSoundStream_SetFilter
+IDirectSoundStream_SetHeadroom
+IDirectSoundStream_SetMixBinVolumes_8
+IDirectSoundStream_SetMixBins
+IDirectSoundStream_SetMaxDistance
+IDirectSoundStream_SetMinDistance
+IDirectSoundStream_SetPosition
+IDirectSoundStream_SetVelocity
+IDirectSoundStream_SetI3DL2Source
+# ---- graphics HLE (src/xdk/d3d8.cpp) ----
+Direct3D_CreateDevice
+D3D_MakeRequestedSpace_8
+CDevice_KickOff
+D3D_KickOffAndWaitForIdle
+D3D_BlockOnTime
+D3DDevice_IsBusy
+D3D_BlockOnResource
+Lock2DSurface
+D3DDevice_RunPushBuffer
+D3DDevice_BlockUntilVerticalBlank
+D3DDevice_SetGammaRamp
+D3DDevice_PersistDisplay
+D3DDevice_UpdateOverlay
+# ---- end graphics HLE ----
+# ---- PC features (src/xdk/game.cpp) ----
+Game_CameraUpdate
+Game_FirstPersonProjection
+# ---- end PC features ----
+# ---- PC shadows (src/xdk/shadows.cpp) ----
+Game_ShadowPass
+Game_ShadowReceiveTest
+# ---- end PC shadows ----
+# ---- PC level of detail (src/xdk/lod.cpp) ----
+Game_EngineCVars
+# ---- end PC level of detail ----
+# ---- start level (src/hle/start_level.cpp) ----
+Game_PushCommand
+# ---- end start level ----
