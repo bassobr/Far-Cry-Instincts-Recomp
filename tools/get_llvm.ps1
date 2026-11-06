@@ -24,17 +24,28 @@ $Major = $Version.Split(".")[0]
 if (-not $Cache) { $Cache = $Out }
 New-Item -ItemType Directory -Force $Out, $Cache | Out-Null
 
+# Windows' own curl and bsdtar: a Git for Windows tar earlier in PATH (CI runners) takes C:\... for a remote host
+$curlExe = Join-Path $env:SystemRoot "System32\curl.exe"
+$tarExe = Join-Path $env:SystemRoot "System32\tar.exe"
+$clock = [Diagnostics.Stopwatch]::StartNew()
+function Step([string]$Text) { Write-Host ("[{0,6:N1} s] {1}" -f $clock.Elapsed.TotalSeconds, $Text) }
+
 function Get-Pinned([string]$Url, [string]$File, [string]$Sha) {
     if (-not (Test-Path $File) -or (Get-FileHash $File -Algorithm SHA256).Hash -ne $Sha) {
-        Write-Host "downloading $Url"
-        Invoke-WebRequest -UseBasicParsing $Url -OutFile "$File.part"
+        Step "downloading $Url"
+        & $curlExe -fsSL --retry 3 -o "$File.part" $Url
+        if ($LASTEXITCODE -ne 0) { throw "downloading $Url failed ($LASTEXITCODE)" }
         Move-Item -Force "$File.part" $File
+        Step "downloaded $File ($([math]::Round((Get-Item $File).Length / 1MB, 1)) MB)"
+    } else {
+        Step "using $File"
     }
     $hash = (Get-FileHash $File -Algorithm SHA256).Hash
     if ($hash -ne $Sha) { throw "$File has SHA-256 $hash, expected $Sha" }
+    Step "SHA-256 ok: $hash"
 }
 
-$tar = Join-Path $Cache $Archive
+$tar = (Join-Path (Resolve-Path $Cache).Path $Archive)
 Get-Pinned $ArchiveUrl $tar $ArchiveSha256
 Get-Pinned $LicenseUrl (Join-Path $Out "LICENSE.TXT") $LicenseSha256
 
@@ -44,8 +55,10 @@ $members = @("bin/clang.exe", "bin/clang-cl.exe", "bin/lld-link.exe", "bin/llvm-
 $stage = Join-Path $Out "extract"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
-& tar.exe -xf $tar -C $stage @members
+Step "extracting $($members.Count) members with $tarExe"
+& $tarExe -xf $tar -C $stage @members
 if ($LASTEXITCODE -ne 0) { throw "extracting $tar failed" }
+Step "extracted"
 foreach ($dir in "bin", "lib") {
     if (Test-Path (Join-Path $Out $dir)) { Remove-Item -Recurse -Force (Join-Path $Out $dir) }
     Move-Item (Join-Path $stage "$top\$dir") (Join-Path $Out $dir)
@@ -54,4 +67,4 @@ Remove-Item -Recurse -Force $stage
 
 $reported = & (Join-Path $Out "bin\clang.exe") --version | Select-Object -First 1
 if ($reported -notmatch "clang version $([regex]::Escape($Version))\b") { throw "unexpected clang: $reported" }
-Write-Host "LLVM $Version in $Out ($reported)"
+Step "LLVM $Version in $Out ($reported)"

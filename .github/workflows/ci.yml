@@ -12,6 +12,7 @@ jobs:
   # config/game_code.profdata, and the one a release bundles) builds everything.
   build-test:
     runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
