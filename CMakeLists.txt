@@ -24,6 +24,34 @@ FetchContent_Declare(zydis
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(zydis)
 
+# shared by the recompiler and the game executable
+add_library(xbe STATIC src/xbe/xbe.cpp)
+target_include_directories(xbe PUBLIC src)
+
+add_executable(fci-recomp
+    tools/recomp/main.cpp
+    tools/recomp/analysis.cpp
+    tools/recomp/codegen.cpp
+    tools/recomp/codegen_insn.cpp
+    tools/recomp/xmm_live.cpp
+    tools/recomp/semtest.cpp)
+target_link_libraries(fci-recomp PRIVATE xbe Zydis)
+
+# only the recompiler and the semantics test, whose cases fci-recomp writes without an XBE (CI, no game files)
+option(FCI_TOOLS_ONLY "Build fci-recomp and fci-semtest only, without default.xbe" OFF)
+if(FCI_TOOLS_ONLY)
+    set(SEMTEST_CASES ${CMAKE_BINARY_DIR}/semtest/semtest_cases.cpp)
+    add_custom_command(
+        OUTPUT ${SEMTEST_CASES}
+        COMMAND fci-recomp --semtest ${SEMTEST_CASES}
+        DEPENDS fci-recomp
+        COMMENT "Writing the semantics test cases")
+    add_executable(fci-semtest tools/semtest/main.cpp ${SEMTEST_CASES})
+    target_include_directories(fci-semtest PRIVATE src tools)
+    target_link_libraries(fci-semtest PRIVATE Zydis)
+    return()
+endif()
+
 # SDL3 for controllers (any pad SDL knows: Xbox, PlayStation, Switch, generic), static so it links into the exe;
 # settings as in SCDA-XBERecomp (MIT)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -50,19 +78,6 @@ set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp)
-
-# shared by the recompiler and the game executable
-add_library(xbe STATIC src/xbe/xbe.cpp)
-target_include_directories(xbe PUBLIC src)
-
-add_executable(fci-recomp
-    tools/recomp/main.cpp
-    tools/recomp/analysis.cpp
-    tools/recomp/codegen.cpp
-    tools/recomp/codegen_insn.cpp
-    tools/recomp/xmm_live.cpp
-    tools/recomp/semtest.cpp)
-target_link_libraries(fci-recomp PRIVATE xbe Zydis)
 
 # the recompiled game code, written by fci-recomp into generated/
 set(FCI_PARTITIONS 128)

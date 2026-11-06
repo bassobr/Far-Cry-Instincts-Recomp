@@ -28,12 +28,19 @@
       "inherits": "release",
       "binaryDir": "${sourceDir}/out/build/pgo-gen",
       "cacheVariables": { "FCI_PGO": "generate" }
+    },
+    {
+      "name": "tools",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/out/build/tools",
+      "cacheVariables": { "FCI_TOOLS_ONLY": "ON" }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "precise", "configurePreset": "precise" },
     { "name": "debug", "configurePreset": "debug" },
-    { "name": "pgo-gen", "configurePreset": "pgo-gen" }
+    { "name": "pgo-gen", "configurePreset": "pgo-gen" },
+    { "name": "tools", "configurePreset": "tools" }
   ]
 }

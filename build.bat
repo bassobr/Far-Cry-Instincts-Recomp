@@ -1,5 +1,6 @@
 @echo off
 rem Builds the recompiler, recompiles assets\default.xbe and compiles the result.
+rem "build.bat tools" builds only the recompiler and the semantics test, without the game.
 setlocal
 set "PRESET=%~1"
 if "%PRESET%"=="" set "PRESET=release"
@@ -12,7 +13,7 @@ if not defined VSDIR (
 )
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
-if not exist assets\default.xbe (
+if /i not "%PRESET%"=="tools" if not exist assets\default.xbe (
     echo assets\default.xbe missing, extract the game first:
     echo   powershell -File tools\xiso.ps1 -Iso ^<game.iso^> -Out assets
     exit /b 1

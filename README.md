@@ -104,6 +104,11 @@ To check the recompiler's instruction semantics against the host CPU:
 out\build\release\fci-semtest.exe
 ```
 
+`build.bat tools` builds only `fci-recomp` and `fci-semtest` into `out\build\tools\`, without the game; it needs no
+`assets\` folder. CI builds this preset and runs the semantics test, without any game files. Releases never contain
+the game, its recompiled code or an executable built from it: `FarCryInstincts.exe` is always built from your own
+`default.xbe`.
+
 ### PGO profile
 
 The release build optimises the recompiled code with the clang PGO profile `config/game_code.profdata` when it

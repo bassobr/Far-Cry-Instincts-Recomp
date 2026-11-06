@@ -1,5 +1,6 @@
 // fci-recomp: translates the x86 code of Far Cry Instincts' default.xbe into C++.
 //   fci-recomp <default.xbe> <output dir> [config dir]
+//   fci-recomp --semtest <file.cpp>   only the instruction semantics test (tools/semtest), no XBE needed
 // The config dir holds symbols.txt (XDK symbols, tools/symbols.py), symbols_fci.txt (found by hand) and
 // hle.txt (the symbols host code replaces, one name per line).
 #include <cstdio>
@@ -66,8 +67,16 @@ bool LoadHooks(const std::filesystem::path& path) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: fci-recomp <default.xbe> <output dir>\n");
+        std::fprintf(stderr, "usage: fci-recomp <default.xbe> <output dir> [config dir]\n"
+                             "       fci-recomp --semtest <file.cpp>\n");
         return 1;
+    }
+    // the test cases are fixed instructions (semtest.cpp), translated without a program around them
+    if (std::string(argv[1]) == "--semtest") {
+        xbe::Image image;
+        recomp::Analysis analysis(image, {});
+        recomp::Codegen codegen(image, analysis);
+        return recomp::WriteSemanticsTest(codegen, argv[2]) > 0 ? 0 : 1;
     }
     xbe::Image image;
     std::string error;
