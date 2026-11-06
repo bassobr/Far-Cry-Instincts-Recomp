@@ -242,9 +242,9 @@ target_link_libraries(FarCryInstincts PRIVATE xbe dbghelp winmm d3d11 dxgi d3dco
 # what it exports to the game code DLL (FCI_RT_API, hle_hooks.h, the C runtime functions of runtime.cpp) goes into
 # its import library, compiler/FarCryInstincts.lib, which the DLL links against
 set_target_properties(FarCryInstincts PROPERTIES ENABLE_EXPORTS ON ARCHIVE_OUTPUT_DIRECTORY ${COMPILER_DIR})
-# Microsoft's HLSL compiler (Windows SDK redistributable) next to the developer build's exe, which the loader takes
-# first (application directory). A release does not ship it (tools/dist.ps1): it uses the system's, Windows' own or
-# Proton's builtin (vkd3d-shader); delete the copy to test a Proton run as a release does
+# Microsoft's HLSL compiler (Windows SDK redistributable) next to the exe, which the loader takes first (application
+# directory), under Wine/Proton too; a release ships it (tools/dist.ps1). Delete the copy to test Proton's builtin
+# compiler (vkd3d-shader)
 find_file(FCI_D3DCOMPILER_DLL d3dcompiler_47.dll
     PATHS "$ENV{WindowsSdkDir}Redist/D3D/x64" "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64" NO_DEFAULT_PATH)
 if(FCI_D3DCOMPILER_DLL)

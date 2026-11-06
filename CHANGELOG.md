@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 (unreleased)
+
+- The release ships Microsoft's `d3dcompiler_47.dll` again, next to the executable. Proton loads it instead of its
+  builtin compiler, so the Steam Deck needs no protontricks step and gets the full GPU performance (split screen about
+  8 % faster than with Proton's compiler). The Proton shader fix and the message box of 0.1.1 stay as a safety net.
+
 ## 0.1.1 (2026-11-06)
 
 - The release no longer contains Microsoft's `d3dcompiler_47.dll`. The game uses the system's HLSL compiler: the
