@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.4 (unreleased)
+## 0.1.4 (2026-11-07)
 
 - The water surface seen from below no longer flickers (#9). A recompiler bug: status flags were not passed between a
   function and the code it calls or returns to. The C runtime's hand-written x87 `acos` and `asin` rely on that, so
