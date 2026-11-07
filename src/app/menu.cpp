@@ -285,10 +285,10 @@ const Setting kSettings[] = {
      When::Restart, "Resolution of the shadow maps."},
     {"shadow_distance", "SHADOW DISTANCE", "1", [] { return Range(1, 8, 1, 1, 0, "x"); }, When::Restart,
      "Reach of the sun's shadows, times the console's (~15 m)."},
-    {"shadow_cascades", "SHADOW CASCADES", "on",
-     [] { return Choices{{"on", "ON (DEFAULT)"}, {"off", "OFF"}}; }, When::Restart,
-     "With shadow distance 2x or more: the console's shadows near you in a map of their own (sharp, every caster), "
-     "the far ones as before. The game draws near and far on alternate frames."},
+    {"shadow_cascades", "SHADOW CASCADES", "off",
+     [] { return Choices{{"off", "OFF (DEFAULT)"}, {"on", "ON (EXPERIMENTAL)"}}; }, When::Restart,
+     "Experimental, with shadow distance 2x or more: the console's shadows near you in a map of their own (sharp, "
+     "every caster), the far ones as before. The game draws near and far on alternate frames, which can flicker."},
     {"shadow_filter", "SHADOW FILTER", "soft",
      [] { return Choices{{"soft", "SOFT (DEFAULT)"}, {"sharp", "SHARP (CONSOLE)"}}; }, When::Restart,
      "Soft shadow edges, or the NV2A's 2x2 filter."},

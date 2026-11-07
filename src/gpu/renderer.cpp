@@ -294,6 +294,7 @@ bool g_frame_3d = false;  // a W-buffered (3D) draw went into a widened target s
 // draws into the widened target are the HUD. 2D before it belongs to the view (the sun's glare sprite, placed by
 // the widened camera) and must not be narrowed or clipped to the 4:3 middle
 bool g_post_3d = false;
+float g_view_3d[4] = {};  // viewport (scale x, y, offset x, y) of the last 3D draw into a widened target
 // fmv_scale (gpu/fmv.h): a video texture went full screen into a widened target since the last present; the frame
 // is shown at the widescreen aspect and the 2D over it stays in the 4:3 middle
 bool g_frame_video = false;
@@ -304,6 +305,87 @@ std::vector<std::pair<kelvin::State, kelvin::Draw>> g_before_video;
 bool g_replay_now = false, g_replaying = false;
 uint32_t g_stage_video[4] = {};  // per stage of the current draw: width << 16 | height of a linear guest texture
 // ---- end PC features ----
+
+// ---- diagnostics: FCI_TRACE_HUD (GitHub #17) ----
+// How draws are classified for the widescreen HUD (DrawOne, Present).
+// FCI_TRACE_HUD=<s>[,<s>...]: one whole frame from each of these seconds (after the first draw) on, a line per draw:
+// target, W-buffered, 3D view seen, post processing begun, narrowed, box of its positions, w of the first vertex,
+// colour mask, blending, shaders.
+// FCI_TRACE_HUD=watch (also with times: watch,<s>,...): a line whenever the per-frame summary changes: 3D draws after
+// the post processing (in another view: a new 3D view begins; in the same view: kept), 2D draws over the 3D view left
+// wide after such a new view (not its own 2D before its post processing), narrowed draws, draws classified otherwise
+// than before GitHub #17.
+struct HudTrace {
+    bool init = false, watch = false;
+    int times = 0;
+    double at[8] = {};
+    ULONGLONG start = 0;
+    int frame = 0;  // 1: this frame is traced, -1: the next one is
+    // watch: this frame's summary and the last one logged
+    uint32_t restarts = 0, kept = 0, wide_2d = 0, narrowed = 0, changed = 0;
+    uint32_t last[5] = {~0u, ~0u, ~0u, ~0u, ~0u};
+    uint64_t frames = 0, since = 0;
+    // the classification before GitHub #17 (any 3D draw after the post processing began a new view, no clip space
+    // quads as full screen), for comparison: post processing begun, the first draw classified otherwise
+    bool old_post = false;
+    char change[200] = {};
+    char first[160] = {};  // the first 2D draw left wide
+    char restart[320] = {};  // the first 3D draw after the post processing
+    // DrawOne: a 3D draw into a widened target after the post processing (view: viewport scale x, y, offset x, y)
+    void Restart(bool same_view, uint32_t count, uint32_t blend, uint64_t vs, uint64_t ps, const float* view,
+                 const float* before) {
+        // the first one, but one in another view rather than in the same
+        if ((same_view ? kept++ : restarts++) || (restart[0] && (same_view || restarts > 1 || !kept))) return;
+        std::snprintf(restart, sizeof restart,
+                      "%s view, count %u blend %u vs %016llX ps %016llX, view %g %g %g %g (before %g %g %g %g)",
+                      same_view ? "same" : "other", count, blend, (unsigned long long)vs, (unsigned long long)ps,
+                      view[0], view[1], view[2], view[3], before[0], before[1], before[2], before[3]);
+    }
+    void Init() {
+        init = true;
+        start = GetTickCount64();
+        char v[128] = {};
+        if (!GetEnvironmentVariableA("FCI_TRACE_HUD", v, sizeof v)) return;
+        for (char* p = v; *p && times < 8;) {
+            if (!std::strncmp(p, "watch", 5)) watch = true;
+            else at[times++] = std::atof(p);
+            p = std::strchr(p, ',');
+            if (!p) break;
+            p++;
+        }
+        if (watch) rt::Log("render: hud trace: watching the classification frame by frame");
+    }
+    bool On() const { return watch || times; }
+    // Present: the frame ends
+    void Frame(float aspect) {
+        if (watch) {
+            frames++;
+            const uint32_t now[5] = {restarts, kept, wide_2d ? 1u : 0u, narrowed ? 1u : 0u, changed ? 1u : 0u};
+            if (std::memcmp(now, last, sizeof now)) {
+                rt::Log("render: hud trace: frame %llu (%.1f s): 3D after the post processing: %u new views, %u in "
+                        "the same view%s%s; 2D left wide over a new view %u%s%s; narrowed %u; classified otherwise "
+                        "than before #17 %u%s%s; aspect %.3f (before: %llu frames)",
+                        (unsigned long long)frames, (GetTickCount64() - start) / 1000.0, restarts, kept,
+                        restart[0] ? ", first: " : "", restart, wide_2d, wide_2d ? ", first: " : "", first, narrowed,
+                        changed, changed ? ", first: " : "", change, aspect, (unsigned long long)(frames - since));
+                std::memcpy(last, now, sizeof last);
+                since = frames;
+            }
+            restarts = kept = wide_2d = narrowed = changed = 0;
+            first[0] = restart[0] = change[0] = 0;
+        }
+        old_post = false;
+        if (frame == 1) frame = 0, rt::Log("render: hud trace: present (aspect %.3f)", aspect);
+        else if (frame == -1) frame = 1, rt::Log("render: hud trace: frame start");
+        for (int i = 0; i < times && frame == 0; i++)
+            if (at[i] > 0 && GetTickCount64() - start >= ULONGLONG(at[i] * 1000)) {
+                at[i] = 0, frame = -1;  // the next present starts a traced frame
+                rt::Log("render: hud trace: armed at %.1f s", (GetTickCount64() - start) / 1000.0);
+            }
+    }
+};
+HudTrace g_hud_trace;
+// ---- end diagnostics ----
 
 // performance (fractional render scale): host rows of a guest height, the host row a guest row starts at
 uint32_t HostHeightOf(uint32_t height, float scale) { return uint32_t(float(height) * scale + 0.5f); }
@@ -2946,13 +3028,31 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     // hud: x' = x * hud[0] + hud[1], y' = y * hud[2] + hud[3] for vertices with w = 1 (identity: as drawn)
     vc.hud[0] = 1.0f, vc.hud[1] = 0.0f, vc.hud[2] = 1.0f, vc.hud[3] = 0.0f;
     bool narrowed = false;
-    if (g_frame_3d && surf.color && surf.color->wide == 1.0f) g_post_3d = true;
+    bool old_narrowed = false;  // diagnostics: FCI_TRACE_HUD=watch, as before GitHub #17
+    if (g_frame_3d && surf.color && surf.color->wide == 1.0f) g_post_3d = g_hud_trace.old_post = true;
     // fmv_scale: frames of a video (a video texture drawn, or the overlay showing one) are shown wide too
     const bool video_frame = fmv::Fill() && (g_frame_video || g_last_video || gpu::OverlayActive());
     if (surf.color && surf.color->wide != 1.0f) {
         if (vc.screen[3] != 0) {
+            // A 3D draw after the post processing begins another 3D view (split screen: the next player's) only if
+            // it goes to another part of the screen; in the same view it is part of the post processing, and the
+            // HUD after it is still narrowed. The feral vision draws 3D after its tint (a vertex program in the
+            // view's viewport, VS 664EFBF835E19AA8, and a fixed function pass, VS 9685CBB901367C84) and nothing into
+            // a smaller target after that: taken for a new view, the HUD stayed stretched over the whole width as
+            // long as the feral vision was on (GitHub #17).
+            // The view: the viewport of a vertex program (c58/c59: scale and offset, x and y; a split screen's view
+            // has its own). Fixed function draws carry it in the composite matrix (the viewport registers hold only
+            // the pixel centre bias), so they begin no new view; a split screen's next view draws vertex programs.
+            const bool program = (s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3) == 2;
+            const float view[4] = {s.constants[58][0], s.constants[58][1], s.constants[59][0], s.constants[59][1]};
+            const bool same_view = !program || std::memcmp(view, g_view_3d, sizeof view) == 0;
+            if (g_post_3d && g_hud_trace.watch)  // diagnostics: FCI_TRACE_HUD
+                g_hud_trace.Restart(same_view, d.count, s.Reg(SET_BLEND_ENABLE), vsh::Key(s, d.enabled),
+                                    psh::Key(s, config), view, g_view_3d);
+            if (!same_view) g_post_3d = false;
+            g_hud_trace.old_post = false;
             g_frame_3d = true;
-            g_post_3d = false;  // another 3D view (split screen)
+            if (program) std::memcpy(g_view_3d, view, sizeof view);
         } else if (((g_frame_3d && g_post_3d) || fmv::Fill()) && (d.enabled & 1) && d.stride >= 4 && !g_counting &&
                    s.Reg(SET_COLOR_MASK) != 0) {
             // (visibility tests are no HUD: FCI decides per water patch from a pre-transformed test polygon whether to
@@ -2967,10 +3067,17 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             // batch whose parts slide out at both sides spans the width too, but neither the height nor one quad
             bool across = lo <= 1.0f && hi >= surf.width - 1.0f;
             bool covers = across && top <= 1.0f && bottom >= surf.height - 1.0f;
+            old_narrowed = (g_frame_3d && g_hud_trace.old_post && !(covers || (across && d.count <= 6))) ||
+                           (video_frame && !g_frame_3d && !covers);  // diagnostics: FCI_TRACE_HUD=watch
+            // a quad given in clip space (-1..1; the vertex program spreads it over the screen) covers it too: the
+            // feral vision's tint (GitHub #17), narrowed it tinted only the 4:3 middle
+            auto clip_full = [](float a, float b) { return a <= -0.99f && b >= 0.99f && b - a <= 2.5f; };
+            if (d.count <= 6 && clip_full(lo, hi) && clip_full(top, bottom)) across = covers = true;
             // ---- fmv_scale: a video texture (title, menus) scaled to fill, from then on the frame is a video's ----
             uint32_t video = g_stage_video[0];
             if (fmv::Fill() && !g_frame_3d && video && StageSamples(s.Reg(SET_SHADER_STAGE_PROGRAM) & 0x1F) &&
                 fmv::IsVideo(video >> 16, video & 0xFFFF)) {
+                old_narrowed = false;  // diagnostics: FCI_TRACE_HUD=watch
                 float z = fmv::Transform(lo, top, hi, bottom, video & 0xFFFF, vc.hud);
                 static uint64_t logged = 0;
                 uint64_t what = uint64_t(video) << 32 ^ uint64_t(z * 1000);
@@ -3014,6 +3121,47 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         }
     }
     // ---- end PC features ----
+    // ---- diagnostics: FCI_TRACE_HUD ----
+    if (!g_hud_trace.init) g_hud_trace.Init();
+    if (g_hud_trace.On()) {
+        const bool two_d = vc.screen[3] == 0 && (d.enabled & 1) && d.stride >= 4 && !g_counting &&
+                           s.Reg(SET_COLOR_MASK) != 0 && surf.color && surf.color->wide != 1.0f && g_frame_3d;
+        const bool traced = g_hud_trace.frame == 1;
+        const bool left_wide = g_hud_trace.watch && two_d && !narrowed && !g_post_3d && g_hud_trace.restarts;
+        if (g_hud_trace.watch && narrowed) g_hud_trace.narrowed++;
+        const bool changed = g_hud_trace.watch && narrowed != old_narrowed;
+        if (traced || left_wide || changed) {
+            float lo = 1e30f, hi = -1e30f, top = 1e30f, bottom = -1e30f;
+            const std::vector<float>& vertices = kelvin::Vertices(d);
+            if ((d.enabled & 1) && d.stride >= 4)
+                for (size_t v = 0; v + 4 <= vertices.size(); v += d.stride) {
+                    lo = std::min(lo, vertices[v]), hi = std::max(hi, vertices[v]);
+                    top = std::min(top, vertices[v + 1]), bottom = std::max(bottom, vertices[v + 1]);
+                }
+            if (traced)
+                rt::Log("render: hud trace: draw %llu target %08X %ux%u wide %.3f w %d f3d %d post %d narrowed %d "
+                        "count %u stride %u box %.1f,%.1f..%.1f,%.1f w0 %g mask %X blend %u vs %016llX ps %016llX "
+                        "mode %u c58 %g %g c59 %g %g",
+                        (unsigned long long)g_draws, surf.color ? surf.color->address : 0, surf.width, surf.height,
+                        surf.color ? surf.color->wide : 0.0f, int(vc.screen[3] != 0), g_frame_3d, g_post_3d,
+                        narrowed, d.count, d.stride, lo, top, hi, bottom,
+                        vertices.size() >= 4 && (d.enabled & 1) ? vertices[3] : -1.0f, s.Reg(SET_COLOR_MASK),
+                        s.Reg(SET_BLEND_ENABLE), (unsigned long long)vsh::Key(s, d.enabled),
+                        (unsigned long long)psh::Key(s, config), s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3,
+                        s.constants[58][0], s.constants[58][1], s.constants[59][0], s.constants[59][1]);
+            if (changed && !g_hud_trace.changed++)
+                std::snprintf(g_hud_trace.change, sizeof g_hud_trace.change,
+                              "%s, target %08X box %.1f,%.1f..%.1f,%.1f count %u vs %016llX ps %016llX",
+                              narrowed ? "narrowed" : "wide", surf.color ? surf.color->address : 0, lo, top, hi,
+                              bottom, d.count, (unsigned long long)vsh::Key(s, d.enabled),
+                              (unsigned long long)psh::Key(s, config));
+            if (left_wide && !g_hud_trace.wide_2d++)
+                std::snprintf(g_hud_trace.first, sizeof g_hud_trace.first,
+                              "box %.1f,%.1f..%.1f,%.1f count %u vs %016llX ps %016llX", lo, top, hi, bottom, d.count,
+                              (unsigned long long)vsh::Key(s, d.enabled), (unsigned long long)psh::Key(s, config));
+        }
+    }
+    // ---- end diagnostics ----
     static Constants<VertexConstants> vertex_constants;
     ID3D11Buffer* vcb = vertex_constants.Update(vc);
     bool factor0_each = s.Reg(SET_COMBINER_CONTROL) & 0x1000, factor1_each = s.Reg(SET_COMBINER_CONTROL) & 0x10000;
@@ -3628,8 +3776,9 @@ void SetHle(bool on) {
         rt::Log("render: shadow distance x%.2f: shadow maps %ux (texels %.2fx the size at shadow_scale %u)", k,
                 g_q.shadow_scale, density * k / g_q.shadow_scale, density);
         // shadow cascades: the console's square in a near map at shadow_scale, the rest as before
-        const std::string cascades = settings::String("shadow_cascades", "on");
-        if (k >= 2.0f && cascades != "off" && cascades != "0") {
+        // off by default since 0.1.6: near and far maps on alternate frames flickered on players' machines (GitHub #16)
+        const std::string cascades = settings::String("shadow_cascades", "off");
+        if (k >= 2.0f && (cascades == "on" || cascades == "1")) {
             g_q.near_scale = density;
             rt::Log("render: shadow cascades: near map %ux%u over the console's square (the game's shadow pass "
                     "alternating near and far)", 1024 * density, 1024 * density);
@@ -3686,6 +3835,7 @@ void Present(uint32_t front) {
     g_last_video = g_frame_video;
     g_before_video.clear();
     float aspect = (shown && shown->wide != 1.0f && g_frame_3d) || video ? pcmode::Aspect() : 4.0f / 3.0f;
+    if (g_hud_trace.On()) g_hud_trace.Frame(aspect);  // diagnostics: FCI_TRACE_HUD
     g_frame_3d = false;
     g_frame_video = false;
     g_post_3d = false;

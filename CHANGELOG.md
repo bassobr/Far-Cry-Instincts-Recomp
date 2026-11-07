@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.6 (2026-11-07)
+
+- Shadow cascades are off by default (#16). In 0.1.5 they drew the near and the far shadow map on alternate frames,
+  and on some systems the shadows near the player vanished every second frame, which flickered. `shadow_cascades = on`
+  keeps the experimental path until a flicker-free version is ready.
+- Feral vision on widescreen (#17): the HUD no longer stretches across the whole screen while feral vision is on (the
+  extra 3D passes feral vision draws after its tint were taken for a new view, which switched off the HUD's 4:3
+  centring), and the feral colour tint covers the whole screen instead of only the 4:3 middle.
+
 ## 0.1.5 (2026-11-07)
 
 - Original water (#14): `water_quality = original` draws the game's own water exactly as the Xbox does, with none of
