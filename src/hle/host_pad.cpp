@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "app/settings.h"
+#include "hle/prompts.h"
 #include "runtime/log.h"
 
 namespace hle::host {
@@ -232,6 +233,37 @@ void ApplyRumble(int slot) {
     }
 }
 
+// ---- button prompts (hle/prompts.h, GitHub #15): the controller's family for its prompt glyphs ----
+// FCI_VIRTUAL_PAD_TYPE=ps3|ps4|ps5|switch|xbox: what the virtual pads of FCI_VIRTUAL_PADS count as (tests)
+prompts::PadFamily Family(int slot, int* generation) {
+    *generation = 0;
+    if (g_backend != Backend::Sdl || !g_pads[slot]) return prompts::PadFamily::kXbox;
+    if (VirtualIn(slot)) {
+        char text[16] = {};
+        GetEnvironmentVariableA("FCI_VIRTUAL_PAD_TYPE", text, sizeof text);
+        std::string t = Lower(text);
+        if (t.size() == 3 && t.compare(0, 2, "ps") == 0) {
+            *generation = t[2] - '0';
+            return prompts::PadFamily::kPlayStation;
+        }
+        if (t == "switch") return prompts::PadFamily::kSwitch;
+        return prompts::PadFamily::kXbox;
+    }
+    switch (SDL_GetGamepadType(g_pads[slot])) {
+    case SDL_GAMEPAD_TYPE_XBOX360:
+    case SDL_GAMEPAD_TYPE_XBOXONE: return prompts::PadFamily::kXbox;
+    case SDL_GAMEPAD_TYPE_PS3: *generation = 3; return prompts::PadFamily::kPlayStation;
+    case SDL_GAMEPAD_TYPE_PS4: *generation = 4; return prompts::PadFamily::kPlayStation;
+    case SDL_GAMEPAD_TYPE_PS5: *generation = 5; return prompts::PadFamily::kPlayStation;
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return prompts::PadFamily::kSwitch;
+    default: return prompts::PadFamily::kGeneric;
+    }
+}
+// ---- end button prompts ----
+
 void AddPad(SDL_JoystickID id) {
     for (SDL_Gamepad* pad : g_pads)
         if (pad && SDL_GetGamepadID(pad) == id) return;
@@ -255,6 +287,9 @@ void AddPad(SDL_JoystickID id) {
             SDL_GetGamepadProduct(*slot), SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false) ? ", rumble" : "",
             VirtualIn(n) ? ", virtual" : "");
     if (g_motor[n].low || g_motor[n].high) ApplyRumble(n);
+    int generation;  // button prompts
+    prompts::PadFamily family = Family(n, &generation);
+    prompts::NotePadConnected(family, generation);
 }
 
 void RemovePad(SDL_JoystickID id) {
@@ -434,6 +469,24 @@ bool ReadXInput(int slot, State& s) {
     return true;
 }
 
+// ---- button prompts: a button newly pressed, a trigger past half way or a stick past half its deflection (drift
+// stays below) means the player uses this controller ----
+uint32_t g_prompt_held[kSlots] = {};
+
+void NoteUse(int slot, const State& s) {
+    uint32_t held = 0;
+    for (int b = 0; b < kPhysicalCount; b++)
+        if (s.value[b] > 128) held |= 1u << b;
+    bool used = (held & ~g_prompt_held[slot]) != 0;
+    g_prompt_held[slot] = held;
+    for (int16_t t : s.thumb) used = used || t > 16384 || t < -16384;
+    if (!used) return;
+    int generation;
+    prompts::PadFamily family = Family(slot, &generation);
+    prompts::NotePad(family, generation);
+}
+// ---- end button prompts ----
+
 }  // namespace
 
 bool Connected(int slot) {
@@ -454,6 +507,7 @@ bool Read(int slot, Pad& p) {
     State s;
     if (!(g_backend == Backend::Sdl ? ReadSdl(slot, s) : g_backend == Backend::XInput && ReadXInput(slot, s)))
         return false;
+    NoteUse(slot, s);  // button prompts
     p = Pad{};
     for (int i = 0; i < kTargetCount; i++) {
         uint8_t v = 0;
@@ -533,6 +587,7 @@ void SetBinding(int target, int slot, int button) {
     }
     settings::Set((std::string("pad_bind_") + kTargets[target].name).c_str(), ButtonList(list));
     g_binds = LoadBindings();
+    prompts::BindingsChanged();  // button prompts
 }
 
 void ResetBindings() {
@@ -541,6 +596,7 @@ void ResetBindings() {
     for (int i = 0; i < kTargetCount; i++)
         settings::Set((std::string("pad_bind_") + kTargets[i].name).c_str(), kTargets[i].defaults);
     g_binds = LoadBindings();
+    prompts::BindingsChanged();  // button prompts
 }
 
 void ReloadOptions() {

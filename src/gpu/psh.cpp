@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "gpu/vsh.h"
 #include "runtime/log.h"
@@ -151,20 +152,39 @@ uint64_t Key(const State& s, const Config& config) {
     for (int i = 0; i < 4; i++) alpha_kill |= ((s.Reg(SET_TEXTURE_CONTROL0 + 0x40 * i) & kTextureAlphaKill) ? 1u : 0u) << i;
     mix(alpha_kill);
     bool shadow = false;
-    for (int i = 0; i < 4; i++) mix(uint32_t(config.sampler[i])), shadow |= config.sampler[i] == Sampler::kShadow;
+    for (int i = 0; i < 4; i++) {
+        const Sampler k = config.sampler[i];
+        mix(uint32_t(k));
+        shadow |= k == Sampler::kShadow || k == Sampler::kSceneDepth || k == Sampler::kSceneDepthMS;
+        if (k == Sampler::kSceneDepth || k == Sampler::kSceneDepthMS)  // point or linear (one texel or four)
+            mix((s.Reg(SET_TEXTURE_FILTER + 0x40 * i) >> 24) & 0xF);
+    }
     if (shadow) mix(s.Reg(SET_SHADOW_COMPARE_FUNC));
+    if (shadow && config.cascade) mix(0xCA5CADE5);  // PC shadows: cascades
     return h;
 }
 
 std::string Generate(const State& s, const Config& config) {
     std::string out = kPrelude;
-    static const char* const kTextureType[] = {"Texture2D", "Texture2D", "TextureCube", "Texture3D", "Texture2D"};
+    static const char* const kTextureType[] = {"Texture2D",        "Texture2D", "TextureCube", "Texture3D",
+                                               "Texture2D",        "Texture2D<float>", "Texture2DMS<float>"};
     for (int i = 0; i < 4; i++) {
         char line[128];
         snprintf(line, sizeof line, "%s tex%d : register(t%d);\nSamplerState smp%d : register(s%d);\n",
                  kTextureType[int(config.sampler[i])], i, i, i, i);
         out += line;
     }
+    bool cascade = false;  // PC shadows: cascades
+    for (int i = 0; i < 4; i++) cascade |= config.cascade && config.sampler[i] == Sampler::kShadow;
+    if (cascade)
+        // the near cascade: a second map over part of the shadow map's square (renderer.cpp, "shadow cascades")
+        out += "Texture2D tex_near : register(t4);\n"
+               "Texture2D tex_far : register(t5);\n"
+               "cbuffer Cascade : register(b5) {\n"
+               "    float4 cascade_n[3];  // near map (u, v, depth) = cascade_n x the receiver's (u, v, depth, 1)\n"
+               "    float4 cascade_f[3];  // far map's\n"
+               "    float4 cascade_fade;  // x: 1 / the fading edge in near map coordinates\n"
+               "};\n";
 
     // the vertex shader's outputs, with flat colors when the shade mode asks for them
     std::string input = vsh::kOutputStruct;
@@ -239,7 +259,7 @@ std::string Generate(const State& s, const Config& config) {
     uint32_t other = s.Reg(SET_SHADER_OTHER_STAGE_INPUT);
     uint32_t clip_mode = s.Reg(SET_SHADER_CLIP_PLANE_MODE);
     out += "    float4 t0 = 0, t1 = 0, t2 = 0, t3 = 0;\n";
-    if (g_shadow_debug) out += "    float shadow_dbg = 1, shadow_in = -1, shadow_ref = 0;\n";  // PC shadows
+    if (g_shadow_debug) out += "    float shadow_dbg = 1, shadow_in = -1, shadow_ref = 0, shadow_near = 0;\n";  // PC shadows
     for (int i = 0; i < 4; i++) {
         uint32_t program = (programs >> (5 * i)) & 0x1F;
         if (!program) continue;
@@ -259,6 +279,54 @@ std::string Generate(const State& s, const Config& config) {
             out += line;
         };
         char coords[160];
+        if (sampler == Sampler::kSceneDepth || sampler == Sampler::kSceneDepthMS) {
+            // a depth texture on the 3D view's depth target (the ocean's stage 2 reads the frame's depth buffer, with
+            // r/q = zmax and GREATER). The host keeps that depth as float, maybe multisampled and reversed
+            // (c / d), at a multiple of the guest's size: each of the four guest texels around the point is read at
+            // its centre, turned back into the guest's depth and compared as the NV2A compares a depth texel with
+            // r/q (texel <op> reference, as for the shadow maps below), weighted as its bilinear filter weights them;
+            // with a point filter (the ocean's) only the texel the point lies in
+            const bool ms = sampler == Sampler::kSceneDepthMS;
+            const bool point = ((s.Reg(SET_TEXTURE_FILTER + 0x40 * i) >> 24) & 0xF) == 1;
+            std::string op;
+            switch (s.Reg(SET_SHADOW_COMPARE_FUNC) & 7) {
+            case 0: op = "false"; break;
+            case 1: op = "d < ref"; break;
+            case 2: op = "d == ref"; break;
+            case 3: op = "d <= ref"; break;
+            case 4: op = "d > ref"; break;
+            case 5: op = "d != ref"; break;
+            case 6: op = "d >= ref"; break;
+            default: op = "true"; break;
+            }
+            if (program != 1 && program != 2) op = "true";  // (not seen: no comparison, the depth itself)
+            char depth[2048];
+            snprintf(depth, sizeof depth,
+                     "    {\n"
+                     "        float3 p = T[%d].xyz / (T[%d].w == 0 ? 1 : T[%d].w);\n"
+                     "        float ref = p.z / tex_scale[%d].z, w, h%s;\n"
+                     "        tex%d.GetDimensions(w, h%s);\n"
+                     "        float2 q = p.xy - 0.5, base = floor(q), f = q - base;\n"
+                     "%s"
+                     "        float4 lit = 0, dv = 0;\n"
+                     "        [unroll] for (int k = 0; k < %d; k++) {\n"
+                     "            int2 at = int2(clamp((base + float2(k & 1, k >> 1) + 0.5) * tex_scale[%d].xy, 0, float2(w, h) - 1));\n"
+                     "            float stored = tex%d.Load(%s).x;\n"
+                     "            float d = tex_scale[%d].w > 0 ? tex_scale[%d].w / max(stored, tex_scale[%d].w) : stored;\n"
+                     "            dv[k] = d;\n"
+                     "            lit[k] = (%s) ? 1 : 0;\n"
+                     "        }\n"
+                     "        t%d = %s;\n"
+                     "    }\n",
+                     i, i, i, i, ms ? ", n" : "", i, ms ? ", n" : "",
+                     point ? "        base = floor(p.xy), f = 0;\n" : "", point ? 1 : 4, i, i, ms ? "at, 0" : "int3(at, 0)", i, i, i,
+                     op.c_str(), i,
+                     (program == 1 || program == 2)
+                         ? "dot(lit, float4((1 - f.x) * (1 - f.y), f.x * (1 - f.y), (1 - f.x) * f.y, f.x * f.y)).xxxx"
+                         : "dv.xxxx");
+            out += depth;
+            continue;
+        }
         if (sampler == Sampler::kShadow && (program == 1 || program == 2)) {
             // shadow map: the share of the four nearest texels that pass the comparison, weighted as bilinear
             // filtering would (percentage closer filtering, as the NV2A does with a linear filter)
@@ -276,43 +344,80 @@ std::string Generate(const State& s, const Config& config) {
             default: op = "true"; break;
             }
             char shadow[2048];
-            if (g_shadow_filter == 1) {
-                // ---- PC shadows: soft, the average of 3x3 bilinear lookups one texel apart (a tent over the
-                // 4x4 texels base - 1 .. base + 2 around the point, weights (1 - f, 1, 1, f) per axis), from four
-                // gathers of 2x2 texels (gather order: x left bottom, y right bottom, z right top, w left top) ----
-                snprintf(shadow, sizeof shadow,
-                         "    {\n"
-                         "        float3 p = T[%d].xyz / (T[%d].w == 0 ? 1 : T[%d].w);\n"
-                         "        float2 uv = p.xy * tex_scale[%d].xy;\n"
-                         "        float ref = p.z / tex_scale[%d].z, w, h;\n"
-                         "        tex%d.GetDimensions(w, h);\n"
-                         "        float2 size = float2(w, h), q = uv * size - 0.5, base = floor(q), f = q - base;\n"
-                         "        float sum = 0;\n"
-                         "        [unroll] for (int gy = 0; gy < 2; gy++) [unroll] for (int gx = 0; gx < 2; gx++) {\n"
-                         "            float4 d = tex%d.Gather(smp%d, (base + 0.25 + 2 * float2(gx, gy)) / size);\n"
-                         "            float4 lit = (%s) ? 1 : 0;\n"
-                         "            float wl = gx ? 1 : 1 - f.x, wr = gx ? f.x : 1, wt = gy ? 1 : 1 - f.y, wb = gy ? f.y : 1;\n"
-                         "            sum += dot(lit, float4(wl * wb, wr * wb, wr * wt, wl * wt));\n"
-                         "        }\n"
-                         "        t%d = (sum / 9).xxxx;\n"
-                         "    }\n",
-                         i, i, i, i, i, i, i, i, op.c_str(), i);
+            // the lookup of one map (tex) at uv into result (a float declared before)
+            auto lookup = [&](const char* tex, const char* uv, const char* result, const char* ref) {
+                std::string compare = op;  // its reference: ref, or the near map's
+                for (size_t at = compare.find("ref"); at != std::string::npos; at = compare.find("ref", at + 1))
+                    compare.replace(at, 3, ref), at += std::strlen(ref) - 1;
+                if (g_shadow_filter == 1) {
+                    // ---- PC shadows: soft, the average of 3x3 bilinear lookups one texel apart (a tent over the
+                    // 4x4 texels base - 1 .. base + 2 around the point, weights (1 - f, 1, 1, f) per axis), from four
+                    // gathers of 2x2 texels (gather order: x left bottom, y right bottom, z right top, w left top) ----
+                    snprintf(shadow, sizeof shadow,
+                             "        {\n"
+                             "            float w, h;\n"
+                             "            %s.GetDimensions(w, h);\n"
+                             "            float2 size = float2(w, h), q = %s * size - 0.5, base = floor(q), f = q - base;\n"
+                             "            float sum = 0;\n"
+                             "            [unroll] for (int gy = 0; gy < 2; gy++) [unroll] for (int gx = 0; gx < 2; gx++) {\n"
+                             "                float4 d = %s.Gather(smp%d, (base + 0.25 + 2 * float2(gx, gy)) / size);\n"
+                             "                float4 lit = (%s) ? 1 : 0;\n"
+                             "                float wl = gx ? 1 : 1 - f.x, wr = gx ? f.x : 1, wt = gy ? 1 : 1 - f.y, wb = gy ? f.y : 1;\n"
+                             "                sum += dot(lit, float4(wl * wb, wr * wb, wr * wt, wl * wt));\n"
+                             "            }\n"
+                             "            %s = sum / 9;\n"
+                             "        }\n",
+                             tex, uv, tex, i, compare.c_str(), result);
+                    // ---- end PC shadows ----
+                } else {
+                    snprintf(shadow, sizeof shadow,
+                             "        {\n"
+                             "            float w, h;\n"
+                             "            %s.GetDimensions(w, h);\n"
+                             "            float2 f = frac(%s * float2(w, h) - 0.5);\n"
+                             "            float4 d = %s.Gather(smp%d, %s);\n"
+                             "            float4 lit = (%s) ? 1 : 0;\n"
+                             "            %s = dot(lit, float4((1 - f.x) * f.y, f.x * f.y, f.x * (1 - f.y), (1 - f.x) * (1 - f.y)));\n"
+                             "        }\n",
+                             tex, uv, tex, i, uv, compare.c_str(), result);
+                }
+                return std::string(shadow);
+            };
+            char head[512];
+            snprintf(head, sizeof head,
+                     "    {\n"
+                     "        float3 p = T[%d].xyz / (T[%d].w == 0 ? 1 : T[%d].w);\n"
+                     "        float2 uv = p.xy * tex_scale[%d].xy;\n"
+                     "        float ref = p.z / tex_scale[%d].z, lit_far = 1, lit_near = 1;\n",
+                     i, i, i, i, i);
+            const std::string tex = "tex" + std::to_string(i);
+            out += head;
+            if (cascade) {
+                // ---- PC shadows: cascades. Each map's coordinates and depth from the receiver's (affine maps: the
+                // game's sun cameras are orthographic along the sun; the game's own map this frame is either one);
+                // where the near map covers the point it is used, fading into the far map over its outer edge (no
+                // seam); either map is read only where its weight is above 0 ----
+                out += "        float4 pr = float4(uv, ref, 1);\n"
+                       "        float2 uv_near = float2(dot(cascade_n[0], pr), dot(cascade_n[1], pr));\n"
+                       "        float ref_near = dot(cascade_n[2], pr);\n"
+                       "        float2 uv_far = float2(dot(cascade_f[0], pr), dot(cascade_f[1], pr));\n"
+                       "        float ref_far = dot(cascade_f[2], pr);\n"
+                       "        float2 e = min(uv_near, 1 - uv_near);\n"
+                       "        float near_w = saturate(min(e.x, e.y) * cascade_fade.x);\n"
+                       "        [branch] if (near_w > 0)\n";
+                out += lookup("tex_near", "uv_near", "lit_near", "ref_near");
+                out += "        [branch] if (near_w < 1)\n";
+                out += lookup("tex_far", "uv_far", "lit_far", "ref_far");
+                snprintf(shadow, sizeof shadow, "        t%d = lerp(lit_far, lit_near, near_w).xxxx;\n", i);
+                out += shadow;
+                if (g_shadow_debug) out += "        shadow_near = near_w;\n";
                 // ---- end PC shadows ----
             } else {
-                snprintf(shadow, sizeof shadow,
-                         "    {\n"
-                         "        float3 p = T[%d].xyz / (T[%d].w == 0 ? 1 : T[%d].w);\n"
-                         "        float2 uv = p.xy * tex_scale[%d].xy;\n"
-                         "        float ref = p.z / tex_scale[%d].z, w, h;\n"
-                         "        tex%d.GetDimensions(w, h);\n"
-                         "        float2 f = frac(uv * float2(w, h) - 0.5);\n"
-                         "        float4 d = tex%d.Gather(smp%d, uv);\n"
-                         "        float4 lit = (%s) ? 1 : 0;\n"
-                         "        t%d = dot(lit, float4((1 - f.x) * f.y, f.x * f.y, f.x * (1 - f.y), (1 - f.x) * (1 - f.y))).xxxx;\n"
-                         "    }\n",
-                         i, i, i, i, i, i, i, i, op.c_str(), i);
+                out += lookup(tex.c_str(), "uv", "lit_far", "ref");
+                snprintf(shadow, sizeof shadow, "        t%d = lit_far.xxxx;\n", i);
+                out += shadow;
             }
-            out += shadow;
+            out += "    }\n";
             if (g_shadow_debug) {  // PC shadows: FCI_SHADOW_DEBUG=1
                 snprintf(shadow, sizeof shadow,
                          "    { float3 p = T[%d].xyz / (T[%d].w == 0 ? 1 : T[%d].w); float2 uv = p.xy * tex_scale[%d].xy;\n"
@@ -458,8 +563,10 @@ std::string Generate(const State& s, const Config& config) {
         out += "    float a = round(color.a * 255), ref = alpha_ref.x;\n";
         out += std::string("    if (!(") + Compare(s.Reg(SET_ALPHA_FUNC)) + ")) discard;\n";
     }
-    // PC shadows: FCI_SHADOW_DEBUG=1 tints what a shadow map covers green and its shadow red
-    // (2: red = outside the map, green = lit, blue = beyond its depth range)
+    // PC shadows: FCI_SHADOW_DEBUG=1 tints what a shadow map covers green and its shadow red, the near cascade's
+    // share blue (2: red = outside the map, green = lit, blue = beyond its depth range)
+    if (g_shadow_debug == 1)
+        out += "    color.rgb = lerp(color.rgb, float3(0, 0.3, 1), 0.3 * shadow_near);\n";
     if (g_shadow_debug == 2)
         out += "    if (shadow_in >= 0) color.rgb = float3(1 - shadow_in, shadow_dbg, shadow_ref >= 1 ? 1 : 0);\n";
     if (g_shadow_debug == 1)

@@ -16,12 +16,22 @@
 // (only while they run: the eased value and the level's value stay the game's, so easing and zones work as
 // before); the renderer raises the map's resolution by the same factor (gpu/renderer.cpp), so a shadow texel
 // keeps the size it has at shadow_scale.
+//
+// Shadow cascades (GitHub #16): the pass picks its casters and their level of detail by their size in the map, so
+// with the square k times larger it leaves out small casters (ferns) and draws palm crowns with their low detail
+// meshes: near the player the shadows no longer match the objects. With shadow_cascades (and k >= 2) the pass
+// alternates per view: one frame with the console's radius, which the renderer draws into a near map of its own,
+// the next with k times it, as before (a second pass in the same frame draws no casters: tried first, the far map
+// stayed empty). After each pass the pass's sun camera (a local of the pass, read where its frame was) gives its
+// view-projection; the renderer gets the map from this pass's texture coordinates to the other map's, drawn the
+// frame before (gpu/renderer.cpp, "shadow cascades").
 #include <windows.h>
 
 #include <cmath>
 #include <cstring>
 
 #include "app/pcmode.h"
+#include "gpu/renderer.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -32,8 +42,66 @@ using rt::R32;
 
 constexpr uint32_t kEngine = 0x006B3900;  // the 3D engine's pointer
 constexpr uint32_t kEngineRadius = 0x10B4, kEnvCamera = 0, kEnvRadius = 0x34;
+// the shadow pass's light camera: a local at [esp + 0x700] inside the pass (sub esp 0xAC0 and four pushes), so
+// 0x3D0 below the stack pointer the pass is called with; CCamera +0x364 orthographic, +0x37C/+0x380 its width and
+// height, +0x2B4 view x projection (row vectors)
+constexpr uint32_t kPassCamera = 0x3D0, kCamOrtho = 0x364, kCamWidth = 0x37C, kCamHeight = 0x380, kCamViewProj = 0x2B4;
 
 void SetF(uint32_t va, float v) { std::memcpy(rt::Host(va), &v, 4); }
+
+// the side of the sun's square for radius r (0x004585D0)
+float SquareSide(uint32_t env, float r) {
+    const uint32_t cam = R32(env + kEnvCamera);
+    const float fov = cam ? xdk::GF(cam + 0x38) : 0;
+    return std::fmax(r, 2 * r * std::sin(fov * 0.5f));
+}
+
+// the pass's camera, if the sun's for radius r was set up: its clip from world (column vectors, c = m p)
+bool SunCamera(uint32_t cam, float side, double m[4][4]) {
+    const float w = xdk::GF(cam + kCamWidth), h = xdk::GF(cam + kCamHeight);
+    if (R32(cam + kCamOrtho) != 1 || !(std::fabs(w - side) <= 0.01f * side) || w != h) return false;
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) m[k][r] = xdk::GF(cam + kCamViewProj + 4 * (4 * r + k));  // transposed
+    return true;
+}
+
+bool Invert(const double a[4][4], double out[4][4]) {
+    double m[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) m[r][k] = a[r][k], m[r][k + 4] = r == k ? 1 : 0;
+    for (int col = 0; col < 4; col++) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; r++)
+            if (std::fabs(m[r][col]) > std::fabs(m[pivot][col])) pivot = r;
+        if (std::fabs(m[pivot][col]) < 1e-12) return false;
+        for (int k = 0; k < 8; k++) std::swap(m[col][k], m[pivot][k]);
+        const double d = m[col][col];
+        for (int k = 0; k < 8; k++) m[col][k] /= d;
+        for (int r = 0; r < 4; r++)
+            if (r != col) {
+                const double f = m[r][col];
+                for (int k = 0; k < 8; k++) m[r][k] -= f * m[col][k];
+            }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) out[r][k] = m[r][k + 4];
+    return true;
+}
+
+void Mul(const double a[4][4], const double b[4][4], double out[4][4]) {
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) {
+            double s = 0;
+            for (int j = 0; j < 4; j++) s += a[r][j] * b[j][k];
+            out[r][k] = s;
+        }
+}
+
+// texture coordinates of a sun camera's map: u = 0.5 + 0.5 x, v = 0.5 - 0.5 y, depth = z
+void ToTexture(const double clip[4][4], double out[4][4]) {
+    static const double kTex[4][4] = {{0.5, 0, 0, 0.5}, {0, -0.5, 0, 0.5}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    Mul(kTex, clip, out);
+}
 
 }  // namespace
 
@@ -41,18 +109,82 @@ HLE_STDCALL(Game_ShadowPass, 7) {
     const uint32_t engine = a[0], env = a[2];
     const float k = pcmode::ShadowDistance();
     const float radius = xdk::GF(env + kEnvRadius);  // 0: no sun shadow (r_DynamicShadow off)
-    // the frame copies the eased radius here before every pass, so this does not compound
-    if (k != 1.0f && radius > 0) SetF(env + kEnvRadius, radius * k);
     {
         static float logged = -1;  // the game's radius, when it changes by a metre or more
         if (std::fabs(radius - logged) >= 1.0f) {
             logged = radius;
-            const uint32_t cam = R32(env + kEnvCamera);
-            const float fov = cam ? xdk::GF(cam + 0x38) : 0, r = radius * k;
             rt::Log("shadows: sun shadow radius %g m (level %g m) x%.2f: square of %.1f m", radius,
-                    xdk::GF(engine + kEngineRadius), k, std::fmax(r, 2 * r * std::sin(fov * 0.5f)));
+                    xdk::GF(engine + kEngineRadius), k, SquareSide(env, radius * k));
         }
     }
+    // ---- shadow cascades: the near pass (the console's radius) and the far one on alternate frames ----
+    if (k >= 2.0f && radius > 0 && gpu::render::ShadowCascades()) {
+        // per view (split screen: one pass each)
+        struct View {
+            uint32_t env = 0;
+            uint64_t passes = 0;           // this view's passes so far
+            uint64_t done[2] = {};         // the pass that last drew each map (near, far), 0 = none
+            double clip[2][4][4] = {};     // and its camera
+        };
+        static View views[4];
+        View* v = nullptr;
+        for (View& x : views)
+            if (x.env == env || (!v && !x.env)) v = &x;
+        if (!v) v = &views[0], *v = View{};
+        v->env = env;
+        const uint64_t pass = ++v->passes;
+        const int which = pass & 1;  // 0: near, 1: far
+        const float r_pass = which ? radius * k : radius;
+        const uint32_t cam = c.esp - kPassCamera;
+        SetF(cam + kCamWidth, 0);  // (so that a pass without the sun is told apart)
+        SetF(env + kEnvRadius, r_pass);
+        if (!which) xdk::RenderMark([] { gpu::render::BeginNearShadowPass(); });
+        const uint32_t r = xdk::CallOriginal(c, GUEST_ORIG(Game_ShadowPass));
+        if (!which) xdk::RenderMark([] { gpu::render::EndNearShadowPass(); });
+        double clip[4][4];
+        bool ok = SunCamera(cam, SquareSide(env, r_pass), clip);
+        const float far_plane = xdk::GF(cam + 0x34);
+        // the other map's texture coordinates from this one's: T other_clip this_clip^-1 T^-1 (the other map was drawn
+        // by the pass before, with its camera)
+        float m[3][4] = {};
+        if (ok) {
+            std::memcpy(v->clip[which], clip, sizeof clip);
+            v->done[which] = pass;
+            double ot[4][4], tt[4][4], ti[4][4], map[4][4];
+            ok = v->done[!which] && v->done[!which] == pass - 1;
+            if (ok) {
+                ToTexture(v->clip[!which], ot), ToTexture(clip, tt);
+                ok = Invert(tt, ti);
+            }
+            if (ok) {
+                Mul(ot, ti, map);
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 4; j++) m[i][j] = float(map[i][j]);
+            }
+        } else {
+            v->done[which] = 0;
+        }
+        static int logged = 0;
+        if (logged < 4) {
+            logged++;
+            // (far plane: the depth range, over which the game's constant depth bias spreads)
+            rt::Log("shadows: cascades: %s pass, camera %s (square %.1f m, far plane %.1f m); the other map: u = %.4f u "
+                    "%+.4f v %+.4f d %+.4f, v = %.4f u %+.4f v %+.4f d %+.4f, d = %.4f u %+.4f v %+.4f d %+.4f",
+                    which ? "far" : "near", ok ? "sun" : "not the sun (or no other map)", SquareSide(env, r_pass),
+                    far_plane, m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0],
+                    m[2][1], m[2][2], m[2][3]);
+        }
+        const bool near_now = !which;
+        xdk::RenderMark([ok, near_now, m] { gpu::render::SetShadowCascade(ok, near_now, m); });
+        return r;
+    }
+    if (k >= 2.0f && gpu::render::ShadowCascades()) {  // no sun this frame: no near map for the receivers
+        static const float none[3][4] = {};
+        xdk::RenderMark([] { gpu::render::SetShadowCascade(false, false, none); });
+    }
+    // ---- end shadow cascades ----
+    // the frame copies the eased radius here before every pass, so this does not compound
+    if (k != 1.0f && radius > 0) SetF(env + kEnvRadius, radius * k);
     return xdk::CallOriginal(c, GUEST_ORIG(Game_ShadowPass));
 }
 

@@ -201,11 +201,12 @@ there.
 | `aniso` | `16` | Anisotropic filtering, 1–16 (1 = off) |
 | `shadow_scale` | `2` (Steam Deck `4`) | Shadow map resolution, 1–8 times the console's |
 | `shadow_distance` | `1` | Sun shadow range, 1–8 times the console's (the map grows with it) |
+| `shadow_cascades` | `on` | With `shadow_distance` 2 or more: the shadows near you get their own map, drawn as on the console at `shadow_scale`, and the far ones continue in the large map, with a smooth blend |
 | `shadow_filter` | `soft` | `soft` or `sharp` (as the console) |
 | `ao` | `ssao` (Steam Deck `gtao`) | Ambient occlusion: `off`, `ssao`, `gtao` |
 | `ao_strength` | `1` | 0–4 |
 | `ao_resolution` | `auto` | `full`, `half`; `auto` = half above 720 lines |
-| `water_quality` | `high` | `console` (the original water), `medium` (new shader), `high` (new shader with refraction) |
+| `water_quality` | `high` | `original` (the game's own water exactly as the Xbox draws it; `console` is the same), `medium` (new shader), `high` (new shader with refraction) |
 | `fc1_path` | (empty) | Far Cry (PC) install folder for the water's wave texture, see below |
 | `lod_distance` | `4` (Steam Deck `1`) | Level-of-detail and sprite distances, 0.5–8 times the console's |
 | `view_distance` | `2` (Steam Deck `1`) | Object view distance, 0.5–8 times the console's |
@@ -236,6 +237,7 @@ there.
 | `mouse_smoothing` | `0` | 0 = off; else milliseconds (up to 200) over which each movement is spread, by time, not frames; the total stays exact |
 | `mouse_zoom_scale` | `fov` | While zoomed (scope, binoculars): `fov` = slower by the zoom's field of view ratio (as the game does for the stick), `tan` = by the ratio of tan(fov/2), `off` = unchanged |
 | `mouse_zoom_sensitivity` | `1` | Extra factor while zoomed (0.05–10) |
+| `button_prompts` | `auto` | Button icons in the game's hints and menus: `auto` (the device used last), `xbox`, `keyboard` (your bound keys and mouse buttons), `playstation`, `switch`. All icons are drawn at runtime |
 | `pad_backend` | `sdl` | `sdl`, `xinput` (XInput pads only, without SDL), `off` |
 | `pad_dead_zone` | `0` | Extra stick dead zone, 0.05–0.9 (0 = the game's own only) |
 | `pad_rumble` | `100` | Rumble strength in percent |

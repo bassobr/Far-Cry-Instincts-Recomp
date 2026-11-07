@@ -26,6 +26,8 @@ inline bool Active() { return Dumping() || Replacing(); }
 
 // the texture's name, 0 when it cannot be dumped or replaced (3D, depth, video formats)
 uint64_t Key(const texture::Desc& d);
+// the same name whether dumping/replacing is on or not (button prompts: gpu/prompt_icons.cpp finds its font page)
+uint64_t ContentKey(const texture::Desc& d);
 
 // dumping is on and key has neither been dumped (in this or an earlier run) nor has a replacement
 bool WantsDump(uint64_t key);

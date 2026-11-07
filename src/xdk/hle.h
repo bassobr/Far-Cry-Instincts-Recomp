@@ -48,6 +48,8 @@ inline void* HostPtr(uint32_t va) { return rt::Host(va); }
 // performance (xdk/d3d8.cpp): runs fn on the render thread in push buffer order (values the renderer reads per
 // frame), at once without HLE graphics
 void RenderPost(std::function<void()> fn);
+// PC shadows: the same, after everything the guest pushed so far (drains first): a mark between two draws
+void RenderMark(std::function<void()> fn);
 // performance: frames the guest may finish ahead of the screen (frame_queue, 1-3)
 void SetFrameQueue(int frames);
 inline uint32_t CallGuest(rt::Cpu& c, uint32_t fn, std::initializer_list<uint32_t> args) {

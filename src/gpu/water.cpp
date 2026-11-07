@@ -116,18 +116,34 @@ float4 main(VSOut input) : SV_Target {
     float3 N = normalize(float3(-slope, 1));
     float cosv = saturate(dot(N, V));
 
-    // Fresnel: 1 / (1 + E.N)^8 between a low reflection looking down and a full one at grazing angles
-    float f8 = 1.0 / pow(1.0 + cosv, 8.0);
+    // Fresnel: 1 / (1 + E.N)^8 between a low reflection looking down and a full one at grazing angles. Its normal is a
+    // calmer one (half the slope; our four layers are steeper than Far Cry's two): with the full slope, wave flanks
+    // turned away from the eye reflected fully even looking down, blobs of the deep blue (a little violet) zenith of
+    // FCI's sky on the turquoise of a lagoon (GitHub #14)
+    float cosf = saturate(dot(normalize(float3(-0.5 * slope, 1)), V));
+    float f8 = 1.0 / pow(1.0 + cosf, 8.0);
     float3 refl_w = saturate(lerp(float3(0.10, 0.10, 0.05), float3(1.2, 1.2, 1.05), f8) * tune2.w);
 
-    // reflection: the game's mirrored view at the exact projection of this point, bent by the waves
+    // reflection: the game's mirrored view at the exact projection of this point, bent by the waves; a quarter paler
+    // (a rough surface mirrors a blur of the sky and its haze, not its deepest blue)
     float q = dot(float4(P, 1), refl_q);
     float2 ruv = float2(dot(float4(P, 1), refl_s), dot(float4(P, 1), refl_t)) / (abs(q) < 1e-6 ? 1e-6 : q);
     ruv += slope * tune.y * saturate(30.0 / max(dist, 1.0));
     float3 R = tex1.Sample(smp1, ruv).rgb;
+    R = lerp(Luma(R).xxx, R, 0.75);
 
     // the brightness of the game's water colour (its vertex colour, dark at night and in fog; 0.19 by day)
     float light = saturate(Luma(input.d0.rgb) / 0.19);
+    // the light around (GitHub #14): the game's water colour knows the level and the time of day, not a canopy, a
+    // gorge or a fog bank. The mirrored scene does: its brightness around this point (a blur of four taps of the
+    // reflection target), against an open sky's (~0.45), scales the water's own colour; dark under trees and in fog,
+    // unchanged under an open sky
+    float2 ruv0 = ruv - slope * tune.y * saturate(30.0 / max(dist, 1.0));
+    float around = 0.25 * (Luma(tex1.SampleLevel(smp1, ruv0 + float2(0.03, 0.02), 0).rgb) +
+                           Luma(tex1.SampleLevel(smp1, ruv0 + float2(-0.03, -0.02), 0).rgb) +
+                           Luma(tex1.SampleLevel(smp1, ruv0 + float2(0.02, -0.04), 0).rgb) +
+                           Luma(tex1.SampleLevel(smp1, ruv0 + float2(-0.02, 0.04), 0).rgb));
+    float ambient = saturate(around / 0.45);
 
     // what lies behind the surface: the scene's depth against the water's along the same ray
     int2 px = int2(input.pos.xy);
@@ -142,15 +158,16 @@ float4 main(VSOut input) : SV_Target {
     // the water's own colour: deep blue seen at a grazing angle, a lighter blue-green looking down, greener over
     // shallow ground (the light the sand sends back up)
     float3 body = lerp(float3(0.04, 0.148, 0.26), float3(0.16, 0.38, 0.45), cosv);
-    body = lerp(float3(0.13, 0.46, 0.47), body, saturate(h / 6.0)) * light;
+    body = lerp(float3(0.13, 0.46, 0.47), body, saturate(h / 6.0)) * (light * ambient);
 
-    // the sun: the view reflected at the waves against the sun's direction, a glow and a sharp glitter
+    // the sun: the view reflected at the waves against the sun's direction, a glow and a sharp glitter; only where
+    // the reflection there is a bright sky (the sun hidden by fog or leaves glints nowhere)
     float3 spec = 0;
     if (sun.w > 0) {
         float3 Rv = reflect(-V, N);
         float s = saturate(dot(Rv, sun.xyz));
         spec = (2.0 * pow(s, 64.0) * f8 + 6.0 * pow(s, 900.0)) * float3(1.0, 0.8, 0.5) * light * tune2.z;
-        spec *= saturate(sun.z * 8.0);  // not below the horizon
+        spec *= saturate(sun.z * 8.0) * smoothstep(0.35, 0.7, Luma(R));  // not below the horizon, not in shade
     }
 
     // foam at the waterline (by the path through the water), broken up by the waves
@@ -169,14 +186,14 @@ float4 main(VSOut input) : SV_Target {
     if (ds2 <= dw * 1.002) at2 = at;
     float3 behind = scene_color.SampleLevel(smp_clamp, at2, 0).rgb;
     // the light from behind is fogged already; the water's own part gets the fog here
-    float3 own = body * opacity * (1 - refl_w) + R * refl_w + spec + foamy * 0.8 * light;
+    float3 own = body * opacity * (1 - refl_w) + R * refl_w + spec + foamy * 0.8 * light * lerp(0.3, 1.0, ambient);
     // and what comes through is tinted on its way (red goes first: shallow water over sand turns turquoise)
     float3 through = (1 - opacity) * (1 - refl_w) * (1 - foamy) * exp(-L * float3(0.30, 0.07, 0.06));
     float3 color = lerp(fog_color.rgb * (1 - through), own, fog_factor) + through * behind;
     return float4(color, shore);
 #else
     // without a copy of the scene: blending does the light from behind (undisplaced, one weight for all channels)
-    float3 own = body * opacity * (1 - refl_w) + R * refl_w + spec + foamy * 0.8 * light;
+    float3 own = body * opacity * (1 - refl_w) + R * refl_w + spec + foamy * 0.8 * light * lerp(0.3, 1.0, ambient);
     float through = Luma((1 - opacity) * (1 - refl_w)) * (1 - foamy);
     float3 color = lerp(fog_color.rgb * (1 - through), own, fog_factor);
     float a = saturate(1 - through);
@@ -286,12 +303,24 @@ void MakeWaves() {
 
 }  // namespace
 
+int Parse(const std::string& value) {
+    std::string v = value;
+    for (char& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    // "console" was the name of original up to 0.1.4: the same path (the game's draws as translated)
+    if (v == "original" || v == "console" || v == "0") return kOriginal;
+    return v == "medium" || v == "1" ? kMedium : kHigh;
+}
+
+namespace {
+const char* Name(int q) {
+    return q == kOriginal ? "original (the game's own draws)" : q == kMedium ? "medium" : "high";
+}
+}  // namespace
+
 int BootQuality() {
     static const int quality = [] {
-        std::string v = settings::String("water_quality", "high");
-        for (char& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        int q = v == "console" || v == "0" ? kConsole : v == "medium" || v == "1" ? kMedium : kHigh;
-        rt::Log("water: %s", q == kConsole ? "console (the game's combiners)" : q == kMedium ? "medium" : "high");
+        const int q = Parse(settings::String("water_quality", "high"));
+        rt::Log("water: %s", Name(q));
         return q;
     }();
     return quality;
@@ -304,7 +333,7 @@ int Current() {
 
 bool SetQuality(int quality) {
     g_live = std::clamp(quality, 0, 2);
-    rt::Log("water: %s (settings menu)", quality == kConsole ? "console" : quality == kMedium ? "medium" : "high");
+    rt::Log("water: %s (settings menu)", Name(g_live));
     return true;
 }
 

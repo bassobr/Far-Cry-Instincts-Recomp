@@ -818,5 +818,12 @@ void RenderPost(std::function<void()> fn) {
     if (HleOff()) return fn();
     Post(std::move(fn));
 }
+// PC shadows (xdk/shadows.cpp): as RenderPost, but after all the guest has pushed so far (Post goes before what is
+// not drained yet)
+void RenderMark(std::function<void()> fn) {
+    if (HleOff()) return fn();
+    Drain(false);
+    Post(std::move(fn));
+}
 }  // namespace xdk
 // ---- end performance ----

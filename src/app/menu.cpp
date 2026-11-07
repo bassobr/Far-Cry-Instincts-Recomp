@@ -38,6 +38,7 @@
 #include "gpu/water.h"  // PC water
 #include "hle/host_pad.h"  // controllers (SDL3)
 #include "hle/pc_input.h"
+#include "hle/prompts.h"  // button prompts
 #include "runtime/log.h"
 #include "video/display.h"
 #include "xdk/hle.h"  // performance: frame_queue
@@ -284,14 +285,18 @@ const Setting kSettings[] = {
      When::Restart, "Resolution of the shadow maps."},
     {"shadow_distance", "SHADOW DISTANCE", "1", [] { return Range(1, 8, 1, 1, 0, "x"); }, When::Restart,
      "Reach of the sun's shadows, times the console's (~15 m)."},
+    {"shadow_cascades", "SHADOW CASCADES", "on",
+     [] { return Choices{{"on", "ON (DEFAULT)"}, {"off", "OFF"}}; }, When::Restart,
+     "With shadow distance 2x or more: the console's shadows near you in a map of their own (sharp, every caster), "
+     "the far ones as before. The game draws near and far on alternate frames."},
     {"shadow_filter", "SHADOW FILTER", "soft",
      [] { return Choices{{"soft", "SOFT (DEFAULT)"}, {"sharp", "SHARP (CONSOLE)"}}; }, When::Restart,
      "Soft shadow edges, or the NV2A's 2x2 filter."},
     // PC water (gpu/water.h)
     {"water_quality", "WATER", "high",
-     [] { return Choices{{"console", "CONSOLE"}, {"medium", "MEDIUM"}, {"high", "HIGH (DEFAULT)"}}; }, When::Live,
-     "The sea's surface: console = as on the Xbox; medium adds Fresnel, depth colour, a soft shore and sun glints; "
-     "high also refraction. From console when ambient occlusion was off at start needs a restart."},
+     [] { return Choices{{"original", "ORIGINAL"}, {"medium", "MEDIUM"}, {"high", "HIGH (DEFAULT)"}}; }, When::Live,
+     "The sea's surface: original = the game's own water as the Xbox draws it, quirks and all; medium = our shader "
+     "(Fresnel, depth colour, a soft shore, sun glints); high also refraction."},
     // PC level of detail (xdk/lod.cpp)
     {"lod_distance", "DETAIL DISTANCE", "4", [] { return DistanceChoices(pcmode::kDefaultLodDistance); }, When::Live,
      "Distance at which trees, plants and objects switch to simpler models and to sprites, times the console's."},
@@ -315,6 +320,14 @@ const Setting kSettings[] = {
      "Italian and Spanish (German shows English there; a PAL disc may have it). Auto = the Windows display language."},
     {"pause_on_focus_loss", "PAUSE ON FOCUS LOSS", "0", OnOff, When::Live,
      "Hold the game while the window is in the background."},
+    {"button_prompts", "BUTTON PROMPTS", "auto",
+     [] {
+         return Choices{{"auto", "AUTO (DEVICE USED LAST)"}, {"xbox", "XBOX"}, {"keyboard", "KEYBOARD AND MOUSE"},
+                        {"playstation", "PLAYSTATION"}, {"switch", "NINTENDO SWITCH"}};
+     },
+     When::Live,
+     "The buttons the game's hints and menus show: the bound keys and mouse buttons, or a PlayStation or Switch "
+     "pad's buttons. Auto follows the device used last."},
     {"texture_dump", "TEXTURE DUMPING", "0", OnOff, When::Restart, "Write every game texture to textures\\dump."},
     {"texture_replace", "TEXTURE REPLACEMENT", "0", OnOff, When::Restart, "Use the images in textures\\replace."},
 };
@@ -415,6 +428,7 @@ bool Truthy(const std::string& v) { return v == "1" || v == "true" || v == "yes"
 // which choice the value is: as written, else the nearest number, else the default's
 int IndexOf(const Setting& s, const Choices& list, std::string v) {
     v = Lower(Trim(v));
+    if (v == "console" && !std::strcmp(s.key, "water_quality")) v = "original";  // PC water: the earlier name
     bool boolean = list.size() == 2 && list[0].value == "0" && list[1].value == "1";
     if (boolean) return Truthy(v) ? 1 : (v == "0" || v == "false" || v == "no" || v == "off") ? 0 : IndexOf(s, list, Fallback(s));
     for (size_t i = 0; i < list.size(); i++)
@@ -444,10 +458,7 @@ int AtBoot(const Setting& s, const Choices& list) { return IndexOf(s, list, sett
 // a change waits for the next start: what the row says, or the AO pass that was off at start
 bool NeedsRestart(const Setting& s) {
     if (s.when != When::Live) return true;
-    // PC water: from console it reads the scene depth, which the depth targets only offer when made for AO or water
-    if (!std::strcmp(s.key, "water_quality"))
-        return !gpu::water::BootQuality() && !gpu::ao::BootMode() &&
-               Lower(settings::String("water_quality", "high")) != "console";
+    // (PC water: the depth targets are always readable, also with original at start: the game's ocean reads them)
     return !std::strcmp(s.key, "ao") && !gpu::ao::BootMode();
 }
 
@@ -472,8 +483,7 @@ void ApplyLive(const Setting& s) {
         std::string v = Lower(settings::String("ao", "ssao"));
         gpu::ao::SetMode(v == "gtao" ? 2 : v == "ssao" ? 1 : 0);
     } else if (key == "water_quality") {  // PC water
-        std::string v = Lower(settings::String("water_quality", "high"));
-        gpu::water::SetQuality(v == "console" ? gpu::water::kConsole : v == "medium" ? gpu::water::kMedium : gpu::water::kHigh);
+        gpu::water::SetQuality(gpu::water::Parse(settings::String("water_quality", "high")));
     } else if (key == "ao_strength") gpu::ao::SetStrength(settings::Float("ao_strength", 1.0f));
     else if (!key.compare(0, 6, "mouse_")) {
         // the overall sensitivity sets both axes
@@ -483,6 +493,7 @@ void ApplyLive(const Setting& s) {
         hle::pc::ReloadMouse();
     }
     else if (key == "pause_on_focus_loss") SetPauseOnFocusLoss(settings::Bool("pause_on_focus_loss", false));
+    else if (key == "button_prompts") hle::prompts::Reload();
     else if (key == "pad_dead_zone" || key == "pad_rumble") hle::host::ReloadOptions();
 }
 

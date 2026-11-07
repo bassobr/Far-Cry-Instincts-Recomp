@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.5 (2026-11-07)
+
+- Original water (#14): `water_quality = original` draws the game's own water exactly as the Xbox does, with none of
+  the PC water changes. The old `console` mode was not the original: a translation bug read the depth buffer of the
+  game's water shader from memory that is never written, so the sea came out opaque turquoise everywhere. That is
+  fixed, and `console` now means `original`.
+- New water (`medium`/`high`): no more violet patches (the game's deep-blue sky was reflected too strongly on wave
+  flanks), and the water's own colour, foam and sun glints follow the light around them, so dark and foggy levels
+  such as the swamp stay murky instead of glowing turquoise.
+- Shadow cascades (#16): with Shadow Distance 2x or more, the shadows near you get their own map drawn exactly as on
+  the console, and the far shadows continue in the large map. Before, at large distances the game picked fewer and
+  simpler shadow casters (ferns lost their shadows, palm crowns no longer lined up with their trunks). New setting
+  `shadow_cascades` (on by default).
+- Button prompts (#15): the game's button icons follow the device you use: your bound keys and mouse buttons with
+  keyboard and mouse, Cross/Circle/Square/Triangle on PlayStation pads, Switch symbols on Switch pads. New setting
+  `button_prompts` (`auto`, `xbox`, `keyboard`, `playstation`, `switch`); all icons are drawn at runtime.
+- High frame rates (#6): the view sway while swimming was added once per frame, so above 30 fps the view tilted far
+  more and you sank or rose, and ladders in the water climbed up or down at random; it is now the same at any frame
+  rate. Scripted vehicles (e.g. the Humvee at the start of Native) missed their path above about 150 fps because the
+  tyres put less engine force on the road at very small physics steps; wheel forces are now applied at most 60 times
+  per second, as in the console's physics substeps, while everything still moves every frame.
+- New PGO profile; the game code is rebuilt once on the first start after updating.
+
 ## 0.1.4 (2026-11-07)
 
 - The water surface seen from below no longer flickers (#9). A recompiler bug: status flags were not passed between a

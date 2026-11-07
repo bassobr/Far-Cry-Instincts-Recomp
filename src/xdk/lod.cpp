@@ -116,9 +116,11 @@ void TraceEntity() {
     if (!GetEnvironmentVariableA("FCI_TRACE_ENTITY", text, sizeof text)) return;
     float want[3] = {};
     if (std::sscanf(text, "%f,%f,%f", &want[0], &want[1], &want[2]) != 3) return;
+    // "<x>,<y>,<z>,pos": only its position and flags +0x18, every 250 ms when they change (moving entities)
+    const bool pos_only = std::strstr(text, ",pos") != nullptr;
     static std::once_flag once;
-    std::call_once(once, [want] {
-        std::thread([want] {
+    std::call_once(once, [want, pos_only] {
+        std::thread([want, pos_only] {
             constexpr uint32_t kVtable = 0x005F6AA0, kPos = 0x34C, kSize = 0x440;
             uint32_t entity = 0;
             while (!entity) {
@@ -146,6 +148,15 @@ void TraceEntity() {
             rt::Log("lod: FCI_TRACE_ENTITY %g,%g,%g is the entity at %08X", want[0], want[1], want[2], entity);
             uint32_t last[kSize / 4];
             std::memcpy(last, rt::Host(entity), kSize);
+            while (pos_only) {
+                Sleep(250);
+                uint32_t now[kSize / 4];
+                std::memcpy(now, rt::Host(entity), kSize);
+                if (std::memcmp(&now[kPos / 4], &last[kPos / 4], 12) || now[0x18 / 4] != last[0x18 / 4])
+                    rt::Log("lod: entity at %.2f %.2f %.2f flags %08X", xdk::GF(entity + kPos), xdk::GF(entity + kPos + 4),
+                            xdk::GF(entity + kPos + 8), now[0x18 / 4]);
+                std::memcpy(last, now, kSize);
+            }
             for (;;) {
                 Sleep(20);
                 uint32_t now[kSize / 4];

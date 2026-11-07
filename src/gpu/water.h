@@ -1,8 +1,11 @@
 // PC water: the sea's surface with a pixel shader of our own instead of the game's register combiners
-// (FarCryInstincts.ini / FCI_<KEY>, see README): water_quality = console | medium | high.
+// (FarCryInstincts.ini / FCI_<KEY>, see README): water_quality = original | medium | high ("console", the earlier
+// name, reads as original).
 //
-// The renderer (gpu/renderer.cpp, block "PC water") recognises the ocean's draw (the projected grid of the game's
-// OceanOver vertex program) and, unless the setting is console, draws it with the HLSL of water.cpp: the game's
+// original: the game's own draws, shaders and textures as translated, nothing of the PC water (the ground under water
+// keeps the game's turquoise fog, no sun from the sky sprite, no wave map). The renderer (gpu/renderer.cpp, block "PC
+// water") recognises the ocean's draw (the projected grid of the game's OceanOver vertex program) and, with medium or
+// high, draws it with the HLSL of water.cpp: the game's
 // reflection target, its water colour and fog, the sun's direction from its sky sprite, a wave map (Far Cry PC's
 // Waterbump when installed, gpu/fc1_data.h, else our own), the scene's depth and (high) a copy of the scene.
 #pragma once
@@ -13,7 +16,10 @@
 
 namespace gpu::water {
 
-enum Quality : int { kConsole = 0, kMedium = 1, kHigh = 2 };
+enum Quality : int { kOriginal = 0, kMedium = 1, kHigh = 2 };
+
+// a setting's value (original, console, medium, high or 0..2; case-insensitive) as a quality; anything else is high
+int Parse(const std::string& value);
 
 // as read at start (water_quality; the HLE graphics only)
 int BootQuality();

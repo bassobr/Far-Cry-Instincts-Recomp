@@ -93,6 +93,10 @@ D3DDevice_UpdateOverlay
 # ---- PC features (src/xdk/game.cpp) ----
 Game_CameraUpdate
 Game_FirstPersonProjection
+Game_FrameTimeSource
+Game_PhysicsStep
+Game_PlayerAngles
+Game_VehicleImpulses
 # ---- end PC features ----
 # ---- PC shadows (src/xdk/shadows.cpp) ----
 Game_ShadowPass

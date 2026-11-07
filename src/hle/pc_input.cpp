@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "app/settings.h"
+#include "hle/prompts.h"  // button prompts
 #include "runtime/guest_time.h"
 #include "runtime/log.h"
 #include "video/display.h"
@@ -432,6 +433,14 @@ void ApplyKeyboardMouse(Pad& p, bool focused) {
         if (counts) g_script_mouse = true;
         (e.axis ? script_dy : script_dx) += counts;
     }
+    // ---- button prompts: a scripted key (FCI_KEY_SCRIPT) counts as keyboard use, as a real one does in the
+    // window (video/display.cpp) ----
+    static bool script_held[kMaxCode] = {};
+    for (int code = 0; code < kMaxCode; code++) {
+        if (held[code] && !script_held[code]) prompts::NoteKeyboard();
+        script_held[code] = held[code];
+    }
+    // ---- end button prompts ----
     // ---- settings menu: what is held as the menu closes (the key that closed it) waits for its release; the
     // motion and the wheel while it was open are dropped ----
     if (g_settle_pending && focused) {
@@ -611,7 +620,10 @@ void ResetBindings() {
     ReloadBindings();
 }
 
-void ReloadBindings() { g_binds_read = false, Bindings(); }
+void ReloadBindings() {
+    g_binds_read = false, Bindings();
+    prompts::BindingsChanged();  // button prompts: the icons show the new keys
+}
 void ReloadMouse() { g_mouse_read = false, Mouse(); }
 void SettleAfterMenu() { g_settle_pending = true; }
 // ---- end settings menu ----

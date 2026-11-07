@@ -24,6 +24,7 @@
 #include "gpu/renderer.h"  // CompileHlsl
 #include "kernel/kernel.h"  // relaunch handover
 #include "hle/host_pad.h"  // controllers: motors off at exit
+#include "hle/prompts.h"   // button prompts
 #include "runtime/guest.h"
 #include "runtime/log.h"
 #include "runtime/memory.h"
@@ -429,7 +430,29 @@ void LeaveExclusiveForExit() {
 }
 // ---- end display output options ----
 
+// ---- button prompts (hle/prompts.h, GitHub #15): keys, mouse buttons, the wheel and steady mouse motion in the
+// focused window switch the prompts to keyboard and mouse (button_prompts = auto) ----
+void NotePromptInput(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !(lp & (1 << 30))) {  // not the auto repeat
+        hle::prompts::NoteKeyboard();
+    } else if (msg == WM_INPUT && GetForegroundWindow() == hwnd) {
+        RAWINPUT input;
+        UINT size = sizeof input;
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) ==
+                UINT(-1) ||
+            input.header.dwType != RIM_TYPEMOUSE)
+            return;
+        constexpr USHORT kPressed = RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_DOWN |
+                                    RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_WHEEL;
+        if (input.data.mouse.usButtonFlags & kPressed) hle::prompts::NoteKeyboard();
+        else if (!(input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
+            hle::prompts::NoteMouseMotion(input.data.mouse.lLastX, input.data.mouse.lLastY);
+    }
+}
+// ---- end button prompts ----
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    NotePromptInput(hwnd, msg, wp, lp);  // button prompts
     // ---- settings menu: F10 and, while it is open, the keyboard and mouse go to the menu ----
     LRESULT menu_result = 0;
     if (app::MenuWndProc(hwnd, msg, wp, lp, &menu_result)) return menu_result;

@@ -463,6 +463,10 @@ bool Replacing() {
 uint64_t Key(const texture::Desc& d) {
     if (!Active()) return 0;
     Cost cost;
+    return ContentKey(d);
+}
+
+uint64_t ContentKey(const texture::Desc& d) {
     switch (d.color) {
     case 0x24: case 0x25:                        // YUY2/UYVY: video frames
     case 0x2A: case 0x2C: case 0x2E: case 0x30:  // depth

@@ -30,6 +30,7 @@
 #include "gpu/psh.h"
 #include "gpu/texture.h"
 #include "gpu/texture_pack.h"  // texture dump/replacement
+#include "gpu/prompt_icons.h"  // button prompts
 #include "app/output.h"  // display output options
 #include "app/pcmode.h"
 #include "app/settings.h"
@@ -72,6 +73,7 @@ bool g_counting = false;  // pixels are counted for a visibility test (SET_ZPASS
 struct Quality {
     float scale = 1;  // performance: fractional (render_scale), e.g. 800 / 480 on the Steam Deck
     uint32_t shadow_scale = 1, msaa = 1, aniso = 1;
+    uint32_t near_scale = 0;  // PC shadows: the near cascade's resolution (x 1024), 0 = no cascades
     float wide = 1.0f;  // PC features: frame buffer sized targets this much wider (pcmode::Widen)
 };
 Quality g_q;
@@ -668,8 +670,9 @@ DepthTarget* GetDepth(uint32_t address, uint32_t width, uint32_t height, bool z1
     desc.SampleDesc.Count = samples;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | (samples == 1 ? D3D11_BIND_SHADER_RESOURCE : 0);
-    // ambient occlusion and the PC water read it
-    if (!z16 && g_hle && (ao::BootMode() || water::BootQuality())) desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    // ambient occlusion and the PC water read it, and so does the game: the ocean's stage 2 is the frame's depth buffer
+    // (DepthTexture), so every 24 bit target is readable
+    if (!z16) desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &slot->texture))) return nullptr;
     D3D11_DEPTH_STENCIL_VIEW_DESC dsv{z16 ? DXGI_FORMAT_D16_UNORM
                                       : slot->stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT,
@@ -690,6 +693,43 @@ DepthTarget* GetDepth(uint32_t address, uint32_t width, uint32_t height, bool z1
     g_depths.push_back(std::move(slot));
     return g_depths.back().get();
 }
+
+// ---- PC shadows: shadow cascades ----
+// With shadow_distance k > 1 the sun's one shadow map covers k times the console's square (xdk/shadows.cpp). That
+// is coarser up close, and the game itself draws less into it: it picks its casters and their level of detail by
+// their size in the map, so small ones (ferns) vanish and palm crowns get their low detail meshes, the shadows near
+// the player no longer match what casts them (GitHub #16). With cascades the game's shadow pass alternates
+// (xdk/shadows.cpp; a second pass in the same frame draws nothing, the game marks what it drew this frame): one
+// frame with the console's radius, drawn into a near map of its own (shadow_scale x 1024), the next with k times it
+// into the shadow map as before. Each map is kept until its next pass. The receivers' pixel shaders (psh.cpp) take
+// the near map where it covers them, fading into the far one over its outer tenth (no seam); their coordinates in the
+// other map (the one the game did not draw this frame) come from the matrix of the two sun cameras (both
+// orthographic along the sun: an affine map of texture coordinates and depth). Each map has the game's own camera,
+// snapping (whole texels, no shimmer) and depth range, so the polygon offset is the game's in each; what moves is
+// one frame old in the other map. The game marks the near pass and sends the matrix in push buffer order
+// (BeginNearShadowPass, EndNearShadowPass, SetShadowCascade).
+constexpr uint32_t kNearTag = 0x10000000;  // near maps live at the shadow map's address + this (beyond guest RAM)
+bool g_near_pass = false;                   // the game's near shadow pass is being drawn
+struct Cascade {
+    bool on = false;
+    uint32_t far_address = 0;  // the shadow map whose receivers use it
+    DepthTarget* near_map = nullptr;
+    DepthTarget* far_map = nullptr;
+    // (u, v, depth) in either map = these x the receivers' (the game's: this frame's map) (u, v, depth, 1)
+    float n[3][4] = {}, f[3][4] = {};
+};
+Cascade g_cascade;
+struct CascadeConstants {
+    float n[3][4], f[3][4];  // psh.cpp's cascade_n, cascade_f
+    float fade[4];           // x: 1 / the fading edge in near map coordinates
+};
+uint64_t g_cascade_draws = 0;  // draws into near maps (statistics)
+DepthTarget* g_last_near = nullptr;  // the near map the last near pass drew
+DepthTarget* g_last_far = nullptr;   // the 16 bit depth target last drawn outside a near pass
+uint32_t g_last_shadow_address = 0, g_last_shadow_width = 0;  // the 16 bit depth target last drawn outside a near pass
+DepthTarget* g_stage_depth[4] = {};  // the depth target a stage samples (GetTexture), else null
+constexpr float kCascadeFade = 10.0f;
+// ---- end PC shadows ----
 
 struct Surfaces {
     Target* color = nullptr;
@@ -734,6 +774,10 @@ Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool ref
         if (!shadow && !swizzled && row >= 640) out.wide = g_q.wide;  // PC features: widescreen
     }
     uint32_t pitch = s.Reg(SET_SURFACE_PITCH);
+    // PC shadows: the game's near shadow pass draws into the near map (see "shadow cascades"), its depth only (the
+    // shadow passes write no colour: the colour target is a dummy at physical 0)
+    const bool to_near = g_near_pass && zeta == 1 && g_q.near_scale && want_depth;
+    if (to_near) want_color = false, out.scale = float(g_q.near_scale);
     if (want_color && color) {
         uint32_t address = ResolveDma(s.Reg(SET_CONTEXT_DMA_COLOR)) + s.Reg(SET_SURFACE_COLOR_OFFSET);
         out.color = GetTarget(address, color, out.width, out.height, pitch & 0xFFFF, swizzled, out.scale, out.samples,
@@ -742,7 +786,10 @@ Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool ref
     }
     if (want_depth && zeta) {
         uint32_t address = ResolveDma(s.Reg(SET_CONTEXT_DMA_ZETA)) + s.Reg(SET_SURFACE_ZETA_OFFSET);
+        if (to_near) address += kNearTag;  // PC shadows
         out.depth = GetDepth(address, out.width, out.height, zeta == 1, out.scale, out.samples, out.wide);
+        if (to_near) g_last_near = out.depth;  // PC shadows
+        else if (zeta == 1) g_last_shadow_address = address, g_last_shadow_width = out.width, g_last_far = out.depth;
     }
     const float sx = float(out.scale) * out.wide;
     out.clip.left = LONG(out.clip.left * sx + 0.5f), out.clip.right = LONG(out.clip.right * sx + 0.5f);
@@ -1285,6 +1332,7 @@ struct TextureEntry {
     uint64_t pack_dump_key = 0;      // dumped once the content stayed for a while (not a video frame)
     texture::Desc pack_dump_desc;
     std::vector<texture::Image> pack_dump_images;
+    bool prompt_page = false;  // button prompts: the font page with the button glyphs (gpu/prompt_icons.h)
     // ---- end texture dump/replacement ----
 };
 
@@ -1484,26 +1532,50 @@ ComPtr<ID3D11ShaderResourceView> CreateTexture(const texture::Desc& d, psh::Samp
 
 const bool g_no_snapshot = GetEnvironmentVariableA("FCI_NO_TARGET_SNAPSHOT", nullptr, 0) > 0;  // diagnostics
 
+ID3D11ShaderResourceView* DepthView(DepthTarget& d);
+
 // a depth texture on a depth target's memory (a shadow map the GPU just rendered): the host depth itself
-ID3D11ShaderResourceView* DepthTexture(const texture::Desc& d, float* scale) {
+ID3D11ShaderResourceView* DepthTexture(const texture::Desc& d, float* scale, psh::Sampler& kind, int stage) {
     DepthTarget* found = nullptr;
     for (auto& t : g_depths)
-        if (t->address == d.address && t->srv && t->width >= d.width && t->height >= d.height &&
+        if (t->address == d.address && (t->srv || !t->z16) && t->width >= d.width && t->height >= d.height &&
             (!found || t->last_write > found->last_write))
             found = t.get();
     if (!found) return nullptr;
+    // a 24 bit target (the 3D view's: the ocean reads the frame's depth buffer as stage 2): float on the host, maybe
+    // multisampled and reversed, at a multiple of the guest's size. Before (GitHub #14), with MSAA the HLE read guest
+    // memory there (never written: every comparison passed, the ocean was opaque wherever it was drawn), without MSAA
+    // it compared the host's float depth as if it were the guest's 24 bit one
+    if (!found->z16) {
+        if (d.color != 0x2E) return nullptr;  // (only LIN_D24S8 seen; swizzled ones address normalised)
+        ID3D11ShaderResourceView* view = DepthView(*found);
+        if (!view) return nullptr;
+        scale[0] = float(HostWidthOf(found->width, found->scale, found->wide)) / float(found->width);
+        scale[1] = float(HostHeightOf(found->height, found->scale)) / float(found->height);
+        scale[2] = 16777215.0f;
+        scale[3] = g_reversed_depth ? psh::kReversedDepth : 0.0f;
+        kind = found->samples > 1 ? psh::Sampler::kSceneDepthMS : psh::Sampler::kSceneDepth;
+        if (stage >= 0 && stage < 4) g_stage_depth[stage] = found;  // (the draw binds it read-only)
+        return view;
+    }
     bool z16 = d.color == 0x2C || d.color == 0x30;
     scale[2] = z16 ? 65535.0f : 16777215.0f;
     // linear (rect) textures address in texels of the guest size; the host target may be larger
     if (d.color == 0x2E || d.color == 0x30) scale[0] = 1.0f / found->width, scale[1] = 1.0f / found->height;
+    if (stage >= 0 && stage < 4) g_stage_depth[stage] = found;  // PC shadows: its near cascade
     return found->srv.Get();
 }
 
 // the texture of a stage, or null; kind and scale (xy: coordinate scale, z: depth range of shadow maps)
 // describe how the shader addresses it
-ID3D11ShaderResourceView* GetTexture(const State& s, int stage, psh::Sampler& kind, float* scale) {
+TextureEntry* g_texture_entry = nullptr;  // button prompts: the entry GetTextureOf ended at, null for none
+texture::Desc g_texture_desc;
+
+ID3D11ShaderResourceView* GetTextureOf(const State& s, int stage, psh::Sampler& kind, float* scale) {
+    g_texture_entry = nullptr;  // button prompts
     uint32_t base = 0x40 * stage;
     g_stage_video[stage] = 0;  // PC features: fmv_scale
+    g_stage_depth[stage] = nullptr;  // PC shadows
     uint32_t control0 = s.Reg(SET_TEXTURE_CONTROL0 + base);
     if (!(control0 & 0x40000000)) return nullptr;
     uint32_t format = s.Reg(SET_TEXTURE_FORMAT + base);
@@ -1547,17 +1619,20 @@ ID3D11ShaderResourceView* GetTexture(const State& s, int stage, psh::Sampler& ki
     uint32_t size = texture::GuestSize(d);
     if (!d.width || !d.height || !size || d.address + uint64_t(size) > 0x04000000) return nullptr;
 
-    if (d.color == 0x2A || d.color == 0x2C || d.color == 0x2E || d.color == 0x30)
-        if (ID3D11ShaderResourceView* srv = DepthTexture(d, scale)) {
-            kind = psh::Sampler::kShadow;
+    if (d.color == 0x2A || d.color == 0x2C || d.color == 0x2E || d.color == 0x30) {
+        psh::Sampler depth_kind = psh::Sampler::kShadow;
+        if (ID3D11ShaderResourceView* srv = DepthTexture(d, scale, depth_kind, stage)) {
+            kind = depth_kind;
             return srv;
         }
+    }
     if (!g_no_snapshot)
         if (ID3D11ShaderResourceView* srv = TargetSnapshot(d, scale)) return srv;
 
     uint64_t key = Mix(Mix(Mix(d.address, d.color), Mix(d.width, d.height)), Mix(Mix(d.depth, d.levels),
                                                                                   Mix(d.cube, Mix(d.pitch, d.palette))));
     TextureEntry& entry = g_textures[key];
+    g_texture_entry = &entry, g_texture_desc = d;  // button prompts
     // PC features, fmv_scale: Bink fills the title's and menus' videos into linear textures (not render targets)
     if (info.layout == texture::Layout::kLinear) g_stage_video[stage] = d.width << 16 | d.height;
     // ---- texture dump/replacement: a replacement that finished loading, or a changed replacement folder ----
@@ -1575,6 +1650,7 @@ ID3D11ShaderResourceView* GetTexture(const State& s, int stage, psh::Sampler& ki
     entry.writebacks = g_writebacks;
     if (entry.srv && entry.hash == hash) return entry.srv.Get();
     entry.hash = hash;
+    entry.prompt_page = kind == psh::Sampler::k2D && prompt_icons::IsGlyphPage(d);  // button prompts
     const int64_t made_at = rt::hitch::Enabled() ? rt::hitch::Now() : 0;  // performance: FCI_TRACE_HITCHES
     if (!texpack::Active()) {  // performance: DXT as BC (texture dump/replacement wants the decoded pixels)
         if (ComPtr<ID3D11ShaderResourceView> srv = CreateBlockTexture(d, kind)) {
@@ -1589,6 +1665,16 @@ ID3D11ShaderResourceView* GetTexture(const State& s, int stage, psh::Sampler& ki
     if (texpack::Active()) PackCreated(entry, d, kind, size, images);  // ---- texture dump/replacement ----
     return entry.srv.Get();
 }
+
+// ---- button prompts (gpu/prompt_icons.h, GitHub #15): the font page with the button glyphs is drawn for the
+// input device in use ----
+ID3D11ShaderResourceView* GetTexture(const State& s, int stage, psh::Sampler& kind, float* scale) {
+    ID3D11ShaderResourceView* srv = GetTextureOf(s, stage, kind, scale);
+    if (srv && g_texture_entry && g_texture_entry->prompt_page)
+        if (ID3D11ShaderResourceView* page = prompt_icons::Page(g_device.Get(), g_texture_desc, g_q.scale)) return page;
+    return srv;
+}
+// ---- end button prompts ----
 
 D3D11_TEXTURE_ADDRESS_MODE AddressMode(uint32_t v) {
     switch (v) {
@@ -1902,8 +1988,12 @@ bool Ready() {
     char debug[8] = {};
     if (GetEnvironmentVariableA("FCI_D3D_DEBUG", debug, sizeof debug)) flags |= D3D11_CREATE_DEVICE_DEBUG;
     D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, &level, 1, D3D11_SDK_VERSION,
-                                   &g_device, nullptr, &g_context);
+    // diagnostics: FCI_D3D_WARP=1 renders with Windows' software rasterizer (WARP), the same on every machine: does a
+    // picture depend on the GPU or its driver? (slow: use a small scale)
+    const bool warp = GetEnvironmentVariableA("FCI_D3D_WARP", nullptr, 0) > 0;
+    HRESULT hr = D3D11CreateDevice(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                                   &level, 1, D3D11_SDK_VERSION, &g_device, nullptr, &g_context);
+    if (warp) rt::Log("render: FCI_D3D_WARP: the software rasterizer (WARP)");
     if (FAILED(hr)) {
         rt::Log("render: D3D11CreateDevice failed %08X", unsigned(hr));
         g_failed = true;
@@ -2288,6 +2378,17 @@ ID3D11ShaderResourceView* DepthView(DepthTarget& d) {
     return d.ao_srv.Get();
 }
 
+// a read-only view of a depth target, so that a draw can test against it while a shader reads it (the ocean)
+ID3D11DepthStencilView* ReadOnlyDsv(DepthTarget& d) {
+    if (!d.dsv_read) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC desc;
+        d.dsv->GetDesc(&desc);
+        desc.Flags = D3D11_DSV_READ_ONLY_DEPTH | (d.stencil ? D3D11_DSV_READ_ONLY_STENCIL : 0);
+        if (FAILED(g_device->CreateDepthStencilView(d.texture.Get(), &desc, &d.dsv_read))) return nullptr;
+    }
+    return d.dsv_read.Get();
+}
+
 void AoFlush() {
     g_ds.Invalidate();  // performance: state cache
     if (!g_ao.pending) return;
@@ -2385,10 +2486,11 @@ void Rebind(const Surfaces& surf) {
 // The ocean (FCI's projected grid, vertex program "OceanOver"): a triangle strip with position and colour, W-buffered,
 // blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA without depth writes, stage 0 the du/dv wave texture (G8B8, projective 2D at
 // world xy x c104), stage 1 the reflection target (bump environment mapped by stage 0), stage 2 the frame's depth buffer
-// as a projective depth texture (r/q = zmax: whether anything was drawn behind; our HLE reads guest memory there, as
-// before). With water_quality medium/high its pixel shader is ours (gpu/water.cpp), with the world position from the
-// vertex program, the scene's depth (a read-only depth view, the water writes none) and for high a resolved copy of the
-// scene. Under water the game draws the surface with another program (OceanUnder), which stays the game's.
+// as a projective depth texture (texel GREATER r/q = zmax: hardly ever true, the alpha is the vertex alpha; DepthTexture
+// reads the host depth there; water_quality original draws it so). With medium/high its pixel shader is ours
+// (gpu/water.cpp), with the world position from the vertex program, the scene's depth (a read-only depth view, the
+// water writes none) and for high a resolved copy of the scene. Under water the game draws the surface with another
+// program (OceanUnder), which stays the game's.
 struct WaterConstants {
     float eye[4];
     float refl_s[4], refl_t[4], refl_q[4];
@@ -2524,12 +2626,7 @@ bool PrepareWater(const State& s, const Draw& d, const Surfaces& surf, WaterPass
     ID3D11PixelShader* wps = GetWaterPixelShader(quality, surf.samples, fog_mode);
     VertexShader* wvs = wps ? GetVertexShader(s, d.enabled, d.raw ? d.format : nullptr, true) : nullptr;
     if (!wps || !wvs || !wvs->layout) return false;
-    if (!depth.dsv_read) {
-        D3D11_DEPTH_STENCIL_VIEW_DESC desc;
-        depth.dsv->GetDesc(&desc);
-        desc.Flags = D3D11_DSV_READ_ONLY_DEPTH | (depth.stencil ? D3D11_DSV_READ_ONLY_STENCIL : 0);
-        if (FAILED(g_device->CreateDepthStencilView(depth.texture.Get(), &desc, &depth.dsv_read))) return false;
-    }
+    if (!ReadOnlyDsv(depth)) return false;
     if (g_gpu_timing.enabled) g_gpu_timing.Begin(Pass::kWater);  // performance: FCI_GPU_TIMING
     ID3D11ShaderResourceView* scene = nullptr;
     if (quality >= water::kHigh) {
@@ -2767,6 +2864,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     ID3D11SamplerState* samplers[4] = {};
     PixelConstants pc{};
     uint32_t programs = s.Reg(SET_SHADER_STAGE_PROGRAM);
+    for (DepthTarget*& t : g_stage_depth) t = nullptr;
     for (int i = 0; i < 4; i++) {
         pc.tex_scale[i][0] = pc.tex_scale[i][1] = 1.0f;
         if (!StageSamples((programs >> (5 * i)) & 0x1F)) continue;
@@ -2775,11 +2873,37 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         config.sampler[i] = kind;
         samplers[i] = GetSampler(s, i);
     }
+    // ---- PC shadows: a receiver of a shadow map with a near cascade reads that too (t4, b5) ----
+    bool cascade = false;
+    for (int i = 0; i < 4; i++)
+        if (config.sampler[i] == psh::Sampler::kShadow && g_stage_depth[i] && g_cascade.on &&
+            g_stage_depth[i]->address == g_cascade.far_address)
+            cascade = true;
+    config.cascade = cascade;
+    // ---- end PC shadows ----
     // (with color writes off, as in the shadow map passes over a dummy color target at physical 0 and the
     // visibility tests, the color target is bound but not refreshed from guest memory: that was a 4 MB upload and
     // hash every frame, as the CPU's data at physical 0 changes all the time)
     Surfaces surf = BindSurfaces(s, true, depth_test || stencil_test, WriteMask(s.Reg(SET_COLOR_MASK)) != 0);
     if (!surf.color && !surf.depth) return;
+    // a stage reads the depth target this draw tests against (the ocean, DepthTexture): bound read-only for the draw
+    // (the game writes no depth there); were it written, the stage reads nothing
+    ID3D11DepthStencilView* depth_read_only = nullptr;
+    for (int i = 0; i < 4 && surf.depth; i++) {
+        if (g_stage_depth[i] != surf.depth || (config.sampler[i] != psh::Sampler::kSceneDepth &&
+                                               config.sampler[i] != psh::Sampler::kSceneDepthMS))
+            continue;
+        const bool writes = s.Reg(SET_DEPTH_MASK) && depth_test;
+        static int logged = 0;
+        if (logged < 4) {
+            logged++;
+            rt::Log("render: stage %d reads the depth target %08X it is drawn with (compare %u, filter %08X%s)", i,
+                    surf.depth->address, s.Reg(SET_SHADOW_COMPARE_FUNC) & 7, s.Reg(SET_TEXTURE_FILTER + 0x40 * i),
+                    writes ? ", depth writes: not read" : "");
+        }
+        if (writes) srvs[i] = nullptr;
+        else if (!depth_read_only) depth_read_only = ReadOnlyDsv(*surf.depth);
+    }
     // ---- ambient occlusion ----
     if (AoBeforeDraw(s, surf, surf.depth && depth_test && s.Reg(SET_DEPTH_MASK),
                      surf.color ? WriteMask(s.Reg(SET_COLOR_MASK)) : UINT8(0)))
@@ -3054,7 +3178,25 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     }
     g_context->RSSetScissorRects(1, &scissor);
 
-    if (wpass.active) WaterBind(wpass, surf);  // PC water
+    if (wpass.active) {
+        WaterBind(wpass, surf);  // PC water
+    } else if (depth_read_only) {
+        ID3D11RenderTargetView* rtv = surf.color ? surf.color->rtv.Get() : nullptr;
+        g_context->OMSetRenderTargets(rtv ? 1 : 0, &rtv, depth_read_only);
+    }
+    // ---- PC shadows: a receiver gets the near cascade (psh.cpp) ----
+    if (cascade) {
+        static Constants<CascadeConstants> cascade_constants;
+        CascadeConstants cc{};
+        std::memcpy(cc.n, g_cascade.n, sizeof cc.n);
+        std::memcpy(cc.f, g_cascade.f, sizeof cc.f);
+        cc.fade[0] = kCascadeFade;
+        ID3D11Buffer* b = cascade_constants.Update(cc);
+        ID3D11ShaderResourceView* maps[2] = {g_cascade.near_map->srv.Get(), g_cascade.far_map->srv.Get()};
+        g_context->PSSetConstantBuffers(5, 1, &b);
+        g_context->PSSetShaderResources(4, 2, maps);
+    }
+    // ---- end PC shadows ----
 
     // geometry
     static Ring vertex_ring(D3D11_BIND_VERTEX_BUFFER), index_ring(D3D11_BIND_INDEX_BUFFER);
@@ -3140,7 +3282,17 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         g_context->DrawIndexed(UINT(indices.size()), 0, 0);
     }
     }
-    if (wpass.active) WaterUnbind(surf);  // PC water
+    if (g_near_pass && surf.depth && surf.depth->z16) g_cascade_draws++;  // PC shadows: statistics
+    if (depth_read_only) {  // (the depth's view off the stages before it is writable again)
+        ID3D11ShaderResourceView* none[4] = {};
+        g_context->PSSetShaderResources(0, 4, none);
+    }
+    if (wpass.active) {
+        WaterUnbind(surf);  // PC water
+    } else if (depth_read_only) {
+        ID3D11RenderTargetView* rtv = surf.color ? surf.color->rtv.Get() : nullptr;
+        g_context->OMSetRenderTargets(rtv ? 1 : 0, &rtv, surf.depth->dsv.Get());
+    }
     if (surf.color && mask) MarkWritten(*surf.color);
     g_draws++;
     if (surf.depth && depth_test && s.Reg(SET_DEPTH_MASK)) surf.depth->last_write = ++g_write_sequence;
@@ -3475,6 +3627,13 @@ void SetHle(bool on) {
         g_q.shadow_scale = uint32_t(std::clamp(std::lround(density * k), 1l, 8l));
         rt::Log("render: shadow distance x%.2f: shadow maps %ux (texels %.2fx the size at shadow_scale %u)", k,
                 g_q.shadow_scale, density * k / g_q.shadow_scale, density);
+        // shadow cascades: the console's square in a near map at shadow_scale, the rest as before
+        const std::string cascades = settings::String("shadow_cascades", "on");
+        if (k >= 2.0f && cascades != "off" && cascades != "0") {
+            g_q.near_scale = density;
+            rt::Log("render: shadow cascades: near map %ux%u over the console's square (the game's shadow pass "
+                    "alternating near and far)", 1024 * density, 1024 * density);
+        }
     }
     {
         std::string filter = settings::String("shadow_filter", "soft");
@@ -3558,6 +3717,44 @@ bool SyncToGuest(uint32_t address, bool late) {
 }
 
 void SetGammaRamp(const uint8_t ramp[768]) { present::SetGamma(ramp); }
+
+// ---- PC shadows: shadow cascades (see above; called in push buffer order) ----
+bool ShadowCascades() { return g_q.near_scale != 0; }
+void BeginNearShadowPass() {
+    g_near_pass = true;
+    g_ds.Invalidate();  // performance: state cache (other targets follow)
+}
+void EndNearShadowPass() { g_near_pass = false; }
+void SetShadowCascade(bool on, bool near_now, const float m[3][4]) {
+    g_cascade.on = on && g_last_near && g_last_far && g_last_near->srv && g_last_far->srv;
+    g_cascade.near_map = g_last_near;
+    g_cascade.far_map = g_last_far;
+    g_cascade.far_address = g_last_shadow_address;
+    // this frame's map: as the receivers address it; the other: m (from the game's two cameras) about the XDK's pixel
+    // centre (+0.53125 guest texels in c59: both maps hold their content offset by it, m maps the cameras' 0.5 +- 0.5
+    // clip)
+    static const float kSame[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    float other[3][4];
+    std::memcpy(other, m, sizeof other);
+    if (g_last_shadow_width) {
+        const float g = 0.53125f / float(g_last_shadow_width);
+        other[0][3] += g - g * (other[0][0] + other[0][1]);
+        other[1][3] += g - g * (other[1][0] + other[1][1]);
+        other[2][3] -= g * (other[2][0] + other[2][1]);
+    }
+    std::memcpy(g_cascade.n, near_now ? kSame : other, sizeof g_cascade.n);
+    std::memcpy(g_cascade.f, near_now ? other : kSame, sizeof g_cascade.f);
+    static uint64_t frames = 0, draws = 0;
+    if (g_cascade.on && ++frames % 3000 == 1) {
+        rt::Log("render: shadow cascades: near map %ux%u, far %ux%u at %08X, %.1f near draws per frame (last 3000)",
+                HostWidthOf(g_last_near->width, g_last_near->scale, 1.0f),
+                HostHeightOf(g_last_near->height, g_last_near->scale),
+                HostWidthOf(g_last_far->width, g_last_far->scale, 1.0f), HostHeightOf(g_last_far->height, g_last_far->scale),
+                g_last_shadow_address, double(g_cascade_draws - draws) / (frames > 1 ? 3000 : 1));
+        draws = g_cascade_draws;
+    }
+}
+// ---- end PC shadows ----
 
 std::recursive_mutex& ContextLock() {
     static std::recursive_mutex lock;

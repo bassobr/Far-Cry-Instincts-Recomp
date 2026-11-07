@@ -23,6 +23,10 @@ var D3D_g_FixedFunctionShader = 0x00519BF8  # the device's vertex shader record 
 # ---- PC features (src/xdk/game.cpp) ----
 fun Game_CameraUpdate = 0x002A84E0  # CCamera update, camera in ebx: projection and frustum from fov +0x38, aspect +0x384
 fun Game_FirstPersonProjection = 0x002469E0  # renderer in eax: projection of first person items from fov +0x698, viewport and pixel aspect +0x6AC
+fun Game_FrameTimeSource = 0x001FF8F0  # thiscall (frame timer 0x00644488 in ecx), seconds in st(0): the millisecond clock 0x002856F0 x 0.001, the frame timer's time source
+fun Game_PhysicsStep = 0x003741E0  # stdcall (physics world, frame time; ret 8): CPhysicalWorld time step, called once per frame by 0x001FCF40
+fun Game_PlayerAngles = 0x00098AE0  # thiscall (player, ?; ret 4), virtual (0x005FC3F0): the player's view angles with the water bob (p_waterbob_*, added per frame)
+fun Game_VehicleImpulses = 0x003CC9A0  # thiscall (wheeled vehicle, step time; ret 4), virtual (CWheeledVehicleEntity vtable 0x00625D40 +0xD8, called by the rigid body step 0x003B2FE0): all wheel forces of a step (suspension, engine, tyre friction)
 # ---- end PC features ----
 # ---- PC shadows (src/xdk/shadows.cpp) ----
 fun Game_ShadowPass = 0x00458C80  # (engine, ?, view environment: camera +0, sun shadow radius +0x34, ...; 7 args, ret 0x1C): shadow casting lights, their cameras and depth passes

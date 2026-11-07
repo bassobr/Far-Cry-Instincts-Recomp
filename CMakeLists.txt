@@ -224,6 +224,9 @@ add_executable(FarCryInstincts
     # texture dump/replacement and fps counter (parts adapted from SCDA-XBERecomp, MIT)
     src/gpu/texture_pack.cpp
     src/gpu/fps_overlay.cpp
+    # button prompts for the input device in use (GitHub #15)
+    src/hle/prompts.cpp
+    src/gpu/prompt_icons.cpp
     # fmv_scale, colour_blind (parts adapted from SCDA-XBERecomp, MIT)
     src/gpu/fmv.cpp
     # ambient occlusion (SSAO/GTAO), adapted from SCDA-XBERecomp (MIT)
@@ -257,6 +260,7 @@ else()
     message(WARNING "d3dcompiler_47.dll (Windows SDK Redist/D3D/x64) not found: not copied next to the exe")
 endif()
 target_link_libraries(FarCryInstincts PRIVATE windowscodecs)  # texture dump/replacement: PNG through WIC
+target_link_libraries(FarCryInstincts PRIVATE gdi32)  # button prompts: key labels drawn with a system font
 target_link_libraries(FarCryInstincts PRIVATE $<LINK_ONLY:SDL3::SDL3-static>)  # controllers (src/hle/host_pad.cpp)
 # no high entropy ASLR: thread stacks that DLLs create at load time (before our first static initializer)
 # could otherwise land anywhere in 64 bit space, sometimes in the guest window at 0x2000000000

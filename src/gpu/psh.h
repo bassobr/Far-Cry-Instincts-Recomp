@@ -11,7 +11,10 @@ namespace gpu::psh {
 
 // kShadow: a depth texture (a host depth target) that projective stages compare against r/q, with
 // tex_scale.xy addressing it and tex_scale.z its depth range (65535 or 16777215)
-enum class Sampler : uint8_t { k2D, kRect, kCube, k3D, kShadow };
+// kSceneDepth / kSceneDepthMS: a linear depth texture on a 24 bit depth target (the 3D view's, float on the host,
+// multisampled or not, maybe reversed): compared like kShadow, per texel of the guest's size, with tex_scale.xy the host
+// pixels per guest texel, tex_scale.z the depth range and tex_scale.w the reversed depth's constant (0: not reversed)
+enum class Sampler : uint8_t { k2D, kRect, kCube, k3D, kShadow, kSceneDepth, kSceneDepthMS };
 
 // performance: what the pixel shader writes as depth (renderer.cpp decides by target and draw)
 enum class Depth : uint8_t {
@@ -24,6 +27,8 @@ enum class Depth : uint8_t {
 struct Config {
     Sampler sampler[4] = {};
     Depth depth = Depth::kNone;
+    // PC shadows: the shadow map has a near cascade (texture t4, cbuffer b5: renderer.cpp, "shadow cascades")
+    bool cascade = false;
 };
 
 // performance: reversed depth stores c / d for the guest's depth d (w / zmax or z / zmax)

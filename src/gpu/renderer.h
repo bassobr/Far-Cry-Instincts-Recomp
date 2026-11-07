@@ -40,6 +40,15 @@ void Present(uint32_t front);  // physical address of the frame buffer to show, 
 // late: a lock that does not wait for the GPU (NOOVERWRITE): the newest finished copy, without a stall
 bool SyncToGuest(uint32_t address, bool late = false);
 void SetGammaRamp(const uint8_t ramp[768]);
+// ---- PC shadows: shadow cascades (xdk/shadows.cpp; the last three in push buffer order) ----
+// whether the sun gets a near shadow map (shadow_cascades with shadow_distance >= 2, HLE)
+bool ShadowCascades();
+// the game's shadow pass between these draws its 16 bit depth into the near map instead
+void BeginNearShadowPass();
+void EndNearShadowPass();
+// after a pass (near_now: the near one): its receivers read the other map at m x (u, v, depth, 1) (on: valid)
+void SetShadowCascade(bool on, bool near_now, const float m[3][4]);
+// ---- end PC shadows ----
 // performance: held while the device context is in use (the render thread's commands, the settings menu's frames,
 // CPU reads of render targets)
 std::recursive_mutex& ContextLock();
