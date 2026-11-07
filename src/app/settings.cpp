@@ -231,6 +231,18 @@ bool FromEnvironment(const char* key) {
     return Environment(key, v);
 }
 
+std::string ChangedSinceStart() {
+    std::lock_guard lock(g_lock);
+    std::string out;
+    for (const auto& [key, value] : g_changed) {
+        std::string boot;
+        if (!BootLookup(key.c_str(), boot) && !DeviceDefault(key.c_str(), boot)) boot = "(default)";
+        if (boot == value) continue;
+        out += (out.empty() ? "" : ", ") + key + " " + boot + " -> " + value;
+    }
+    return out;
+}
+
 bool Save() {
     std::lock_guard lock(g_lock);
     if (g_unsaved.empty()) return true;

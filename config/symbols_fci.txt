@@ -34,3 +34,6 @@ fun Game_EngineCVars = 0x00481B30  # block in eax (0x108 bytes, [0x006B4AB8]): r
 # ---- start level (src/hle/start_level.cpp, FCI_START_LEVEL) ----
 fun Game_PushCommand = 0x00012000  # (edx = command text, game; ret 4): queues a game command (StartLevel, ReturnToMenu, ...) at game+0x3A4
 # ---- end start level ----
+# ---- mouse look (src/hle/mouse_look.cpp) ----
+fun Game_LookInput = 0x0003D450  # stdcall (aim controller, processing command, TURNLR, TURNUD): the look input of a client; writes the frame's yaw/pitch change in degrees to the command +0xBC/+0xC0
+# ---- end mouse look ----

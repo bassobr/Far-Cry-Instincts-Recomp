@@ -16,6 +16,9 @@ namespace gpu::present {
 void DumpNext(const char* tag);
 void Frame(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11ShaderResourceView* frame, uint32_t w,
            uint32_t h, float aspect = 4.0f / 3.0f);
+// relaunch handover: this process's dedicated GPU memory in MB (-1 before the swap chain) and the budget Windows
+// gives it
+int VideoMemoryUsage(int* budget_mb = nullptr);
 // PC features, vsync = 1: waits until the display takes the next frame (call with the guest CPU released, before
 // the frame is presented); false without vsync (the caller paces the frames itself)
 bool WaitForDisplay();

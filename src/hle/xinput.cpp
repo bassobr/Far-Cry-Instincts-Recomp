@@ -10,7 +10,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
+
+#include <dbghelp.h>
 
 #include "app/menu.h"  // settings menu
 #include "hle/original.h"
@@ -189,6 +193,107 @@ Pad ReadHost(int port) {
     return p;
 }
 
+// ---- FCI_WATCH=<hex>[,<hex>...]@<seconds>: hardware write breakpoints (up to four guest dwords) on the thread
+// that polls player 1, armed at that script time; every distinct writer (host return chain) is logged with its
+// symbols and source lines, which name the generated function and the guest instruction (PC(...) on that line) ----
+struct WatchHit {
+    uint64_t frames[6];
+    volatile LONG count;
+};
+constexpr int kMaxWatchHits = 64;
+WatchHit g_watch_hits[kMaxWatchHits];
+volatile LONG g_watch_used = 0;
+int g_watch_logged[kMaxWatchHits] = {};
+
+LONG CALLBACK OnWatch(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 0xF))
+        return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t frames[6] = {};
+    CONTEXT ctx = *e->ContextRecord;
+    for (int i = 0; i < 6 && ctx.Rip; i++) {
+        frames[i] = ctx.Rip;
+        DWORD64 image = 0;
+        auto* fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+        if (!fn) break;
+        void* handler_data;
+        DWORD64 frame;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+    }
+    LONG used = g_watch_used;
+    int i = 0;
+    for (; i < used; i++)
+        if (!std::memcmp(g_watch_hits[i].frames, frames, sizeof frames)) break;
+    if (i == used && used < kMaxWatchHits) {
+        std::memcpy(g_watch_hits[used].frames, frames, sizeof frames);
+        g_watch_used = used + 1;
+    }
+    if (i < kMaxWatchHits) InterlockedIncrement(&g_watch_hits[i].count);
+    e->ContextRecord->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void Watch(double now) {
+    static struct {
+        std::vector<uint32_t> at;
+        double from = -1;
+    } w = [] {
+        decltype(w) out;
+        char text[256] = {};
+        if (!GetEnvironmentVariableA("FCI_WATCH", text, sizeof text)) return out;
+        char* when = std::strchr(text, '@');
+        out.from = when ? std::atof(when + 1) : 0;
+        if (when) *when = 0;
+        for (char* item = std::strtok(text, ","); item && out.at.size() < 4; item = std::strtok(nullptr, ","))
+            out.at.push_back(uint32_t(std::strtoul(item, nullptr, 16)));
+        return out;
+    }();
+    static bool armed = false;
+    if (w.at.empty()) return;
+    if (!armed && now >= w.from) {
+        armed = true;
+        AddVectoredExceptionHandler(1, OnWatch);
+        HANDLE self = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE,
+                        DUPLICATE_SAME_ACCESS);
+        std::thread([&, self] {
+            SuspendThread(self);
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            GetThreadContext(self, &ctx);
+            DWORD64* dr[4] = {&ctx.Dr0, &ctx.Dr1, &ctx.Dr2, &ctx.Dr3};
+            ctx.Dr7 = 0;
+            for (size_t i = 0; i < w.at.size(); i++) {
+                *dr[i] = reinterpret_cast<DWORD64>(rt::Host(w.at[i]));
+                ctx.Dr7 |= (1ull << (2 * i)) | (0xDull << (16 + 4 * i));  // enabled, write, 4 bytes
+            }
+            SetThreadContext(self, &ctx);
+            ResumeThread(self);
+        }).join();
+        CloseHandle(self);
+        rt::Log("input: %.3f s watching %zu guest dwords for writes", now, w.at.size());
+    }
+    // log new writers, and every 2 s the counts
+    static double last_counts = 0;
+    bool counts = now - last_counts >= 2;
+    if (counts) last_counts = now;
+    for (LONG i = 0; i < g_watch_used; i++) {
+        if (g_watch_logged[i] && !counts) continue;
+        g_watch_logged[i] = 1;
+        std::string chain;
+        for (uint64_t f : g_watch_hits[i].frames) {
+            if (!f) break;
+            chain += " " + rt::SymbolAt(f);
+            IMAGEHLP_LINE64 line{sizeof line};
+            DWORD disp = 0;
+            if (SymGetLineFromAddr64(GetCurrentProcess(), f - 1, &disp, &line) && line.FileName) {
+                const char* file = std::strrchr(line.FileName, '\\');
+                chain += std::string("(") + (file ? file + 1 : line.FileName) + ":" + std::to_string(line.LineNumber) + ")";
+            }
+        }
+        rt::Log("input: %.3f s watch writer %ld x%ld:%s", now, i, g_watch_hits[i].count, chain.c_str());
+    }
+}
+
 // ---- diagnostics for calibrating the mouse look ----
 // FCI_MEM_SNAPSHOT=200,203,...: at those script seconds, every committed page of guest memory goes to
 // mem_<seconds>.bin beside the executable (records: guest address, size, bytes), to find the view angles.
@@ -217,6 +322,7 @@ void Diagnostics() {
         return at;
     }();
     double now = ScriptSeconds();
+    Watch(now);
     if (!floats.empty()) {
         static double last = -1;
         if (now - last < 0.01) return;  // the boot polls many times a millisecond

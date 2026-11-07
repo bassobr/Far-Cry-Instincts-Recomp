@@ -19,6 +19,7 @@
 #include "app/focus_pause.h"  // PC comfort features
 #include "app/menu.h"         // settings menu
 #include "gpu/nv2a.h"
+#include "gpu/present.h"   // relaunch handover: GPU memory
 #include "gpu/renderer.h"  // CompileHlsl
 #include "kernel/kernel.h"  // relaunch handover
 #include "hle/host_pad.h"  // controllers: motors off at exit
@@ -623,7 +624,8 @@ void FinishHandover() {
     SetForegroundWindow(g_window);
     SetEvent(g_handover);
     CloseHandle(g_handover);
-    rt::Log("display: handover done, window shown");
+    int budget = 0, used = gpu::present::VideoMemoryUsage(&budget);
+    rt::Log("display: handover done, window shown (GPU memory of this process %d MB, budget %d MB)", used, budget);
 }
 
 void Vblank() {

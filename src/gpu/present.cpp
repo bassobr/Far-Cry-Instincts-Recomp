@@ -782,6 +782,8 @@ void DumpHdr(float px, float py, float pw, float ph) {
 }
 // ---- end display output options ----
 
+ComPtr<IDXGIAdapter3> g_adapter3;  // relaunch handover: VideoMemoryUsage
+
 bool InitSwap() {
     g_window = static_cast<HWND>(display::Window());
     if (!g_window) return rt::Log("present: no window"), false;
@@ -791,6 +793,7 @@ bool InitSwap() {
     if (FAILED(g_device->QueryInterface(IID_PPV_ARGS(&dxgi))) || FAILED(dxgi->GetAdapter(&adapter)) ||
         FAILED(adapter->GetParent(IID_PPV_ARGS(&factory))))
         return rt::Log("present: no DXGI factory"), false;
+    adapter.As(&g_adapter3);  // relaunch handover: VideoMemoryUsage
     RECT rc;
     GetClientRect(g_window, &rc);
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -1271,6 +1274,13 @@ void DumpBack() {
 }  // namespace
 
 void DumpNext(const char* tag) { g_dump_tag = tag; }
+
+int VideoMemoryUsage(int* budget_mb) {
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (!g_adapter3 || FAILED(g_adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) return -1;
+    if (budget_mb) *budget_mb = int(info.Budget >> 20);
+    return int(info.CurrentUsage >> 20);
+}
 
 void Frame(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11ShaderResourceView* frame, uint32_t w,
            uint32_t h, float aspect) {

@@ -45,7 +45,8 @@ the other open-source projects listed under [Credits](#credits).
 **Input**
 - Up to four controllers through SDL3 (Xbox, PlayStation, Switch Pro and most other gamepads), hot-plug, rumble,
   remappable buttons, split screen
-- Keyboard and mouse for player 1 with remappable keys and raw mouse look calibrated to the game's turn rate
+- Keyboard and mouse for player 1 with remappable keys and direct raw mouse look (a fixed angle per count, shown in
+  the same frame), with adjustable sensitivity, optional acceleration and smoothing, and zoom sensitivity
 
 **Comfort**
 - Settings menu on **F10** (controller: **Back + Start**), applied at once where possible and saved to the ini file
@@ -209,7 +210,7 @@ there.
 | `lod_distance` | `4` (Steam Deck `1`) | Level-of-detail and sprite distances, 0.5–8 times the console's |
 | `view_distance` | `2` (Steam Deck `1`) | Object view distance, 0.5–8 times the console's |
 | `aspect` | `auto` | `auto` (the output's shape), `4:3`, `16:9`, `16:10`, `21:9`, `W:H` or a number |
-| `fov` | `1` | Field of view multiplier, 0.5–2 |
+| `fov` | `1` | Field of view multiplier, 0.5–2, on the game's vertical view (67.5° in play), on every aspect ratio; `2` gives 135° vertically (160° horizontally on 21:9) |
 | `fps_limit` | `auto` | `auto` = display refresh rate, `30` = console, `0` = unlimited, or a number |
 | `vsync` | `0` | `1` = present with the display's refresh |
 | `frame_queue` | `1` (Steam Deck `2`) | Frames the game may finish ahead of display, 1–3 |
@@ -225,10 +226,16 @@ there.
 | `colour_blind` | `0` | `0` off, `1` protanopia, `2` deuteranopia, `3` tritanopia |
 | `fps_counter` | `0` | `1` = show frame rate and frame times |
 | `skip_intro` | `0` | `1` = skip the three logo videos at start (Ubisoft, Crytek, Far Cry Instincts); not the story's cutscenes |
+| `language` | `english` | Text and voice language: `english`, `french`, `italian`, `spanish`, `german`, `auto` (the Windows display language). The NTSC disc has English, French, Italian and Spanish; `german` shows English there. Takes effect after a restart |
 | `pause_on_focus_loss` | `0` | `1` = pause game, sound and rumble while the window is in the background |
-| `mouse_sensitivity` | `1` | 1 = 0.1 degrees per mouse count; `mouse_sensitivity_x` / `_y` per axis |
+| `mouse_mode` | `direct` | `direct` = every mouse count turns the view by the same angle, at once, with no ramp, speed cap, smoothing or dead zone; `stick` = the old way through the right stick (the game's stick handling) |
+| `mouse_sensitivity` | `1` | 1 = 0.1 degrees per mouse count (900 counts = 90°), 0.01–100; `mouse_sensitivity_x` / `_y` per axis |
 | `mouse_invert_y` | `0` | `1` = inverted vertical mouse look |
-| `mouse_acceleration` | `0` | 0 = none (raw input) |
+| `mouse_acceleration` | `0` | 0 = none (raw input); > 0 = extra gain per count/ms of mouse speed (0.05: 1.5× at 10 counts/ms), independent of the frame rate |
+| `mouse_acceleration_cap` | `2` | Highest gain the acceleration reaches (≥ 1) |
+| `mouse_smoothing` | `0` | 0 = off; else milliseconds (up to 200) over which each movement is spread, by time, not frames; the total stays exact |
+| `mouse_zoom_scale` | `fov` | While zoomed (scope, binoculars): `fov` = slower by the zoom's field of view ratio (as the game does for the stick), `tan` = by the ratio of tan(fov/2), `off` = unchanged |
+| `mouse_zoom_sensitivity` | `1` | Extra factor while zoomed (0.05–10) |
 | `pad_backend` | `sdl` | `sdl`, `xinput` (XInput pads only, without SDL), `off` |
 | `pad_dead_zone` | `0` | Extra stick dead zone, 0.05–0.9 (0 = the game's own only) |
 | `pad_rumble` | `100` | Rumble strength in percent |
@@ -316,10 +323,10 @@ code. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   xiso images.
 - Launching as a non-Steam game in the Steam Deck's Game Mode has not been fully verified; the game itself runs
   under Proton.
-- With `fov` above about 1.1 on 21:9 (about 1.45 on 16:9) the view widens no further: the game's camera caps its
-  field of view.
 - The story's cutscenes, such as the opening on the boat, are scripted sequences in the levels and can't be skipped
   (as on the Xbox); `skip_intro` covers the logo videos at start.
+- Direct mouse look has been measured on foot, while zoomed and in split screen; vehicles and mounted guns use the
+  same input path but have had less testing. `mouse_mode = stick` brings back the old behaviour.
 - Online play (Xbox Live, system link) is not supported.
 
 ## Credits

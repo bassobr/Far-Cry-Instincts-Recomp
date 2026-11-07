@@ -104,3 +104,6 @@ Game_EngineCVars
 # ---- start level (src/hle/start_level.cpp) ----
 Game_PushCommand
 # ---- end start level ----
+# ---- mouse look (src/hle/mouse_look.cpp) ----
+Game_LookInput
+# ---- end mouse look ----

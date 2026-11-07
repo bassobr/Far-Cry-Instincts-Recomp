@@ -3,11 +3,13 @@
 // The wheel as two bindable keys follows SCDA-XBERecomp (MIT, Copyright (c) 2026 TGP482, Joshhhuaaa),
 // src/core/input.cpp: codes Windows leaves unassigned, a notch is a short press.
 //
-// Mouse look: the game turns the view at a rate given by the right stick's deflection. The motion is turned into
-// an angle (mouse_sensitivity degrees per 10 counts), and each poll deflects the stick so that the game's turn
-// rate, measured for this game (kYaw/kPitch), times the frame's time turns that angle. What the stick cannot turn
-// at once (the game's top rate) carries over to the next polls, so a given amount of motion always turns the same
-// angle, however fast it is made.
+// Mouse look, mouse_mode = direct (the default): the motion becomes degrees (mouse_sensitivity per 10 counts, with
+// the optional acceleration, smoothing and zoom scale) that hle/mouse_look.cpp adds to the view angles in the game's
+// look input, once a frame (TakeLookDegrees). Where that does not run, and with mouse_mode = stick, the old way:
+// the game turns the view at a rate given by the right stick's deflection. The motion is turned into an angle, and
+// each poll deflects the stick so that the game's turn rate, measured for this game (kYaw/kPitch), times the
+// frame's time turns that angle. What the stick cannot turn at once (the game's top rate) carries over to the next
+// polls, so a given amount of motion always turns the same angle, however fast it is made.
 #include "hle/pc_input.h"
 
 #include <windows.h>
@@ -295,10 +297,17 @@ struct Axis {
 };
 Axis g_yaw{kYaw, int(sizeof kYaw / sizeof kYaw[0])}, g_pitch{kPitch, int(sizeof kPitch / sizeof kPitch[0])};
 
+enum class ZoomScale { kFov, kTan, kOff };
+
 struct MouseSettings {
+    bool direct;                  // mouse_mode: direct (onto the view angles) or stick (the old right stick)
     double degrees_x, degrees_y;  // per count
     bool invert_y;
-    double acceleration;  // extra gain per count/ms of speed, 0 for none
+    double acceleration;          // extra gain per count/ms of speed, 0 for none
+    double acceleration_cap;      // the gain's ceiling (a factor, >= 1)
+    double smoothing;             // seconds the motion is spread over, 0 for none
+    ZoomScale zoom_scale;         // while zoomed: the game's fov ratio, the ratio of tan(fov / 2), or none
+    double zoom_sensitivity;      // times this while zoomed
 };
 
 MouseSettings g_mouse;
@@ -309,17 +318,49 @@ const MouseSettings& Mouse() {
     g_mouse_read = true;
     g_mouse = [] {
         MouseSettings m;
-        double base = settings::Float("mouse_sensitivity", 1.0f);
-        m.degrees_x = settings::Float("mouse_sensitivity_x", float(base)) * 0.1;
-        m.degrees_y = settings::Float("mouse_sensitivity_y", float(base)) * 0.1;
+        m.direct = Lower(Trim(settings::String("mouse_mode", "direct"))) != "stick";
+        double base = std::clamp(settings::Float("mouse_sensitivity", 1.0f), 0.01f, 100.0f);
+        m.degrees_x = std::clamp(settings::Float("mouse_sensitivity_x", float(base)), 0.01f, 100.0f) * 0.1;
+        m.degrees_y = std::clamp(settings::Float("mouse_sensitivity_y", float(base)), 0.01f, 100.0f) * 0.1;
         m.invert_y = settings::Bool("mouse_invert_y", false);
         m.acceleration = std::max(0.0f, settings::Float("mouse_acceleration", 0.0f));
-        rt::Log("input: mouse look %.3f/%.3f degrees per count%s, acceleration %.2f", m.degrees_x, m.degrees_y,
-                m.invert_y ? ", inverted y" : "", m.acceleration);
+        m.acceleration_cap = std::max(1.0f, settings::Float("mouse_acceleration_cap", 2.0f));
+        m.smoothing = std::clamp(settings::Float("mouse_smoothing", 0.0f), 0.0f, 200.0f) / 1000.0;
+        std::string zoom = Lower(Trim(settings::String("mouse_zoom_scale", "fov")));
+        m.zoom_scale = zoom == "tan" ? ZoomScale::kTan : zoom == "off" ? ZoomScale::kOff : ZoomScale::kFov;
+        m.zoom_sensitivity = std::clamp(settings::Float("mouse_zoom_sensitivity", 1.0f), 0.05f, 10.0f);
+        rt::Log("input: mouse look %s, %.3f/%.3f degrees per count%s, acceleration %.2f (cap %.2f), smoothing %.0f ms, "
+                "zoom %s x %.2f",
+                m.direct ? "direct" : "through the right stick", m.degrees_x, m.degrees_y,
+                m.invert_y ? ", inverted y" : "", m.acceleration, m.acceleration_cap, m.smoothing * 1000,
+                m.zoom_scale == ZoomScale::kTan ? "tan" : m.zoom_scale == ZoomScale::kOff ? "off" : "fov",
+                m.zoom_sensitivity);
         return m;
     }();
     return g_mouse;
 }
+
+// mouse_acceleration: the gain for this much motion in this time (counts per ms, so the same at any frame rate)
+double AccelerationGain(const MouseSettings& m, double counts, double dt) {
+    if (m.acceleration <= 0 || dt <= 0) return 1;
+    return std::min(1 + m.acceleration * std::fabs(counts) / (dt * 1000), m.acceleration_cap);
+}
+
+// ---- direct mouse look (hle/mouse_look.cpp): the motion goes onto the view angles in the game's look input,
+// once a frame, after the game's stick handling; the poll only hands it the scripted counts ----
+struct Direct {
+    double script_x = 0, script_y = 0;  // FCI_KEY_SCRIPT counts since the last look input
+    double last = -1;                   // script time of the last look input
+    bool focused = false;               // as the last poll saw it
+    // mouse_smoothing: each frame's degrees spread evenly over [from, from + smoothing]
+    struct Sample {
+        double from, yaw, pitch;
+    };
+    std::vector<Sample> samples;
+} g_direct;
+// the look input ran this recently: the mouse is direct (else the right stick takes it)
+constexpr double kDirectTimeout = 0.25;
+// ---- end direct mouse look ----
 
 // ---- settings menu: after the menu closes, keys and buttons still held reach the game only once let go ----
 bool g_settle_pending = false;
@@ -400,6 +441,7 @@ void ApplyKeyboardMouse(Pad& p, bool focused) {
         display::TakeMouseMotion(&ignore_x, &ignore_y);
         display::TakeWheelNotches();
         g_yaw.pending = g_pitch.pending = 0;
+        g_direct.script_x = g_direct.script_y = 0, g_direct.samples.clear();
     }
     // ---- end settings menu ----
     UpdateWheel(now, focused ? display::TakeWheelNotches() : 0, last, now);
@@ -432,14 +474,25 @@ void ApplyKeyboardMouse(Pad& p, bool focused) {
         if (keys[i]) p.thumb[i] = keys[i];
     }
 
-    // mouse look: the right stick, unless keys push it
+    // direct mouse look: the game's look input took the motion since the previous poll (hle/mouse_look.cpp), so
+    // the scripted counts wait there for the next one. Where it does not run (menus, no player in control), the
+    // motion falls back to the right stick below, as with mouse_mode = stick
+    g_direct.focused = focused;
+    const bool direct = mouse.direct && g_direct.last >= 0 && now - g_direct.last < kDirectTimeout;
+    if (direct) {
+        g_direct.script_x += script_dx, g_direct.script_y += script_dy;
+        g_yaw.pending = g_pitch.pending = 0;
+        last = now;
+        return;
+    }
+    g_direct.script_x = g_direct.script_y = 0, g_direct.samples.clear();
+
+    // mouse look through the right stick, unless keys push it
     int dx = 0, dy = 0;
     bool captured = focused && display::TakeMouseMotion(&dx, &dy);
     double mx = dx + script_dx, my = dy + script_dy;
-    if (mouse.acceleration > 0 && dt > 0) {
-        double speed = std::sqrt(mx * mx + my * my) / (dt * 1000);  // counts per ms
-        mx *= 1 + mouse.acceleration * speed, my *= 1 + mouse.acceleration * speed;
-    }
+    double gain = AccelerationGain(mouse, std::sqrt(mx * mx + my * my), dt);
+    mx *= gain, my *= gain;
     bool active = (captured || g_script_mouse) && !keys[2] && !keys[3];
     int16_t rx = Look(g_yaw, mx * mouse.degrees_x, dt, active);
     int16_t ry = Look(g_pitch, -my * mouse.degrees_y * (mouse.invert_y ? -1 : 1), dt, active);
@@ -449,6 +502,55 @@ void ApplyKeyboardMouse(Pad& p, bool focused) {
                 rx, ry, g_yaw.pending, g_pitch.pending);
     last = now;
 }
+
+// ---- direct mouse look (hle/mouse_look.cpp) ----
+double ZoomFactor(double fov) {
+    const MouseSettings& m = Mouse();
+    constexpr double kNormal = 1.5707963;  // the game's own reference: it scales the stick by fov / 90 degrees
+    if (!(fov > 0.01 && fov < kNormal - 1e-3)) return 1;  // not zoomed (or a wider view: no faster mouse)
+    double f = m.zoom_scale == ZoomScale::kFov ? fov / kNormal
+               : m.zoom_scale == ZoomScale::kTan ? std::tan(fov / 2) / std::tan(kNormal / 2)
+                                                 : 1.0;
+    return f * m.zoom_sensitivity;
+}
+
+bool TakeLookDegrees(double fov, double* yaw, double* pitch) {
+    const MouseSettings& m = Mouse();
+    *yaw = *pitch = 0;
+    const double now = ScriptSeconds();
+    const double dt = g_direct.last >= 0 ? std::clamp(now - g_direct.last, 0.0, 0.25) : 0.0;
+    const double from = g_direct.last >= 0 ? g_direct.last : now;
+    g_direct.last = now;
+    if (!m.direct) return false;
+    int dx = 0, dy = 0;
+    if (g_direct.focused) display::TakeMouseMotion(&dx, &dy);
+    double mx = dx + g_direct.script_x, my = dy + g_direct.script_y;
+    g_direct.script_x = g_direct.script_y = 0;
+    const double gain = AccelerationGain(m, std::sqrt(mx * mx + my * my), dt);
+    const double zoom = ZoomFactor(fov);
+    double dyaw = mx * m.degrees_x * gain * zoom;
+    double dpitch = -my * m.degrees_y * gain * zoom * (m.invert_y ? -1 : 1);  // mouse forward (dy < 0) looks up
+    if (m.smoothing > 0) {
+        // the motion of [from, now] spread over [from, from + smoothing]: what falls before now goes this frame
+        if (dyaw || dpitch) g_direct.samples.push_back({from, dyaw, dpitch});
+        dyaw = dpitch = 0;
+        for (auto& s : g_direct.samples) {
+            double share = (std::min(now, s.from + m.smoothing) - std::max(from, s.from)) / m.smoothing;
+            if (share > 0) dyaw += s.yaw * share, dpitch += s.pitch * share;
+        }
+        std::erase_if(g_direct.samples, [&](const Direct::Sample& s) { return s.from + m.smoothing <= now; });
+    } else {
+        g_direct.samples.clear();
+    }
+    *yaw = dyaw, *pitch = dpitch;
+    if (TraceOn() && (mx || my || dyaw || dpitch))
+        rt::Log("input: %.3f s mouse %.0f,%.0f dt %.1f ms gain %.3f zoom %.3f (fov %.4f) -> yaw %+.4f pitch %+.4f deg",
+                now, mx, my, dt * 1000, gain, zoom, fov, dyaw, dpitch);
+    return true;
+}
+
+bool DirectLook() { return Mouse().direct; }
+// ---- end direct mouse look ----
 
 // ---- settings menu (app/menu.cpp) ----
 int BindingCount() { return kTargetCount; }

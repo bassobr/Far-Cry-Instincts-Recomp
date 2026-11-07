@@ -251,7 +251,7 @@ const Setting kSettings[] = {
     {"scale", "RENDER RESOLUTION", "auto", ScaleChoices, When::Restart,
      "Times the console's 640x480, or a share of the output's height; auto = the output's height."},
     {"fov", "FIELD OF VIEW", "1", [] { return Range(0.5, 2.0, 0.05, 1.0, 2, "x"); }, When::Live,
-     "Scale of the game's vertical field of view."},
+     "Scale of the game's vertical field of view, on every screen shape (the sides follow with Hor+)."},
     {"fps_limit", "MAX FRAME RATE", "auto", FpsChoices, When::Live,
      "Highest frame rate; auto = the display's refresh rate, 30 = the console's."},
     {"vsync", "VERTICAL SYNC", "0", OnOff, When::Restart, "Show frames with the monitor's refresh."},
@@ -307,6 +307,12 @@ const Setting kSettings[] = {
     {"skip_intro", "SKIP STARTUP VIDEOS", "0", OnOff, When::Live,
      "Skip the Ubisoft, Crytek and Far Cry Instincts logo videos at start. The story's cutscenes (the opening on the "
      "boat) are part of the levels and can't be skipped, as on the Xbox."},
+    {"language", "LANGUAGE", "english",
+     [] { return Choices{{"english", "ENGLISH"}, {"french", "FRENCH"}, {"german", "GERMAN"}, {"italian", "ITALIAN"},
+                         {"spanish", "SPANISH"}, {"auto", "AUTO (WINDOWS)"}}; },
+     When::Restart,
+     "The game's text and voice language, as the Xbox dashboard's language. The NTSC disc has English, French, "
+     "Italian and Spanish (German shows English there; a PAL disc may have it). Auto = the Windows display language."},
     {"pause_on_focus_loss", "PAUSE ON FOCUS LOSS", "0", OnOff, When::Live,
      "Hold the game while the window is in the background."},
     {"texture_dump", "TEXTURE DUMPING", "0", OnOff, When::Restart, "Write every game texture to textures\\dump."},
@@ -315,14 +321,40 @@ const Setting kSettings[] = {
 const char* const kSections[] = {"DISPLAY", "GRAPHICS", "GENERAL"};
 constexpr int kSectionStart[] = {0, 14, 26};  // first setting of each section in kSettings
 
+// mouse look (hle/pc_input.cpp, hle/mouse_look.cpp)
+Choices OffOr(Choices c, const char* off) {
+    c[0].label = off;
+    return c;
+}
 const Setting kMouseSettings[] = {
-    {"mouse_sensitivity_x", "HORIZONTAL SENSITIVITY", "", [] { return Range(0.1, 10, 0.1, 1, 1); }, When::Live,
-     "Mouse look: 1.0 turns 0.1 degrees per count."},
-    {"mouse_sensitivity_y", "VERTICAL SENSITIVITY", "", [] { return Range(0.1, 10, 0.1, 1, 1); }, When::Live,
-     "Mouse look up and down: 1.0 turns 0.1 degrees per count."},
+    {"mouse_mode", "MOUSE LOOK", "direct",
+     [] { return Choices{{"direct", "DIRECT (DEFAULT)"}, {"stick", "THROUGH THE RIGHT STICK (OLD)"}}; }, When::Live,
+     "Direct: every mouse count turns the view by the same angle, at once, like a PC shooter. Through the right "
+     "stick: the mouse moves the stick as before (the game's ramp and top turn rate)."},
+    {"mouse_sensitivity", "SENSITIVITY", "1", [] { return Range(0.1, 10, 0.05, 1, 2); }, When::Live,
+     "Both axes: 1.00 turns 0.1 degrees per count (900 counts = 90 degrees). Sets the two rows below."},
+    {"mouse_sensitivity_x", "HORIZONTAL SENSITIVITY", "", [] { return Range(0.1, 10, 0.05, 1, 2); }, When::Live,
+     "Left and right: 1.00 turns 0.1 degrees per count."},
+    {"mouse_sensitivity_y", "VERTICAL SENSITIVITY", "", [] { return Range(0.1, 10, 0.05, 1, 2); }, When::Live,
+     "Up and down: 1.00 turns 0.1 degrees per count."},
     {"mouse_invert_y", "INVERT Y AXIS", "0", OnOff, When::Live, "Mouse forward looks down."},
-    {"mouse_acceleration", "MOUSE ACCELERATION", "0", [] { return Range(0, 2, 0.05, 0, 2); }, When::Live,
-     "Extra gain with speed; 0 is raw input without acceleration."},
+    {"mouse_acceleration", "MOUSE ACCELERATION", "0", [] { return OffOr(Range(0, 1, 0.01, 0, 2), "OFF (DEFAULT)"); },
+     When::Live,
+     "Extra gain per count/ms of mouse speed (0.05: 1.5x at 10 counts/ms); the same at any frame rate. Off is raw "
+     "input."},
+    {"mouse_acceleration_cap", "ACCELERATION LIMIT", "2", [] { return Range(1, 5, 0.1, 2, 1, "x"); }, When::Live,
+     "The highest gain acceleration may reach."},
+    {"mouse_smoothing", "MOUSE SMOOTHING", "0", [] { return OffOr(Range(0, 100, 5, 0, 0, " MS"), "OFF (DEFAULT)"); },
+     When::Live,
+     "Spreads each frame's motion over this many milliseconds (same at any frame rate); adds about half of it as "
+     "delay."},
+    {"mouse_zoom_scale", "ZOOM SENSITIVITY", "fov",
+     [] { return Choices{{"fov", "MATCH FOV (DEFAULT)"}, {"tan", "MATCH SCREEN DISTANCE"}, {"off", "UNCHANGED"}}; },
+     When::Live,
+     "Aiming down a scope or binoculars: slower by the zoom's field of view ratio (as the game does for the stick), "
+     "by the ratio of tan(fov / 2) (the same screen distance near the middle), or not at all."},
+    {"mouse_zoom_sensitivity", "ZOOM MULTIPLIER", "1", [] { return Range(0.1, 3, 0.05, 1, 2, "x"); }, When::Live,
+     "Times this while zoomed, on top of the zoom sensitivity."},
 };
 
 // ---- CONTROLLER page (hle/host_pad.h) ----
@@ -443,7 +475,13 @@ void ApplyLive(const Setting& s) {
         std::string v = Lower(settings::String("water_quality", "high"));
         gpu::water::SetQuality(v == "console" ? gpu::water::kConsole : v == "medium" ? gpu::water::kMedium : gpu::water::kHigh);
     } else if (key == "ao_strength") gpu::ao::SetStrength(settings::Float("ao_strength", 1.0f));
-    else if (!key.compare(0, 6, "mouse_")) hle::pc::ReloadMouse();
+    else if (!key.compare(0, 6, "mouse_")) {
+        // the overall sensitivity sets both axes
+        if (key == "mouse_sensitivity")
+            for (const char* axis : {"mouse_sensitivity_x", "mouse_sensitivity_y"})
+                settings::Set(axis, settings::String("mouse_sensitivity", "1"));
+        hle::pc::ReloadMouse();
+    }
     else if (key == "pause_on_focus_loss") SetPauseOnFocusLoss(settings::Bool("pause_on_focus_loss", false));
     else if (key == "pad_dead_zone" || key == "pad_rumble") hle::host::ReloadOptions();
 }
@@ -790,7 +828,7 @@ void PollCapture() {
 void Defaults() {
     g_capture = -1;
     if (g_page == kKeyboardPage) {
-        for (const Setting& s : kMouseSettings) settings::Set(s.key, std::strstr(s.key, "sensitivity") ? "1.0" : "0");
+        for (const Setting& s : kMouseSettings) settings::Set(s.key, *s.fallback ? s.fallback : "1");
         hle::pc::ReloadMouse();
         hle::pc::ResetBindings();
     } else if (g_page == kControllerPage) {
@@ -1263,7 +1301,11 @@ bool MenuWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
     static std::once_flag script;
     std::call_once(script, [hwnd] {
         char text[4096] = {};
-        if (GetEnvironmentVariableA("FCI_MENU_SCRIPT", text, sizeof text)) std::thread(ScriptThread, std::string(text), hwnd).detach();
+        // the relaunch between levels inherits the environment: there FCI_MENU_SCRIPT_RELAUNCH runs instead (tests of
+        // a setting changed before a level change must not change it a second time)
+        const bool relaunched = GetEnvironmentVariableA("FCI_RELAUNCHED", nullptr, 0) > 0;
+        if (GetEnvironmentVariableA(relaunched ? "FCI_MENU_SCRIPT_RELAUNCH" : "FCI_MENU_SCRIPT", text, sizeof text))
+            std::thread(ScriptThread, std::string(text), hwnd).detach();
     });
     *result = 0;
     // F10 opens and closes it; its key up must not reach DefWindowProc, which would open the window's menu

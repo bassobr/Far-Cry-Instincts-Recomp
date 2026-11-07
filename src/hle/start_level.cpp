@@ -13,6 +13,7 @@
 #include <cstring>
 #include <string>
 
+#include "runtime/memory.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -131,6 +132,27 @@ HLE_STDCALL(Game_PushCommand, 1) {
         rt::Log("game command '%s' (profile manager %08X, profile %08X)", kernel::ReadCString(c.edx).c_str(),
                 profiles, profiles ? rt::R32(profiles + 0x14) : 0);
     }
+    // FCI_TEST_COMMAND_ON=<prefix> (tests): FCI_TEST_COMMAND replaces the first game command that starts with <prefix>
+    // instead of following the level start, e.g. "LoadGame" = when "Load savepoint" is chosen in the pause menu (so
+    // a level change can follow what was done in the level before: settings, the game's options)
+    {
+        static bool replaced = false;
+        char on[64], test[200];
+        DWORD m = GetEnvironmentVariableA("FCI_TEST_COMMAND_ON", on, sizeof on);
+        DWORD n = GetEnvironmentVariableA("FCI_TEST_COMMAND", test, sizeof test);
+        if (!replaced && m && m < sizeof on && n && n < sizeof test && kernel::ReadCString(c.edx).rfind(on, 0) == 0 &&
+            GetEnvironmentVariableA("FCI_LAUNCH_DATA", nullptr, 0) == 0) {
+            replaced = true;
+            static const uint32_t text = mem::Contiguous().Alloc(0x1000);
+            if (text) {
+                rt::Log("start level: game command '%s' replaced by the test command '%s'",
+                        kernel::ReadCString(c.edx).c_str(), test);
+                std::memcpy(rt::Host(text), test, n + 1);
+                c.edx = text;
+                return xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));
+            }
+        }
+    }
     std::string level, mission;
     int players = 0;
     // a relaunch (kernel::Relaunch: the game's reboot between levels, "-map <level>") boots the same way
@@ -166,7 +188,7 @@ HLE_STDCALL(Game_PushCommand, 1) {
             // reboot paths, e.g. "FadeOutRestartStartLevel level=02_Native" = the reboot between levels)
             char test[200];
             DWORD n = GetEnvironmentVariableA("FCI_TEST_COMMAND", test, sizeof test);
-            if (n && n < sizeof test) {
+            if (n && n < sizeof test && GetEnvironmentVariableA("FCI_TEST_COMMAND_ON", nullptr, 0) == 0) {
                 uint32_t text = c.edx;
                 uint32_t r = xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));
                 std::memcpy(rt::Host(text), test, n + 1);

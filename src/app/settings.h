@@ -34,6 +34,9 @@ bool FromEnvironment(const char* key);
 // writes the values Set changed into FarCryInstincts.ini: a key's existing line keeps its place and its comment,
 // a new key goes at the end, every other line (comments, unknown keys, sections) stays as it was; false on failure
 bool Save();
+// the keys the menu changed while running whose value differs from the start, "key start -> now" each, for the log
+// (the relaunch between levels starts with them: a tester's fci.log shows what changed before a level change)
+std::string ChangedSinceStart();
 // ---- end settings menu ----
 
 }  // namespace settings

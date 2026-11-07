@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.3 (2026-11-07)
+
+- Direct mouse look (#2): the mouse no longer goes through the right stick. Every mouse count turns the view by a
+  fixed angle (0.1° at sensitivity 1), shown in the same frame, with no dead zone, acceleration ramp, turn-rate cap,
+  smoothing or aim assist, the same at any frame rate. Before, the stick path capped mouse turns at 124°/s
+  sideways and 78°/s up and down, and large movements arrived up to half a second late.
+- New mouse settings, in the F10 menu ("Mouse and Keyboard") and the ini file: mouse look mode (`direct` or the
+  old `stick`), sensitivity for both axes or per axis (0.1–10 in the menu), invert Y, optional acceleration with a
+  cap, optional smoothing in milliseconds, and the sensitivity while zoomed (by the zoom's field of view, by
+  tan(fov/2) or off, plus a factor).
+- Language setting (#4): `language` in the ini file and the F10 menu chooses the game's text and voice language
+  (English, French, Italian, Spanish, German, or the Windows display language). The NTSC disc has English, French,
+  Italian and Spanish.
+- `fov` now works up to 2.0 on every aspect ratio. Before, the view stopped widening at about 1.45 on 16:9 and 1.1
+  on 21:9, and on 32:9 it was narrower than the console's even at 1. The engine's culling angle is decoupled from
+  the projection.
+- Fixed an access violation at almost every start, including the restart the game does at every level change: a
+  system thread started while the C runtime was still initializing ran a thread-local constructor that allocated
+  memory before the heap existed. Windows logged it quietly as an "Application Error" (ntdll.dll); in tests it once
+  crashed the game at startup.
+- Level changes: if the next level's process ends before its first frame, the game now shows an error message
+  instead of closing silently. If two instances would not fit into the graphics memory, the old one now closes
+  before the new one starts instead of overlapping. The log names the settings changed before a level change and
+  the GPU memory of both processes.
+
 ## 0.1.2 (2026-11-06)
 
 - Wider field of view (`fov` above 1) no longer cuts the light of lamps and other dynamic lights off in straight lines

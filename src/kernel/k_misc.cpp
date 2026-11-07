@@ -3,11 +3,13 @@
 #include <timeapi.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <thread>
 #include <utility>
 
+#include "app/settings.h"     // PC comfort features: language
 #include "hle/host_pad.h"  // controllers: motors off when the title quits
 #include "kernel/kernel.h"
 #include "runtime/guest_time.h"  // PC comfort features: focus pause
@@ -268,11 +270,45 @@ KERNEL_EXPORT(2, AvSendTVEncoderOption) {
     return 0;
 }
 
+// ---- PC comfort features: language ----
+// The dashboard's language (XC_LANGUAGE), which the game reads at boot for its text and voice: `language` in
+// FarCryInstincts.ini. The NTSC disc has English, French, Italian and Spanish text and voices (sounds_xb\<language>);
+// German is one of the game's languages but that disc has no German text, the game shows English then. auto = the
+// Windows display language where the game has one, else English.
+uint32_t Language() {
+    static const uint32_t value = [] {
+        std::string name = settings::String("language", "english");
+        for (char& ch : name) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        static const std::pair<const char*, uint32_t> kNames[] = {
+            {"english", 1}, {"german", 3}, {"french", 4}, {"spanish", 5}, {"italian", 6}};
+        uint32_t v = 0;
+        if (name == "auto") {
+            switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+            case LANG_GERMAN: v = 3; break;
+            case LANG_FRENCH: v = 4; break;
+            case LANG_SPANISH: v = 5; break;
+            case LANG_ITALIAN: v = 6; break;
+            default: v = 1; break;
+            }
+        }
+        for (const auto& [n, id] : kNames)
+            if (name == n) v = id;
+        if (!v) {
+            rt::Log("settings: language '%s' unknown, English", name.c_str());
+            v = 1;
+        }
+        rt::Log("kernel: language %u (%s)", v, name.c_str());
+        return v;
+    }();
+    return value;
+}
+// ---- end PC comfort features: language ----
+
 // ValueIndex, Type*, Value, ValueLength, ResultLength*
 KERNEL_EXPORT(24, ExQueryNonVolatileSetting) {
     uint32_t value = 0;
     switch (a[0]) {
-    case 0x07: value = 1; break;           // XC_LANGUAGE: English
+    case 0x07: value = Language(); break;  // XC_LANGUAGE (the game's text and voice language)
     case 0x08: value = 0x00400000; break;  // XC_VIDEO_FLAGS: 60 Hz allowed
     case 0x09: value = 0; break;           // XC_AUDIO_FLAGS: stereo
     case 0x103: value = 0x00400100; break; // XC_FACTORY_AV_REGION: NTSC-M

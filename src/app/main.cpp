@@ -146,6 +146,13 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info) {
 int main() {
     rt::InitLog();
     SetUnhandledExceptionFilter(OnCrash);
+    // FCI_TEST_RELAUNCH_FAIL=1: a relaunched process ends at once (test of the level change's error message)
+    if (GetEnvironmentVariableA("FCI_TEST_RELAUNCH_FAIL", nullptr, 0) &&
+        GetEnvironmentVariableA("FCI_RELAUNCHED", nullptr, 0)) {
+        rt::Log("FCI_TEST_RELAUNCH_FAIL: the relaunched process ends");
+        rt::FlushLog();
+        return 3;
+    }
 
     fs::path exe_dir = ExeDir();
     Game game;

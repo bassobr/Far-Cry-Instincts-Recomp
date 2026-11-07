@@ -216,6 +216,7 @@ add_executable(FarCryInstincts
     src/hle/pc_input.cpp
     src/hle/skip_intro.cpp
     src/hle/start_level.cpp
+    src/hle/mouse_look.cpp
     src/app/focus_pause.cpp
     src/runtime/guest_time.cpp
     # texture dump/replacement and fps counter (parts adapted from SCDA-XBERecomp, MIT)

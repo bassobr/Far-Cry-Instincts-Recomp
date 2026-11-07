@@ -23,9 +23,12 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <string>
 #include <vector>
 
+#include "app/settings.h"
+#include "gpu/present.h"  // GPU memory at the handover
 #include "kernel/kernel.h"
 #include "video/display.h"
 #include "runtime/memory.h"
@@ -132,6 +135,9 @@ bool Relaunch(uint32_t routine) {
             ReadCString(page + kDataOffset + (R32(page) == kTypeTitle ? 8 : 0)).c_str());
     if (!self) return false;
     if (GetEnvironmentVariableA("FCI_NO_RELAUNCH", nullptr, 0) > 0) return false;
+    // what the settings menu changed in this process: the new one starts with it (its own log follows)
+    const std::string changed = settings::ChangedSinceStart();
+    rt::Log("kernel: settings changed since the start: %s", changed.empty() ? "none" : changed.c_str());
 
     // trailing zeros of the page need not travel
     const uint8_t* bytes = rt::Host(page);
@@ -152,18 +158,42 @@ bool Relaunch(uint32_t routine) {
     // Handover (as in SCDA-XBERecomp, MIT): this window stays on screen with its last picture until the new instance
     // has presented its first frames (it opens its window hidden and shows it then, video/display.cpp), so no gap
     // and no desktop show in between. Not with exclusive fullscreen: two swap chains cannot hold the output.
-    HANDLE ready = display::WantExclusive() ? nullptr
-                                            : CreateEventW(nullptr, TRUE, FALSE, HandoverEvent(pi.dwProcessId).c_str());
+    // Not either when both instances would not fit the GPU memory Windows gives a process: the new one makes its
+    // render targets (most of its memory: 2.2 of 2.5 GB at scale 6x, msaa 8, shadows 8x) before its first frame,
+    // so during the handover both hold about this one's usage. Without it this process ends at once and its
+    // memory is free before the new one has a device; the desktop shows for a moment.
+    int budget = 0;
+    const int used = gpu::present::VideoMemoryUsage(&budget);
+    if (std::string test = Env("FCI_TEST_GPU_BUDGET"); !test.empty()) budget = std::atoi(test.c_str());  // test: a small GPU
+    const bool fits = used < 0 || budget <= 0 || 2 * used <= budget * 9 / 10;
+    HANDLE ready = display::WantExclusive() || !fits
+                       ? nullptr
+                       : CreateEventW(nullptr, TRUE, FALSE, HandoverEvent(pi.dwProcessId).c_str());
     AllowSetForegroundWindow(pi.dwProcessId);
     ResumeThread(pi.hThread);
-    rt::Log("kernel: relaunched the title as process %lu%s", pi.dwProcessId,
-            ready ? ", keeping this window until its first frames" : "");
+    rt::Log("kernel: relaunched the title as process %lu%s (GPU memory of this process %d MB, budget %d MB)",
+            pi.dwProcessId,
+            ready ? ", keeping this window until its first frames"
+                  : fits ? "" : ", no handover: two instances would not fit the GPU memory",
+            used, budget);
     if (ready) {
         HANDLE wait[] = {ready, pi.hProcess};
         DWORD r = WaitForMultipleObjects(2, wait, FALSE, 15000);
         rt::Log("kernel: handover %s", r == WAIT_OBJECT_0 ? "done" : r == WAIT_OBJECT_0 + 1 ? "failed (new instance ended)"
                                                                                            : "timed out");
         CloseHandle(ready);
+        if (r == WAIT_OBJECT_0 + 1) {  // the next level's process ended before its first frames: say so, not just quit
+            DWORD code = 0;
+            GetExitCodeProcess(pi.hProcess, &code);
+            rt::Log("kernel: the relaunched process %lu ended with %08lX before its first frames", pi.dwProcessId, code);
+            rt::FlushLog();
+            wchar_t text[400];
+            swprintf(text, 400,
+                     L"The next level could not be started: the new game process ended with code %08lX.\n\n"
+                     L"fci.log beside FarCryInstincts.exe says more (the log goes on after \"---- relaunch ----\").",
+                     code);
+            MessageBoxW(nullptr, text, L"Far Cry Instincts", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+        }
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);

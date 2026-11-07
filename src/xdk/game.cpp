@@ -16,6 +16,7 @@
 
 #include "app/pcmode.h"
 #include "gpu/ao.h"
+#include "hle/mouse_look.h"  // direct mouse look
 #include "xdk/hle.h"
 
 namespace {
@@ -53,6 +54,10 @@ HLE_STDCALL(Game_CameraUpdate, 0) {
     // the screen's cameras (4:3, the split screen's views); not square render to texture views or ortho ones
     const bool screen = R32(cam + kCamOrtho) == 0 && aspect > 1.2f && aspect < 3.6f && fov > 0.05f && fov < 3.0f;
     const bool patch = (widen != 1.0f || fov_scale != 1.0f) && screen;
+    // ---- direct mouse look (hle/mouse_look.cpp): the client's view (built by 0x000F0500) shows this frame's
+    // mouse turn already; the game's own fov (before the widening) gives the zoom ----
+    if (R32(c.esp) == 0x000F0C55u) hle::PredictView(cam, fov);
+    // ---- end direct mouse look ----
     if (screen && trace_view) {  // FCI_TRACE_VIEW=1: where the screen's camera is, every 5 s (compare runs)
         static ULONGLONG last = 0;
         if (GetTickCount64() - last >= 5000) {
@@ -70,22 +75,56 @@ HLE_STDCALL(Game_CameraUpdate, 0) {
                     aspect, xdk::GF(cam + 0x30), xdk::GF(cam + 0x34), R32(cam + kCamOrtho), patch ? " (widened)" : "");
         }
     }
+    // ---- fov beyond the engine's limit ----
+    // The vertical field of view (fov / aspect) stays, times fov_scale; the horizontal one grows with the screen.
+    // The engine's angle (vertical x aspect) gives the frustum's sides at tan(fov / 2), so it has to stay below pi:
+    // in play (game fov pi / 2) that held fov only up to ~1.45x at 16:9 and ~1.08x at 21:9, and on 32:9 below 1.
+    // Beyond it the engine gets a culling angle that stays valid and at least as wide as the view (the true
+    // horizontal angle, not less than the limit) with the aspect that keeps the vertical angle exact, and after
+    // the update the projection's x scale is set to the real aspect (column 0 of the projection matrices; the
+    // planes come from the angles, not from these). proj_fovy / proj_aspect: the picture's projection, for AO.
+    float proj_fovy = fov / aspect, proj_aspect = aspect, x_fix = 1.0f;
     if (patch) {
-        // the vertical field of view (fov / aspect) stays, times fov_scale; the horizontal one grows with the screen
-        float wide_fov = std::min(fov * widen * fov_scale, 3.05f);
-        SetF(cam + kCamFov, wide_fov);
-        SetF(cam + kCamAspect, aspect * widen);
+        constexpr float kEngineLimit = 3.05f;
+        const float want = fov * widen * fov_scale, wide_aspect = aspect * widen;
+        proj_aspect = wide_aspect;
+        if (want <= kEngineLimit) {
+            proj_fovy = want / wide_aspect;
+            SetF(cam + kCamFov, want);
+            SetF(cam + kCamAspect, wide_aspect);
+        } else {
+            proj_fovy = std::min(fov / aspect * fov_scale, 2.8f);  // 160 degrees vertically at most
+            const float horizontal = 2.0f * std::atan(wide_aspect * std::tan(proj_fovy * 0.5f));
+            const float cull = std::clamp(horizontal, kEngineLimit, 3.1f);
+            SetF(cam + kCamFov, cull);
+            SetF(cam + kCamAspect, cull / proj_fovy);
+            x_fix = cull / proj_fovy / wide_aspect;
+            static float logged = 0;  // once per requested value: a tester's log shows it
+            if (logged != fov * fov_scale) {
+                logged = fov * fov_scale;
+                rt::Log("game: fov x%.2f at aspect %.3f beyond the engine's angle (game fov %.4f): projection %.1f x "
+                        "%.1f degrees, culling %.1f degrees wide", fov_scale, wide_aspect, fov,
+                        horizontal * 57.29578f, proj_fovy * 57.29578f, cull * 57.29578f);
+            }
+        }
     }
+    // ---- end fov beyond the engine's limit ----
     // ---- ambient occlusion (gpu/ao.h): the screen camera's projection, PerspectiveFovRH(fov / aspect, aspect) ----
     if (screen) {
-        const float f = xdk::GF(cam + kCamFov), a = xdk::GF(cam + kCamAspect);
-        const float y_scale = 1.0f / std::tan(f / a * 0.5f);
+        const float f = proj_fovy, a = proj_aspect;
+        const float y_scale = 1.0f / std::tan(f * 0.5f);
         // (performance: in push buffer order, the render thread may still draw the frame before)
         const float x_scale = y_scale / a, far_plane = xdk::GF(cam + 0x34);
         xdk::RenderPost([=] { gpu::ao::SetProjection(x_scale, y_scale, far_plane); });
     }
     // ---- end ambient occlusion ----
     uint32_t r = xdk::CallOriginal(c, GUEST_ORIG(Game_CameraUpdate));
+    // ---- fov beyond the engine's limit: projection +0x234, with depth scale +0x274, view x projection +0x2B4/+0x2F4
+    // (row vectors: x_clip = column 0; the depth scale matrix of +0x274 is diagonal, so the same factor holds) ----
+    if (x_fix != 1.0f)
+        for (uint32_t m : {0x234u, 0x274u, 0x2B4u, 0x2F4u})
+            for (uint32_t row = 0; row < 4; row++) SetF(cam + m + row * 16, xdk::GF(cam + m + row * 16) * x_fix);
+    // ---- end fov beyond the engine's limit ----
     if (patch) {
         Widened w{cam, fov, aspect, xdk::GF(cam + kCamFov), xdk::GF(cam + kCamAspect)};
         if (known != g_widened.end()) *known = w;

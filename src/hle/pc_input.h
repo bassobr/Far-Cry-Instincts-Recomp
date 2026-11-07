@@ -1,6 +1,6 @@
 // Keyboard and mouse on player 1's pad: bindings from FarCryInstincts.ini (bind_<button> = <keys>), mouse look
-// with sensitivity and inversion, and the test scripts that inject host input (FCI_KEY_SCRIPT). Used by
-// hle/xinput.cpp, which owns the pads.
+// (direct onto the view angles, or through the right stick) with its settings, and the test scripts that inject
+// host input (FCI_KEY_SCRIPT). Used by hle/xinput.cpp, which owns the pads, and hle/mouse_look.cpp.
 #pragma once
 
 #include <cstdint>
@@ -31,6 +31,15 @@ void ApplyKeyboardMouse(Pad& p, bool focused);
 
 // FCI_TRACE_PAD=1: player 1's pad state whenever it changes, with the script time; polls per second
 void TracePad(const Pad& p);
+
+// ---- direct mouse look (hle/mouse_look.cpp, mouse_mode = direct) ----
+// Called once a frame by player 1's look input: the degrees the mouse turns the view this frame (yaw > 0 right,
+// pitch > 0 up), after sensitivity, inversion, acceleration, smoothing and the zoom scale for the view's field of
+// view (radians, the game's own; 0 if unknown). False with mouse_mode = stick. While it runs, the poll leaves the
+// mouse off the right stick.
+bool TakeLookDegrees(double fov, double* yaw, double* pitch);
+bool DirectLook();
+// ---- end direct mouse look ----
 
 // ---- settings menu (app/menu.cpp; called while the guest is held, so no poll runs meanwhile) ----
 int BindingCount();

@@ -95,12 +95,20 @@ namespace {
 struct LandingPad {
     alignas(16) jmp_buf host;
 };
-thread_local std::unordered_map<uint64_t, std::unique_ptr<LandingPad>> t_landings;
+// Built on a thread's first use, not at namespace scope: there its constructor (which allocates) ran from the
+// executable's TLS callback for every new thread, also for the system's thread pool workers that start while the
+// main thread is still initializing the C runtime, before its heap exists. Access violation in RtlAllocateHeap
+// (heap handle 0) on almost every start: the loader swallowed it, Windows logged an "Application Error".
+using Landings = std::unordered_map<uint64_t, std::unique_ptr<LandingPad>>;
+Landings& ThreadLandings() {
+    thread_local Landings landings;
+    return landings;
+}
 uint64_t LandingKey(uint32_t pc, uint32_t esp) { return (uint64_t(pc) << 32) | esp; }
 }  // namespace
 
 jmp_buf* Landing(Cpu& FCI_NOESCAPE c, uint32_t pc) {
-    auto& pad = t_landings[LandingKey(pc, c.esp)];
+    auto& pad = ThreadLandings()[LandingKey(pc, c.esp)];
     if (!pad) pad = std::make_unique<LandingPad>();
     return &pad->host;
 }
@@ -109,7 +117,8 @@ void Call(Cpu& FCI_NOESCAPE c, uint32_t target) {
     if (GuestFunction f = Lookup(target)) return f(c);
     if (target >= kKernelThunkBase && target < kKernelThunkBase + 0x1000) return KernelCall(c, (target - kKernelThunkBase) / 4);
     // the guest's longjmp: back into the frame of its setjmp, whose host frame is still live below us
-    if (auto it = t_landings.find(LandingKey(target, c.esp)); it != t_landings.end()) {
+    Landings& landings = ThreadLandings();
+    if (auto it = landings.find(LandingKey(target, c.esp)); it != landings.end()) {
         static std::atomic<uint32_t> landed{0};
         if (uint32_t n = ++landed; n <= 20 || n % 1000 == 0)
             Log("longjmp %u to %08X (esp %08X, eax %08X)", n, target, c.esp, c.eax);
