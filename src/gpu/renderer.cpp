@@ -2995,15 +2995,38 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         g_ds.raster = r;
     }
     D3D11_RECT scissor = surf.clip;
-    // ---- PC features: fov ----
+    // ---- PC features: widescreen and fov ----
     // FCI draws the light of each dynamic light as an additive pass over the objects it reaches, cut to a scissor
-    // rectangle (a surface clip smaller than the target) that the engine works out from the light's sphere. That
-    // rectangle does not follow fov != 1 (pcmode::FovScale; Hor+ alone it does): it no longer matches the picture,
-    // and the light ends in straight lines at the sides (cabins, rooms). There the 3D draws (W-buffered, vertex
-    // program) on the frame buffer keep only their view's rectangle (viewport constants c58/c59: scale, offset;
-    // a split screen's view stays inside its half); the light's own falloff ends it as before. fov = 1: unchanged.
+    // rectangle (a surface clip smaller than the target, renderer light list +0x54..+0x60 -> 0x002425F0 ->
+    // D3DDevice_SetScissors) that the engine works out from the light's sphere. The rectangle follows the projection
+    // (16:9 -> 21:9 scales it as the picture) but is too narrow towards the sides: lit surfaces beyond it end in
+    // straight vertical lines. On the console that error lies outside the 4:3 picture; Hor+ (pcmode::Widen) and
+    // fov (pcmode::FovScale) show the sides at angles where it is plain (GitHub #8: grates and light in the
+    // tutorial's wreck at 16:9, fov 1). Wherever the picture is not the console's, the 3D draws (W-buffered, vertex
+    // program) on the frame buffer keep their view's rectangle instead (viewport constants c58/c59: scale, offset;
+    // a split screen's view stays inside its half); the light's own falloff ends it. 4:3 with fov 1: unchanged.
+    // Diagnostics: FCI_ENGINE_LIGHT_SCISSOR=1 keeps the engine's rectangles, =2 alternates every 0.5 s (A/B in
+    // frame dumps); FCI_TRACE_LIGHT_SCISSOR=1 logs the first 3000 such draws with their rectangle.
+    static const int engine_scissor = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("FCI_ENGINE_LIGHT_SCISSOR", v, sizeof v) ? std::atoi(v) : 0;
+    }();
+    static const bool trace_scissor = GetEnvironmentVariableA("FCI_TRACE_LIGHT_SCISSOR", nullptr, 0) > 0;
+    if (trace_scissor && w_buffer && surf.width >= 640 && s.constants[59][0] > 2.0f) {
+        static int logged = 0;
+        const uint32_t ch = s.Reg(SET_SURFACE_CLIP_HORIZONTAL), cv = s.Reg(SET_SURFACE_CLIP_VERTICAL);
+        if (logged < 3000 && ((ch >> 16) < 640 || (cv >> 16) < 480)) {
+            logged++;
+            rt::Log("render: light scissor, draw %llu x %u..%u y %u..%u ps %016llX blend %u %X/%X c58 %g %g c59 %g %g",
+                    (unsigned long long)g_draws, ch & 0xFFFF, (ch & 0xFFFF) + (ch >> 16), cv & 0xFFFF,
+                    (cv & 0xFFFF) + (cv >> 16), (unsigned long long)psh::Key(s, config), s.Reg(SET_BLEND_ENABLE),
+                    s.Reg(SET_BLEND_FUNC_SFACTOR), s.Reg(SET_BLEND_FUNC_DFACTOR), s.constants[58][0],
+                    s.constants[58][1], s.constants[59][0], s.constants[59][1]);
+        }
+    }
+    const bool keep_engine = engine_scissor == 1 || (engine_scissor == 2 && ((GetTickCount64() / 500) & 1));
     if (w_buffer && surf.color && surf.width >= 640 && (s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3) == 2 &&
-        pcmode::FovScale() != 1.0f) {
+        (pcmode::Widen() != 1.0f || pcmode::FovScale() != 1.0f) && !keep_engine) {
         const float* scale = s.constants[58];
         const float* offset = s.constants[59];
         const float hw = std::fabs(scale[0]), hh = std::fabs(scale[1]);
@@ -3021,7 +3044,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             if (scissor.left >= scissor.right || scissor.top >= scissor.bottom) scissor = surf.clip;
         }
     }
-    // ---- end PC features: fov ----
+    // ---- end PC features: widescreen and fov ----
     if (narrowed) {
         // PC features: a narrowed 2D draw stays inside the 4:3 middle, as it stayed inside the console's screen
         // (HUD parts the game slides off screen must not show up beside it)

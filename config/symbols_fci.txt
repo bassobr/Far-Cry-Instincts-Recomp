@@ -37,3 +37,6 @@ fun Game_PushCommand = 0x00012000  # (edx = command text, game; ret 4): queues a
 # ---- mouse look (src/hle/mouse_look.cpp) ----
 fun Game_LookInput = 0x0003D450  # stdcall (aim controller, processing command, TURNLR, TURNUD): the look input of a client; writes the frame's yaw/pitch change in degrees to the command +0xBC/+0xC0
 # ---- end mouse look ----
+# ---- map editor (src/hle/map_editor.cpp) ----
+fun Game_LaunchMapEditor = 0x0014F880  # main menu "Map Editor" (B_MapEditor, called from 0x0014F155): state block, shuts the game down, XLaunchNewImage("D:\ige.xbe")
+# ---- end map editor ----

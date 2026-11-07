@@ -107,3 +107,6 @@ Game_PushCommand
 # ---- mouse look (src/hle/mouse_look.cpp) ----
 Game_LookInput
 # ---- end mouse look ----
+# ---- map editor (src/hle/map_editor.cpp) ----
+Game_LaunchMapEditor
+# ---- end map editor ----

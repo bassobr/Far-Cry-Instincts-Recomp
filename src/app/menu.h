@@ -14,6 +14,10 @@ bool MenuOpen();
 void ToggleMenu();
 // Back + Start on a pad (hle/xinput.cpp, from the guest's poll): opens it
 void RequestMenu();
+// a message in the menu's panel instead of the settings (OK, A, B, Enter or Escape closes it); the game is held
+// while it shows, as with the menu. From any thread. False when the menu cannot be shown (no HLE graphics or no
+// picture yet): the caller says it another way
+bool ShowNotice(const char* title, const char* text);
 
 // display.cpp's window procedure asks first: true when the message was the menu's (result in *result)
 bool MenuWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result);

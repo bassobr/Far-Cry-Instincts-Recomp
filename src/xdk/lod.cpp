@@ -27,7 +27,9 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -107,6 +109,60 @@ void TraceMemory() {
     });
 }
 
+// FCI_TRACE_ENTITY=<x>,<y>,<z> (diagnostics): finds the entity placed there (CEntity: vtable 0x005F6AA0, position
+// at +0x34C) and logs every change of its first 0x440 bytes, polled every 20 ms. For entities that vanish (GitHub #6).
+void TraceEntity() {
+    char text[128] = {};
+    if (!GetEnvironmentVariableA("FCI_TRACE_ENTITY", text, sizeof text)) return;
+    float want[3] = {};
+    if (std::sscanf(text, "%f,%f,%f", &want[0], &want[1], &want[2]) != 3) return;
+    static std::once_flag once;
+    std::call_once(once, [want] {
+        std::thread([want] {
+            constexpr uint32_t kVtable = 0x005F6AA0, kPos = 0x34C, kSize = 0x440;
+            uint32_t entity = 0;
+            while (!entity) {
+                Sleep(1000);
+                for (uint64_t a = mem::kVirtualBegin; a < mem::kVirtualEnd && !entity;) {
+                    MEMORY_BASIC_INFORMATION info;
+                    if (!VirtualQuery(rt::Host(uint32_t(a)), &info, sizeof info)) break;
+                    const uint64_t end = std::min<uint64_t>(
+                        uint64_t(static_cast<uint8_t*>(info.BaseAddress) - rt::Host(0)) + info.RegionSize, mem::kVirtualEnd);
+                    if (info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE)
+                        for (uint64_t p = a; p + kSize <= end; p += 4) {
+                            uint32_t vtable;
+                            std::memcpy(&vtable, rt::Host(uint32_t(p)), 4);
+                            if (vtable != kVtable) continue;
+                            const uint32_t q = uint32_t(p) + kPos;
+                            if (std::fabs(xdk::GF(q) - want[0]) < 0.01f && std::fabs(xdk::GF(q + 4) - want[1]) < 0.01f &&
+                                std::fabs(xdk::GF(q + 8) - want[2]) < 0.01f) {
+                                entity = uint32_t(p);
+                                break;
+                            }
+                        }
+                    a = end;
+                }
+            }
+            rt::Log("lod: FCI_TRACE_ENTITY %g,%g,%g is the entity at %08X", want[0], want[1], want[2], entity);
+            uint32_t last[kSize / 4];
+            std::memcpy(last, rt::Host(entity), kSize);
+            for (;;) {
+                Sleep(20);
+                uint32_t now[kSize / 4];
+                std::memcpy(now, rt::Host(entity), kSize);
+                for (uint32_t i = 0; i < kSize / 4; i++) {
+                    if (now[i] == last[i] || i == 0x110 / 4) continue;  // (+0x110: the time of its last update)
+                    float fo, fn;
+                    std::memcpy(&fo, &last[i], 4);
+                    std::memcpy(&fn, &now[i], 4);
+                    rt::Log("lod: entity +%03X %08X -> %08X (%g -> %g)", i * 4, last[i], now[i], fo, fn);
+                }
+                std::memcpy(last, now, kSize);
+            }
+        }).detach();
+    });
+}
+
 }  // namespace
 
 namespace xdk {
@@ -124,6 +180,18 @@ HLE_STDCALL(Game_EngineCVars, 0) {
     g_cvars = cvars;
     for (Field& f : g_fields) f.console = f.written = xdk::GF(cvars + f.offset);
     Apply(pcmode::LodDistance(), pcmode::ViewDistance(), "engine start");
+    // FCI_TEST_CVAR=<hex offset>=<float>[,...] (diagnostics): overwrite fields of the block after the registration
+    char test[256] = {};
+    if (GetEnvironmentVariableA("FCI_TEST_CVAR", test, sizeof test))
+        for (char* item = std::strtok(test, ","); item; item = std::strtok(nullptr, ",")) {
+            char* end = nullptr;
+            const uint32_t off = uint32_t(std::strtoul(item, &end, 16));
+            if (*end != '=' || off >= 0x108) continue;
+            const float before = xdk::GF(cvars + off), value = float(std::atof(end + 1));
+            SetF(cvars + off, value);
+            rt::Log("lod: FCI_TEST_CVAR +0x%X %g -> %g", off, before, value);
+        }
     TraceMemory();
+    TraceEntity();
     return r;
 }

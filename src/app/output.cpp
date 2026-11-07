@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <string>
 #include <vector>
@@ -65,6 +66,42 @@ std::vector<Monitor> Monitors() {
     return out;
 }
 
+// ---- relaunch: FCI_WINDOW_STATE = "1|<windowed|borderless|exclusive>|<device>|x|y|w|h|maximized|placement|flags|
+// showCmd|left|top|right|bottom", only in a relaunched process ----
+const char* const kShown[] = {"windowed", "borderless", "exclusive"};
+
+Carried DecodeCarried() {
+    Carried c;
+    if (GetEnvironmentVariableA("FCI_RELAUNCHED", nullptr, 0) == 0) return c;
+    char text[512] = {};
+    DWORD n = GetEnvironmentVariableA("FCI_WINDOW_STATE", text, sizeof text);
+    if (!n || n >= sizeof text) return c;
+    std::vector<std::string> f;
+    for (char *p = text, *bar; p; p = bar ? bar + 1 : nullptr) {
+        bar = std::strchr(p, '|');
+        if (bar) *bar = 0;
+        f.push_back(p);
+    }
+    if (f.size() != 15 || f[0] != "1") {
+        rt::Log("output: FCI_WINDOW_STATE '%s' not understood, the settings decide", text);
+        return c;
+    }
+    int shown = -1;
+    for (int i = 0; i < 3; i++)
+        if (f[1] == kShown[i]) shown = i;
+    if (shown < 0) return c;
+    auto num = [&](size_t i) { return std::atoi(f[i].c_str()); };
+    c.shown = Shown(shown);
+    for (char ch : f[2]) c.device += wchar_t(static_cast<unsigned char>(ch));
+    c.x = num(3), c.y = num(4), c.w = num(5), c.h = num(6);
+    c.maximized = num(7) != 0, c.placement = num(8) != 0;
+    c.flags = unsigned(num(9)), c.show = unsigned(num(10));
+    c.left = num(11), c.top = num(12), c.right = num(13), c.bottom = num(14);
+    c.valid = c.w > 0 && c.h > 0;
+    return c;
+}
+// ---- end relaunch ----
+
 Options Load() {
     // exclusive fullscreen and the resolution are in pixels: per-monitor DPI aware before any window exists (a
     // DPI unaware process sees a scaled desktop, 2752x1152 for 3440x1440 at 125 %)
@@ -96,6 +133,33 @@ Options Load() {
         if (found < 0) rt::Log("output: monitor '%s' not found, the primary", want.c_str());
         else chosen = found, o.monitor_set = true;
     }
+    // ---- relaunch: the monitor the previous process's window was on (by its device name, else where its rectangle
+    // lies now), not the one of the settings: the window may have been dragged there ----
+    o.carried = DecodeCarried();
+    if (o.carried.valid) {
+        RECT r{o.carried.x, o.carried.y, o.carried.x + o.carried.w, o.carried.y + o.carried.h};
+        if (!MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) {  // its monitor is gone: as the settings say
+            rt::Log("output: relaunch: the previous window (%d,%d %dx%d) is on no monitor now, the settings decide",
+                    o.carried.x, o.carried.y, o.carried.w, o.carried.h);
+            o.carried.valid = false;
+        }
+    }
+    if (o.carried.valid) {
+        int found = -1;
+        for (size_t i = 0; i < list.size(); i++)
+            if (!_wcsicmp(list[i].info.szDevice, o.carried.device.c_str())) found = int(i);
+        if (found < 0) {
+            RECT r{o.carried.x, o.carried.y, o.carried.x + o.carried.w, o.carried.y + o.carried.h};
+            HMONITOR near_rect = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+            for (size_t i = 0; i < list.size(); i++)
+                if (list[i].handle == near_rect) found = int(i);
+        }
+        if (found >= 0) chosen = found, o.monitor_set = true;
+        rt::Log("output: relaunch: window %s at %d,%d %dx%d%s on %s (from the previous process)",
+                kShown[int(o.carried.shown)], o.carried.x, o.carried.y, o.carried.w, o.carried.h,
+                o.carried.maximized ? ", maximized" : "", Narrow(o.carried.device.c_str()).c_str());
+    }
+    // ---- end relaunch ----
     for (size_t i = 0; i < list.size(); i++) {
         const Monitor& m = list[i];
         const RECT& r = m.info.rcMonitor;
@@ -170,6 +234,14 @@ Options Load() {
 const Options& Get() {
     static const Options options = Load();
     return options;
+}
+
+std::string EncodeCarried(const Carried& c) {
+    char text[512];
+    snprintf(text, sizeof text, "1|%s|%s|%d|%d|%d|%d|%d|%d|%u|%u|%d|%d|%d|%d", kShown[int(c.shown)],
+             Narrow(c.device.c_str()).c_str(), c.x, c.y, c.w, c.h, int(c.maximized), int(c.placement), c.flags, c.show,
+             c.left, c.top, c.right, c.bottom);
+    return text;
 }
 
 float AutoAspect() {

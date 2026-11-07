@@ -524,6 +524,24 @@ bool TakeLookDegrees(double fov, double* yaw, double* pitch) {
     if (!m.direct) return false;
     int dx = 0, dy = 0;
     if (g_direct.focused) display::TakeMouseMotion(&dx, &dy);
+    // FCI_TEST_MOUSE_UNEVEN=<f> (tests, 0-1): the scripted counts reach the look input unevenly, like a real mouse
+    // read out of step with the frames: every other look input takes (1 - f) of its counts, the next one the rest
+    // on top of its own (an even motion of c a frame becomes c (1 - f), c (1 + f), ...; the sum stays exact)
+    static const double uneven = [] {
+        char v[32] = {};
+        return GetEnvironmentVariableA("FCI_TEST_MOUSE_UNEVEN", v, sizeof v) ? std::clamp(std::atof(v), 0.0, 1.0) : 0.0;
+    }();
+    if (uneven > 0) {
+        static bool hold = false;
+        static double held_x = 0, held_y = 0;
+        double sx = g_direct.script_x + held_x, sy = g_direct.script_y + held_y;
+        held_x = held_y = 0;
+        if (g_direct.script_x || g_direct.script_y) {
+            hold = !hold;
+            if (hold) held_x = g_direct.script_x * uneven, held_y = g_direct.script_y * uneven, sx -= held_x, sy -= held_y;
+        }
+        g_direct.script_x = sx, g_direct.script_y = sy;
+    }
     double mx = dx + g_direct.script_x, my = dy + g_direct.script_y;
     g_direct.script_x = g_direct.script_y = 0;
     const double gain = AccelerationGain(m, std::sqrt(mx * mx + my * my), dt);

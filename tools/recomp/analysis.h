@@ -4,6 +4,7 @@
 #include <Zydis/Zydis.h>
 
 #include <cstdint>
+#include <iosfwd>
 #include <map>
 #include <set>
 #include <string>
@@ -52,13 +53,22 @@ public:
     std::set<uint32_t> bad_decodes;
     std::set<uint32_t> kernel_calls;  // call sites through the kernel thunk
     size_t dropped = 0;  // functions discarded as data decoded as code
+    std::map<uint32_t, uint32_t> packed_pointers;  // code pointers found in packed structures: where -> target
 
 private:
+    // what a code address points at
+    enum class Target { kFunction, kInsn, kMidInsn, kUnreached, kGarbage, kNoCode };
+    Target Classify(uint32_t va) const;
+    // the first instructions decode as plausible code (no zero fill, no int3, nothing implausible)
+    bool DecodesAsCode(uint32_t va) const;
+    void WritePointerAudit(std::ofstream& out) const;
     bool LooksLikeFunctionStart(uint32_t va) const;
     void Queue(uint32_t va, bool from_pointer);
     void Explore(Function& fn);
     void ScanDataPointers();
     size_t ScanUnreachedPointers();
+    // code pointers in byte-packed structures the code takes the address of: where -> code address
+    std::map<uint32_t, uint32_t> PackedStructPointers() const;
     bool InsideInstruction(uint32_t va) const;
     void Drain();
     void DropDataAsCode();

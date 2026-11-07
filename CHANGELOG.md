@@ -2,6 +2,24 @@
 
 ## 0.1.4 (unreleased)
 
+- Crash on a sniper shot fixed (#7): the smoke trail of the Barrett (AI snipers) and the SL8 fades out with the
+  game's `tanh`, whose handlers sit behind byte-packed tables that the recompiler did not follow. It now follows code
+  pointers in such tables (11 more functions; nothing else in the generated code changes). The game code is rebuilt
+  once on the first start after updating.
+- Hands and weapon no longer jitter while turning with the mouse (#5): they are drawn with the view they were placed
+  for, while the world still turns in the same frame (no added latency).
+- Light no longer ends in straight lines at the sides of a widescreen picture (#8), also at the default field of
+  view: the engine's per-light screen rectangle is too narrow towards the sides, which the 4:3 console picture never
+  showed. Light passes now cover the whole view whenever the picture differs from the console's.
+- Level changes keep the window (#10): mode (F11/Alt+Enter), monitor, position, size and maximized state carry over
+  to the next level's process, also on "Restart level" and "Quit to main menu". Settings changed in the F10 menu
+  still win, and nothing is written to the ini file.
+- After "Quit to main menu" the game no longer seems frozen (#11): it plays a two-minute trailer while it loads,
+  which the game itself does not let you skip. Any button or key now ends it, and `skip_intro` skips it.
+- Choosing the Map Editor no longer closes the game (#12): it is a separate program on the disc (`ige.xbe`) that the
+  recomp does not include; a notice says so and the game stays in the main menu.
+- Menu background videos play at their own frame rate at any game frame rate (#13). Before, the title screen video
+  ran 2× too fast at 60 fps, 4× at 120 fps and far faster unlimited. The full-screen videos were already right.
 - Mouse look in vehicles: a fast flick no longer makes the view jump to the opposite edge of a vehicle's look range
   (the game wraps the angle before limiting it; on a boat a 30° flick in one frame was enough). The mouse turns at
   most 25° sideways per frame and the rest follows in the next frames, which on foot only matters above 3000°/s at

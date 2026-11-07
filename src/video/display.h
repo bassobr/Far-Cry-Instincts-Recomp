@@ -1,6 +1,8 @@
 // The window and what the TV would show: the scanned out frame buffer with the video overlay on top.
 #pragma once
 
+#include <string>
+
 namespace display {
 
 void Init();
@@ -24,6 +26,10 @@ int DumpEvery();  // FCI_DUMP_FRAMES: every n-th frame as BMP, 0 for none
 // relaunch handover (kernel::Relaunch): a relaunched instance opens its window hidden; the presenter calls this once
 // the first frames are out, which shows the window and lets the previous instance end
 void FinishHandover();
+// relaunch: the window as it is now (mode, monitor, rectangle, maximized, windowed placement) for the next process
+// (FCI_WINDOW_STATE, app/output.h); empty when the settings menu changed display_mode, monitor or resolution (the
+// next process follows the settings then)
+std::string RelaunchWindowState();
 
 // ---- display output options (app/output.h): exclusive fullscreen, driven by gpu/present.cpp ----
 // display_mode = fullscreen: whether the window wants exclusive fullscreen now (F11/Alt+Enter toggle it, closing

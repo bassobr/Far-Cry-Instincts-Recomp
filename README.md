@@ -225,7 +225,7 @@ there.
 | `fmv_scale` | `fill` | Videos on widescreen: `fill` (as large as fits without cropping) or `4:3` |
 | `colour_blind` | `0` | `0` off, `1` protanopia, `2` deuteranopia, `3` tritanopia |
 | `fps_counter` | `0` | `1` = show frame rate and frame times |
-| `skip_intro` | `0` | `1` = skip the three logo videos at start (Ubisoft, Crytek, Far Cry Instincts); not the story's cutscenes |
+| `skip_intro` | `0` | `1` = skip the three logo videos at start (Ubisoft, Crytek, Far Cry Instincts) and the trailer after "Quit to main menu" (any button ends it otherwise); not the story's cutscenes |
 | `language` | `english` | Text and voice language: `english`, `french`, `italian`, `spanish`, `german`, `auto` (the Windows display language). The NTSC disc has English, French, Italian and Spanish; `german` shows English there. Takes effect after a restart |
 | `pause_on_focus_loss` | `0` | `1` = pause game, sound and rumble while the window is in the background |
 | `mouse_mode` | `direct` | `direct` = every mouse count turns the view by the same angle, at once, with no ramp, speed cap, smoothing or dead zone; `stick` = the old way through the right stick (the game's stick handling) |
@@ -328,6 +328,8 @@ code. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - Direct mouse look has been measured on foot, while zoomed, swimming, in feral vision, on the quad and in split
   screen; boats, the glider and mounted guns use the same input path but have not been tested yet.
   `mouse_mode = stick` brings back the old behaviour.
+- The Map Editor is a separate program on the disc (`ige.xbe`) that the recomp does not include; choosing it shows a
+  notice and the game stays in the main menu.
 - Online play (Xbox Live, system link) is not supported.
 
 ## Credits

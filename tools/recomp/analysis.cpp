@@ -356,7 +356,138 @@ size_t Analysis::ScanUnreachedPointers() {
         data_pointer_roots_.insert(v);
         added++;
     }
+
+    for (auto [at, v] : PackedStructPointers()) {
+        packed_pointers[at] = v;
+        if (functions.count(v)) continue;
+        Queue(v, true);
+        data_pointer_roots_.insert(v);
+        added++;
+    }
     return added;
+}
+
+// Code pointers in byte-packed structures, which the scans above miss because they read aligned words only.
+// MSVC's x87 math (sinh, cosh, tanh, exp: the CRT's _trandisp1/_trandisp2) keeps one table per function,
+// {name length, name, type, ..., handler[4]}, at an odd address; the function passes it in edx and the
+// dispatcher jumps through one of the handlers, chosen by the class of the argument (fxam), with `jmp [ebx]`.
+// A handler only runs when the game passes such an argument (tanh of a normal number: GitHub #7, level 3).
+// A structure is what the code takes the address of: an immediate that points into a data section at an
+// address that is not 4-aligned and is no string. Its words at the same alignment, up to the next such
+// address and at most kWindow bytes on, are code pointers when they hit an instruction or plausible code.
+std::map<uint32_t, uint32_t> Analysis::PackedStructPointers() const {
+    constexpr uint32_t kWindow = 64;
+    auto is_text = [](uint8_t b) { return (b >= 0x20 && b < 0x7F) || b == '\t' || b == '\r' || b == '\n'; };
+    std::set<uint32_t> bases;
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    for (const auto& [va, in] : insns) {
+        if (!Decode(va, &ins, ops)) continue;
+        for (uint8_t i = 0; i < ins.operand_count_visible; i++) {
+            if (ops[i].type != ZYDIS_OPERAND_TYPE_IMMEDIATE || ops[i].imm.is_relative) continue;
+            uint32_t v = uint32_t(ops[i].imm.value.u);
+            const auto* s = (v & 3) ? image_.SectionAt(v) : nullptr;
+            if (!s || IsCode(v) || s->name.rfind("$$", 0) == 0 || !image_.Mapped(v, 4)) continue;
+            if (is_text(image_.At(v)[0])) continue;  // a string (narrow or UTF-16), not a structure
+            bases.insert(v);
+        }
+    }
+    std::map<uint32_t, uint32_t> found;  // where -> code address
+    for (auto it = bases.begin(); it != bases.end(); ++it) {
+        auto next = std::next(it);
+        uint32_t end = std::min(*it + kWindow, next != bases.end() ? *next : UINT32_MAX);
+        std::vector<std::pair<uint32_t, uint32_t>> hits;
+        bool unreached = false;
+        for (uint32_t at = *it; at + 4 <= end && image_.Mapped(at, 4); at += 4) {
+            uint32_t v = image_.Read32(at);
+            Target t = Classify(v);
+            if (t == Target::kInsn || t == Target::kUnreached) hits.push_back({at, v});
+            unreached |= t == Target::kUnreached;
+        }
+        // Misaligned views of float or short arrays also read as addresses, and some of those land on an
+        // instruction inside a function; a function start there would turn jumps to it into tail calls.
+        // A structure counts only if one of its pointers leads to code nothing reached yet.
+        if (unreached)
+            for (auto [at, v] : hits) found[at] = v;
+    }
+    return found;
+}
+
+bool Analysis::DecodesAsCode(uint32_t va) const {
+    if (!IsCode(va) || image_.At(va)[0] == 0) return false;
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    for (int i = 0; i < 3; i++) {
+        if (!Decode(va, &ins, ops) || ins.mnemonic == ZYDIS_MNEMONIC_INT3 || IsImplausible(ins)) return false;
+        if (ins.meta.category == ZYDIS_CATEGORY_RET || ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) break;
+        va += ins.length;
+    }
+    return true;
+}
+
+Analysis::Target Analysis::Classify(uint32_t va) const {
+    if (!IsCode(va)) return Target::kNoCode;
+    if (functions.count(va)) return Target::kFunction;
+    if (insns.count(va)) return Target::kInsn;
+    if (InsideInstruction(va)) return Target::kMidInsn;
+    return DecodesAsCode(va) ? Target::kUnreached : Target::kGarbage;
+}
+
+// Every 32-bit value that points into code, by where it was found and what it hits. A value that
+// hits an instruction no function begins at, or code nothing reached, is a call target the
+// dispatcher cannot resolve if the game ever uses it.
+void Analysis::WritePointerAudit(std::ofstream& out) const {
+    static const char* const kTargetNames[] = {"function", "insn", "mid-insn", "unreached", "garbage"};
+    struct Source {
+        const char* name;
+        size_t count[5] = {};
+        std::vector<std::pair<uint32_t, uint32_t>> open;  // (where, value) hitting insn or unreached
+    } sources[4] = {{"aligned data"}, {"unaligned data"}, {"code gaps"}, {"immediates"}};
+    auto note = [&](Source& s, uint32_t at, uint32_t v) {
+        Target t = Classify(v);
+        if (t == Target::kNoCode) return;
+        s.count[int(t)]++;
+        if (t == Target::kInsn || t == Target::kUnreached) s.open.push_back({at, v});
+    };
+    for (const auto& s : image_.sections) {
+        bool is_code = std::find(code_.begin(), code_.end(), &s) != code_.end();
+        if (s.name.rfind("$$", 0) == 0) continue;
+        for (uint32_t at = s.va; at + 4 <= s.va + s.rsize; at++) {
+            if (is_code) {
+                if ((at & 3) || InsideInstruction(at) || InsideInstruction(at + 3)) continue;
+                note(sources[2], at, image_.Read32(at));
+            } else {
+                note(sources[(at & 3) ? 1 : 0], at, image_.Read32(at));
+            }
+        }
+    }
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    for (const auto& [va, in] : insns) {
+        if (!Decode(va, &ins, ops)) continue;
+        for (uint8_t i = 0; i < ins.operand_count_visible; i++)
+            if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && !ops[i].imm.is_relative)
+                note(sources[3], va, uint32_t(ops[i].imm.value.u));
+    }
+    char line[160];
+    out << "\npointers into code (where found: function / insn / mid-insn / unreached / garbage)\n";
+    for (const auto& s : sources) {
+        std::snprintf(line, sizeof line, "  %-15s %7zu %7zu %7zu %7zu %7zu\n", s.name, s.count[0], s.count[1], s.count[2],
+                      s.count[3], s.count[4]);
+        out << line;
+    }
+    out << "\npacked structures: code pointers taken as entries (where -> target, now)\n";
+    for (const auto& [at, v] : packed_pointers) {
+        std::snprintf(line, sizeof line, "  %08X -> %08X %s\n", at, v, kTargetNames[int(Classify(v))]);
+        out << line;
+    }
+    for (const auto& s : sources) {
+        out << "\n" << s.name << ": pointers to an instruction no function begins at, or to unreached code\n";
+        for (const auto& [at, v] : s.open) {
+            std::snprintf(line, sizeof line, "  %08X -> %08X %s\n", at, v, kTargetNames[int(Classify(v))]);
+            out << line;
+        }
+    }
 }
 
 void Analysis::Drain() {
@@ -488,6 +619,8 @@ void Analysis::WriteReport(const std::string& path) const {
         std::snprintf(line, sizeof line, "  %08X %6u %s\n", gaps[i].va, gaps[i].size, image_.SectionAt(gaps[i].va)->name.c_str());
         out << line;
     }
+
+    WritePointerAudit(out);
 
     out << "\nfunctions\n";
     for (const auto& [va, fn] : functions) {

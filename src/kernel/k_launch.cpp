@@ -73,6 +73,35 @@ std::vector<uint8_t> FromHex(const std::string& s) {
     return v;
 }
 
+// After the handover: while this window still is in front, the new one comes in front from here (a foreground
+// process may hand the foreground to any window). The new process asks for it too (display::FinishHandover), but
+// Windows lets a background process do that only within its foreground rules; this way the keyboard and the mouse
+// surely go to the new window. Nothing happens when the player has switched to another program meanwhile.
+void ForegroundToNewWindow(DWORD process) {
+    DWORD front = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &front);
+    if (front != GetCurrentProcessId()) return;
+    struct Find {
+        DWORD process;
+        HWND window;
+    } find{process, nullptr};
+    EnumWindows(
+        [](HWND w, LPARAM p) -> BOOL {
+            auto* f = reinterpret_cast<Find*>(p);
+            DWORD pid = 0;
+            wchar_t cls[32] = {};
+            GetWindowThreadProcessId(w, &pid);
+            if (pid != f->process || !IsWindowVisible(w) || !GetClassNameW(w, cls, 32) || wcscmp(cls, L"FarCryInstincts"))
+                return TRUE;
+            f->window = w;
+            return FALSE;
+        },
+        LPARAM(&find));
+    if (!find.window) return;
+    const bool done = SetForegroundWindow(find.window) != 0;
+    rt::Log("kernel: the new window %s in front", done ? "brought" : "could not be brought");
+}
+
 }  // namespace
 
 // FCI_START_LEVEL=<level>[:<mission>[:<players>]]: the parts
@@ -145,6 +174,11 @@ bool Relaunch(uint32_t routine) {
     while (n > 0 && !bytes[n - 1]) n--;
     SetEnvironmentVariableA("FCI_LAUNCH_DATA", ToHex(bytes, n).c_str());
     SetEnvironmentVariableA("FCI_RELAUNCHED", "1");  // the log goes on in the same fci.log
+    // the window as the player left it (F11, dragged to another monitor, resized, maximized): the new process opens
+    // its window the same way (GitHub #10); without it, the settings decide (also after the menu changed them)
+    const std::string window = display::RelaunchWindowState();
+    SetEnvironmentVariableA("FCI_WINDOW_STATE", window.empty() ? nullptr : window.c_str());
+    rt::Log("kernel: window for the new process: %s", window.empty() ? "from the settings" : window.c_str());
 
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -182,6 +216,7 @@ bool Relaunch(uint32_t routine) {
         rt::Log("kernel: handover %s", r == WAIT_OBJECT_0 ? "done" : r == WAIT_OBJECT_0 + 1 ? "failed (new instance ended)"
                                                                                            : "timed out");
         CloseHandle(ready);
+        if (r == WAIT_OBJECT_0) ForegroundToNewWindow(pi.dwProcessId);
         if (r == WAIT_OBJECT_0 + 1) {  // the next level's process ended before its first frames: say so, not just quit
             DWORD code = 0;
             GetExitCodeProcess(pi.hProcess, &code);

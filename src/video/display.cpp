@@ -18,6 +18,7 @@
 #include "app/pcmode.h"
 #include "app/focus_pause.h"  // PC comfort features
 #include "app/menu.h"         // settings menu
+#include "app/settings.h"     // relaunch: display settings changed in the menu
 #include "gpu/nv2a.h"
 #include "gpu/present.h"   // relaunch handover: GPU memory
 #include "gpu/renderer.h"  // CompileHlsl
@@ -518,6 +519,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ---- relaunch handover (kernel::Relaunch): the previous instance keeps its window until this one has frames ----
 HANDLE g_handover = nullptr;  // the previous instance's event; set (and the window shown) by FinishHandover
 std::atomic<bool> g_handing{false};
+int g_show_cmd = SW_SHOW;  // how FinishHandover shows the window (maximized when the previous one was)
+
+// relaunch: the window where and as the previous process left it (output::Carried); false: none handed over
+bool CreateCarriedWindow(const output::Options& o, const wchar_t* cls, HINSTANCE inst) {
+    const output::Carried& c = o.carried;
+    if (!c.valid) return false;
+    const bool popup = c.shown != output::Shown::Windowed;
+    // made hidden, placed, then shown (now, or with the first frames during a handover). Windowed at its own
+    // rectangle, which also gives it that monitor's DPI from the start (no WM_DPICHANGED resizing it afterwards)
+    if (popup)
+        g_window = CreateWindowW(cls, L"Far Cry Instincts", WS_POPUP, o.mon_x, o.mon_y, o.mon_w, o.mon_h, nullptr, nullptr,
+                                 inst, nullptr);
+    else
+        g_window = CreateWindowW(cls, L"Far Cry Instincts", WS_OVERLAPPEDWINDOW, c.x, c.y, c.w, c.h, nullptr, nullptr,
+                                 inst, nullptr);
+    if (!g_window) return false;
+    if (c.placement) {
+        WINDOWPLACEMENT wp{sizeof wp};
+        wp.flags = c.flags & WPF_RESTORETOMAXIMIZED;
+        wp.showCmd = c.show == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        wp.rcNormalPosition = {c.left, c.top, c.right, c.bottom};
+        wp.ptMinPosition = wp.ptMaxPosition = {-1, -1};
+        if (popup) {
+            g_windowed = wp;  // F11 goes back to it
+            g_have_placement = true;
+        } else {
+            WINDOWPLACEMENT hidden = wp;  // its restore rectangle, still hidden
+            hidden.showCmd = SW_HIDE;
+            SetWindowPlacement(g_window, &hidden);
+        }
+    }
+    g_show_cmd = !popup && c.maximized ? SW_SHOWMAXIMIZED : SW_SHOW;
+    g_fullscreen = popup;
+    g_want_exclusive = c.shown == output::Shown::Exclusive && o.mode == output::Mode::Fullscreen && g_hle_output;
+    if (!g_handing) ShowWindow(g_window, g_show_cmd);
+    return true;
+}
 
 void DisplayThread() {
     g_handover = OpenEventW(EVENT_MODIFY_STATE, FALSE, kernel::HandoverEvent(GetCurrentProcessId()).c_str());
@@ -553,18 +591,25 @@ void DisplayThread() {
     bool borderless = o.mode != output::Mode::Windowed;
     if (o.mode == output::Mode::Fullscreen && !g_hle_output)
         rt::Log("display: exclusive fullscreen needs the HLE graphics, borderless instead");
-    if (borderless)
-        g_window = CreateWindowW(wc.lpszClassName, L"Far Cry Instincts", WS_POPUP | visible, o.mon_x, o.mon_y,
-                                 o.mon_w, o.mon_h, nullptr, nullptr, wc.hInstance, nullptr);
-    else
-        g_window = CreateWindowW(wc.lpszClassName, L"Far Cry Instincts", WS_OVERLAPPEDWINDOW | visible,
-                                 chosen_place ? wx : CW_USEDEFAULT, chosen_place ? wy : CW_USEDEFAULT, ww, wh, nullptr,
-                                 nullptr, wc.hInstance, nullptr);
-    g_fullscreen = borderless;
-    g_want_exclusive = o.mode == output::Mode::Fullscreen && g_hle_output;
-    RECT client{};
+    if (CreateCarriedWindow(o, wc.lpszClassName, wc.hInstance)) {  // relaunch: as the previous process left it
+        borderless = g_fullscreen;
+    } else {
+        if (borderless)
+            g_window = CreateWindowW(wc.lpszClassName, L"Far Cry Instincts", WS_POPUP | visible, o.mon_x, o.mon_y,
+                                     o.mon_w, o.mon_h, nullptr, nullptr, wc.hInstance, nullptr);
+        else
+            g_window = CreateWindowW(wc.lpszClassName, L"Far Cry Instincts", WS_OVERLAPPEDWINDOW | visible,
+                                     chosen_place ? wx : CW_USEDEFAULT, chosen_place ? wy : CW_USEDEFAULT, ww, wh,
+                                     nullptr, nullptr, wc.hInstance, nullptr);
+        g_fullscreen = borderless;
+        g_want_exclusive = o.mode == output::Mode::Fullscreen && g_hle_output;
+    }
+    RECT client{}, outer{};
     GetClientRect(g_window, &client);
-    rt::Log("display: window %s, client %ldx%ld", borderless ? "borderless" : "windowed", client.right, client.bottom);
+    GetWindowRect(g_window, &outer);
+    rt::Log("display: window %s%s, client %ldx%ld at %ld,%ld%s", borderless ? "borderless" : "windowed",
+            g_want_exclusive ? " (exclusive fullscreen wanted)" : "", client.right, client.bottom, outer.left, outer.top,
+            g_show_cmd == SW_SHOWMAXIMIZED ? ", maximized" : "");
     char test[128] = {}, close_at[16] = {}, f11[16] = {};
     GetEnvironmentVariableA("FCI_TEST_ALTTAB", test, sizeof test);
     GetEnvironmentVariableA("FCI_TEST_CLOSE", close_at, sizeof close_at);
@@ -620,12 +665,42 @@ int DumpEvery() { return g_dump_every; }
 
 void FinishHandover() {
     if (!g_handing.exchange(false)) return;
-    ShowWindow(g_window, SW_SHOW);
+    ShowWindow(g_window, g_show_cmd);
     SetForegroundWindow(g_window);
     SetEvent(g_handover);
     CloseHandle(g_handover);
     int budget = 0, used = gpu::present::VideoMemoryUsage(&budget);
     rt::Log("display: handover done, window shown (GPU memory of this process %d MB, budget %d MB)", used, budget);
+}
+
+std::string RelaunchWindowState() {
+    HWND w = g_window.load();
+    if (!w) return {};
+    for (const char* key : {"display_mode", "monitor", "resolution"})
+        if (settings::String(key, "") != settings::Boot(key, "")) return {};  // the menu's new value wins
+    output::Carried c;
+    c.shown = g_want_exclusive ? output::Shown::Exclusive : g_fullscreen ? output::Shown::Borderless : output::Shown::Windowed;
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) c.device = mi.szDevice;
+    WINDOWPLACEMENT wp{sizeof wp};
+    const bool own = c.shown == output::Shown::Windowed;
+    if (own) c.placement = GetWindowPlacement(w, &wp) != 0;
+    else if (g_have_placement) wp = g_windowed, c.placement = true;
+    RECT r{};
+    GetWindowRect(w, &r);
+    c.maximized = own && (IsZoomed(w) || (IsIconic(w) && (wp.flags & WPF_RESTORETOMAXIMIZED)));
+    if (own && IsIconic(w)) r = wp.rcNormalPosition;  // minimized: where it comes back (workspace ~ screen here)
+    c.x = r.left, c.y = r.top, c.w = r.right - r.left, c.h = r.bottom - r.top;
+    if (c.placement) {
+        c.flags = wp.flags;
+        c.show = wp.showCmd == SW_SHOWMAXIMIZED || (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED))
+                     ? SW_SHOWMAXIMIZED
+                     : SW_SHOWNORMAL;
+        c.left = wp.rcNormalPosition.left, c.top = wp.rcNormalPosition.top;
+        c.right = wp.rcNormalPosition.right, c.bottom = wp.rcNormalPosition.bottom;
+    }
+    return output::EncodeCarried(c);
 }
 
 void Vblank() {

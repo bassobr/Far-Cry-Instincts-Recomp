@@ -1023,12 +1023,28 @@ void UpdateGamma() {
 // them), shrunk to 640 x 480 so it compares with LLE dumps
 const char* g_dump_tag = nullptr;  // performance: FCI_DUMP_LEFT_OUT
 
+// FCI_DUMP_FRAMES_WINDOW=<from>-<to> (seconds since the start): every frame presented in that time instead, each one
+// (not one per vblank), named frame_<vblank>_<sequence>.bmp (frame by frame measurements: the viewmodel's motion)
 void Dump(uint32_t w, uint32_t h, float aspect) {
     int every = display::DumpEvery();
     const char* tag = g_dump_tag;
     g_dump_tag = nullptr;
+    static const auto window = [] {
+        char v[64] = {};
+        double from = -1, to = -1;
+        if (GetEnvironmentVariableA("FCI_DUMP_FRAMES_WINDOW", v, sizeof v)) std::sscanf(v, "%lf-%lf", &from, &to);
+        return std::pair{from, to};
+    }();
+    const double since = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    static unsigned sequence = 0;
+    char seq[16] = {};
+    if (window.first >= 0 && !tag) {
+        if (since < window.first || since > window.second) return;
+        snprintf(seq, sizeof seq, "%06u", ++sequence);
+        tag = seq;
+    }
     if (!every && !tag) return;
-    uint64_t vblank = uint64_t(std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count() * 59.94);
+    uint64_t vblank = uint64_t(since * 59.94);
     if (!tag && vblank / every == g_last_dump / every) return;
     if (!tag) g_last_dump = vblank;
     D3D11_TEXTURE2D_DESC td{w, h, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_STAGING, 0,

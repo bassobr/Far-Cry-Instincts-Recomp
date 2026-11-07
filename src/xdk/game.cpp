@@ -42,9 +42,40 @@ struct Widened {
 };
 std::vector<Widened> g_widened;
 
+// FCI_TEST_CRT_MATH=1: runs the game's x87 tanh (0x005001F5) and exp (0x004ED12C) once, on the game thread at the
+// first camera update, for an argument of each class (normal, zero, infinite, NaN, denormal) and logs them beside
+// the host's. The CRT dispatches each class to its own handler through a byte-packed table (fci-recomp,
+// PackedStructPointers); tanh of a normal number is the call of GitHub #7 (0x00500275).
+void TestCrtMath(rt::Cpu& c) {
+    const rt::Cpu saved = c;
+    struct Fn { const char* name; uint32_t va; double (*host)(double); } fns[] = {
+        {"tanh", 0x005001F5u, [](double x) { return std::tanh(x); }},
+        {"exp", 0x004ED12Cu, [](double x) { return std::exp(x); }},
+    };
+    const double inf = INFINITY, args[] = {0.5, -0.25, 3.0, -20.0, 0.0, -0.0, 1e-310, inf, -inf, NAN};
+    int bad = 0;
+    for (const auto& fn : fns)
+        for (double x : args) {
+            rt::FPush(c, x);
+            rt::GuestCall(c, fn.va, {});
+            const double y = rt::ST(c, 0), want = fn.host(x);
+            rt::FPop(c);
+            const bool ok = (std::isnan(y) && std::isnan(want)) || y == want || std::fabs(y - want) <= 1e-12 * std::fabs(want);
+            bad += !ok;
+            rt::Log("crt math: %s(%g) = %.17g, host %.17g%s", fn.name, x, y, want, ok ? "" : "  MISMATCH");
+        }
+    rt::Log("crt math: %d mismatches", bad);
+    c = saved;
+}
+
 }  // namespace
 
 HLE_STDCALL(Game_CameraUpdate, 0) {
+    static bool test_math = GetEnvironmentVariableA("FCI_TEST_CRT_MATH", nullptr, 0) > 0;
+    if (test_math) {
+        test_math = false;
+        TestCrtMath(c);
+    }
     const uint32_t cam = c.ebx;
     const float widen = pcmode::Widen(), fov_scale = pcmode::FovScale();
     float fov = xdk::GF(cam + kCamFov), aspect = xdk::GF(cam + kCamAspect);
@@ -146,7 +177,12 @@ HLE_STDCALL(Game_FirstPersonProjection, 0) {
               xdk::GF(renderer + 0x698), R32(renderer + 0x6B8), R32(renderer + 0x6BC), pixel_aspect,
               xdk::GF(renderer + 0x6C8), widen != 1.0f ? " (widened)" : "");
     if (widen != 1.0f) SetF(renderer + 0x6AC, pixel_aspect * widen);
+    // ---- direct mouse look (hle/mouse_look.cpp): the hands and the weapon with the view they were placed for ----
+    float view[16];
+    const bool fp_view = hle::FirstPersonView(renderer, view);
+    // ---- end direct mouse look ----
     uint32_t r = xdk::CallOriginal(c, GUEST_ORIG(Game_FirstPersonProjection));
+    if (fp_view) hle::FirstPersonViewDone(renderer, view);
     if (widen != 1.0f) SetF(renderer + 0x6AC, pixel_aspect);
     return r;
 }

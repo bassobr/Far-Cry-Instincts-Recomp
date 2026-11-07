@@ -67,9 +67,14 @@ Steam Deck OLED (Proton 10, 8 compilers) about 5.8 min. It needs about 1 GB of d
 1. **Loading.** `src/xbe` maps the XBE the way the Xbox lays it out in memory.
 2. **Analysis.** Recursive descent from the entry point. Further functions are found through `call` targets, code
    pointers in data sections (vtables, callbacks) and immediates. Jump tables (`jmp [reg*4+table]`) are resolved.
+   Code pointers in byte-packed structures whose address the code takes (an immediate pointing to a data address
+   that is not 4-aligned and does not start a string) count too: for example the handler tables of the CRT's x87
+   math (`tanh`, `exp`), which its dispatcher reaches with `jmp [ebx]`.
    Functions that were found only through a pointer and contain instructions no Xbox title executes (port I/O,
    `arpl`, BCD, segment instructions) are treated as data and dropped together with everything found only through
-   them. A report goes to `generated/analysis.txt`.
+   them. A report goes to `generated/analysis.txt`, with an audit of every value that points into code (aligned and
+   unaligned data, gaps in the code, immediates) by what it hits: a function, an instruction without a function, or
+   unreached code.
 3. **Symbols.** `config/symbols.txt` holds the addresses of the XDK 5849 library functions in this XBE, found
    offline with XbSymbolDatabase and converted by `tools/symbols.py`; `config/symbols_fci.txt` adds symbols found by
    hand. The names become extra entry points and `SYM_<name>` constants for the host code (`image_symbols.h`,

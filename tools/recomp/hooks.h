@@ -24,6 +24,9 @@ inline constexpr Hook kHooks[] = {
     {0x005C6220, "XInputPoll"},
     // ---- PC comfort features: skip_intro (src/hle/skip_intro.cpp) ----
     {0x005A9A20, "BinkOpen"},  // BinkOpen(name, flags), stdcall, called by the game's video player 0x00220200
+    // ---- menu videos at their own frame rate (src/hle/video_pace.cpp, GitHub #13) ----
+    {0x0021FFA0, "MenuVideoUpdate"},  // a menu background video's update, once per game frame
+    {0x005AB260, "BinkWait"},         // BinkWait(bink), stdcall: the update asks it for videos below 25 fps
 };
 
 // The CRT's _setjmp3. longjmp ends in a jump to the address after a call to it, in the middle of the caller

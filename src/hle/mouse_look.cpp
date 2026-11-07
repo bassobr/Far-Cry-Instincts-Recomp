@@ -27,6 +27,16 @@
 // hold it): a direction whose turn fell short is not added ahead until a turn in it, or one away from it, goes
 // through again (in a cutscene: the first one or two frames of motion show a turn of that frame's size, then
 // nothing).
+//
+// The hands and the weapon (GitHub #5): the frame (0x000490B0) updates the entities (0x001FCD40, which writes the
+// player's copies of its angles, 0x0008AAB0) before the client update (0x000F0500), so the hands and the weapon
+// are placed from the angles before this frame's turn, like the copied camera. With the turn added to the camera
+// only, they trailed the view by this frame's turn: with an uneven mouse (counts per frame differ) they jumped back
+// and forth on the screen (measured 24.9 px at 480 lines, 2.46 degrees, for turns alternating 0.3 and 2.7 degrees
+// a frame). Adding the turn to the player's camera [entity+0x104] as well does not reach them (measured: no
+// change). So they are drawn with the view of the angles they were placed for (FirstPersonView, from the first
+// person projection 0x002469E0, which multiplies the renderer's view with the first person projection for them):
+// on the screen they sit as without the look-ahead, the world turns at once.
 #include <windows.h>
 
 #include <algorithm>
@@ -48,6 +58,9 @@ constexpr uint32_t kClientView = 0x58;          // the client's camera (CCamera:
 constexpr uint32_t kClientLocalPlayer = 0x34;   // word: local player index (0 = the first)
 
 constexpr uint32_t kCamPitch = 0xC, kCamYaw = 0x14;  // degrees; pitch grows downwards, yaw to the left
+// the renderer's view matrix (D3D, row vectors; 0x00242930 multiplies it with the projection +0x178/+0x1B8 into
+// +0x1F8/+0x238, which the first person projection 0x002469E0 uploads)
+constexpr uint32_t kRendererView = 0x138;
 
 // In a vehicle and on a mounted gun the yaw is held within a limit relative to the vehicle or the gun
 // (fLimitLRAngles 100-150, angHLimit 15-130 degrees in the levels' data), and the game takes the relative angle
@@ -73,7 +86,25 @@ struct Ahead {
     bool yaw_blocked[2] = {};    // [direction]: the game held a yaw turn this way back
     float pitch_limit[2] = {-85.0f, 85.0f};  // up, down: as far as the game was seen to let the view go
     double yaw_left = 0;         // the mouse's yaw beyond kMaxYawStep, for the next frames
+    // the first person view of this frame (FirstPersonView): the shown camera's axes, and the rotation from the
+    // shown view to the real one in view space
+    bool fp_on = false;
+    float fp_shown[9] = {}, fp_fix[9] = {}, fp_eye[3] = {};
 } g_ahead;
+
+// The camera's axes in the world (rows: right, up, back; z up) at yaw and pitch in the camera's degrees, as the
+// game builds them (checked against a camera's matrix in guest memory: yaw 176.016, pitch -0.627 gives right
+// 0.998 -0.069 0, up -0.001 -0.011 1.000, back -0.069 -0.998 -0.011). Roll is left out (the game's view does not
+// roll the player's camera; FirstPersonView checks the axes before it uses them).
+void CameraAxes(float yaw_degrees, float pitch_degrees, float out[9]) {
+    const double y = yaw_degrees * 0.017453292519943295, p = pitch_degrees * 0.017453292519943295;
+    const double right[3] = {-std::cos(y), -std::sin(y), 0};
+    const double forward[3] = {std::sin(y) * std::cos(p), -std::cos(y) * std::cos(p), -std::sin(p)};
+    const double up[3] = {right[1] * forward[2] - right[2] * forward[1], right[2] * forward[0] - right[0] * forward[2],
+                          right[0] * forward[1] - right[1] * forward[0]};
+    for (int i = 0; i < 3; i++)
+        out[i] = float(right[i]), out[3 + i] = float(up[i]), out[6 + i] = float(-forward[i]);
+}
 
 void AddF(uint32_t va, float v) {
     float f;
@@ -124,6 +155,7 @@ void hle::PredictView(uint32_t camera, float game_fov) {
     g.fov = game_fov;
     const uint32_t at[2] = {camera + kCamYaw, camera + kCamPitch};
     float real[2] = {xdk::GF(at[0]), xdk::GF(at[1])};
+    g.fp_on = false;
     if (no_ahead) {
         if (trace_look) rt::Log("look: camera yaw %.4f pitch %.4f", real[0], real[1]);
         g.pending = false;
@@ -160,10 +192,70 @@ void hle::PredictView(uint32_t camera, float game_fov) {
         if (shown[i] != real[i]) std::memcpy(rt::Host(at[i]), &shown[i], 4);
         g.real_last[i] = real[i];
     }
+    // the hands and the weapon: placed from the real angles (before this frame's turn), they are drawn with the
+    // view of the real angles (FirstPersonView)
+    g.fp_on = shown[0] != real[0] || shown[1] != real[1];
+    if (g.fp_on) {
+        CameraAxes(shown[0], shown[1], g.fp_shown);
+        for (int i = 0; i < 3; i++) g.fp_eye[i] = xdk::GF(camera + 4 * i);  // the camera's position
+        float axes_real[9];
+        CameraAxes(real[0], real[1], axes_real);
+        for (int i = 0; i < 3; i++)  // D = R_shown R_real^T
+            for (int j = 0; j < 3; j++)
+                g.fp_fix[i * 3 + j] = g.fp_shown[i * 3] * axes_real[j * 3] + g.fp_shown[i * 3 + 1] * axes_real[j * 3 + 1] +
+                                      g.fp_shown[i * 3 + 2] * axes_real[j * 3 + 2];
+    }
     g.asked_last[0] = yaw, g.asked_last[1] = pitch;
     g.have_last = true;
     g.pending = false;
     if (trace_look)  // what the frame shows (the camera), what the player's angles are (real)
         rt::Log("look: camera yaw %.4f pitch %.4f (real %.4f %.4f, pitch limits %.2f %.2f)%s", shown[0], shown[1],
                 real[0], real[1], limit[0], limit[1], g.yaw_blocked[0] || g.yaw_blocked[1] ? " (yaw held)" : "");
+}
+
+bool hle::FirstPersonView(uint32_t renderer, float saved[16]) {
+    static const bool off = GetEnvironmentVariableA("FCI_NO_FIRST_PERSON_FIX", nullptr, 0) > 0;  // diagnosis
+    const Ahead& g = g_ahead;
+    if (!g.fp_on || off) return false;
+    // FCI_TRACE_LOOK: every 2 s how often the view was set, left (another view), held (flag 2)
+    static unsigned counts[3] = {};
+    static ULONGLONG last = 0;
+    auto count = [](int what) {
+        counts[what]++;
+        if (!trace_look || GetTickCount64() - last < 2000) return;
+        last = GetTickCount64();
+        rt::Log("look: first person view: %u set, %u another view, %u view not on the device yet", counts[0], counts[1],
+                counts[2]);
+    };
+    // (a view not yet handed to the device, flag 2 of +0x688, would go there with the first person one)
+    if (rt::R32(renderer + 0x688) & 2) return count(2), false;
+    // the renderer's view (row vectors: view = (world - eye) R^T, so its 3x3 holds the axes as columns, its last row
+    // -eye R^T) must be the shown camera's: not another player's view in split screen, a cutscene's or a reflection's
+    float v[16];
+    std::memcpy(v, rt::Host(renderer + kRendererView), sizeof v);
+    bool same = true;
+    for (int col = 0; col < 3; col++) {
+        float at_eye = v[12 + col];
+        for (int k = 0; k < 3; k++) {
+            same &= std::fabs(v[k * 4 + col] - g.fp_shown[col * 3 + k]) < 0.01f;
+            at_eye += g.fp_eye[k] * v[k * 4 + col];
+        }
+        same &= std::fabs(at_eye) < 0.5f;
+    }
+    if (!same) return count(1), false;
+    count(0);
+    std::memcpy(saved, v, sizeof v);
+    // view x D (D = R_shown R_real^T, 3x3, no translation): (world - eye) R_real^T, the view of the real angles
+    float out[16];
+    for (int r = 0; r < 4; r++) {
+        for (int col = 0; col < 3; col++)
+            out[r * 4 + col] = v[r * 4] * g.fp_fix[col] + v[r * 4 + 1] * g.fp_fix[3 + col] + v[r * 4 + 2] * g.fp_fix[6 + col];
+        out[r * 4 + 3] = v[r * 4 + 3];
+    }
+    std::memcpy(rt::Host(renderer + kRendererView), out, sizeof out);
+    return true;
+}
+
+void hle::FirstPersonViewDone(uint32_t renderer, const float saved[16]) {
+    std::memcpy(rt::Host(renderer + kRendererView), saved, 16 * sizeof(float));
 }

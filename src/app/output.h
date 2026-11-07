@@ -16,6 +16,25 @@ namespace output {
 enum class Mode { Windowed, Borderless, Fullscreen };
 enum class Hdr { Auto, On, Off };
 
+// ---- relaunch between levels (kernel::Relaunch): the window as the previous process left it ----
+// F11/Alt+Enter, a window dragged to another monitor, resized or maximized are not in the ini; the previous process
+// hands them over in FCI_WINDOW_STATE (video/display.cpp makes and applies it), so the next level's window is where
+// and how the player left it. Not when the settings menu changed display_mode, monitor or resolution: then those win.
+enum class Shown { Windowed, Borderless, Exclusive };
+struct Carried {
+    bool valid = false;
+    Shown shown = Shown::Windowed;
+    std::wstring device;          // the monitor the window was on (\\.\DISPLAYn)
+    int x = 0, y = 0, w = 0, h = 0;  // the window's rectangle on the desktop
+    bool maximized = false;
+    // the window's windowed placement (WINDOWPLACEMENT: flags, showCmd, rcNormalPosition in workspace
+    // coordinates): windowed it is the window's own, borderless the one F11 goes back to
+    bool placement = false;
+    unsigned flags = 0, show = 0;
+    int left = 0, top = 0, right = 0, bottom = 0;
+};
+// ---- end relaunch ----
+
 struct Options {
     Mode mode = Mode::Windowed;
     bool monitor_set = false;  // a monitor was chosen (else the window is placed as before, on the primary)
@@ -30,9 +49,12 @@ struct Options {
     float paper_white = 200;          // 0: Windows' SDR content brightness
     float peak = 0;                   // 0: the display's
     float boost = 0;
+    Carried carried;  // relaunch: the previous process's window (its monitor is the chosen one then)
 };
 
 const Options& Get();
+// relaunch: the text of FCI_WINDOW_STATE for a window state (Load reads it back in the new process)
+std::string EncodeCarried(const Carried& c);
 // the shape aspect = auto follows: the resolution's, else the chosen monitor's
 float AutoAspect();
 // the height the output has (resolution, else the monitor's): scale = auto follows it

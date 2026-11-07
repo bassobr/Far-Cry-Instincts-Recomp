@@ -877,7 +877,48 @@ void DrawTabs() {
     ImGui::PopStyleColor(4);
 }
 
+// ---- a notice (ShowNotice) in the panel's look instead of the settings: title, text, OK (under g_ui) ----
+std::string g_notice_title, g_notice_text;
+
+void DrawNotice() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    float em = ImGui::GetFontSize();
+    float w = std::min(em * 34, vp->Size.x - 16);
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
+    for (const auto& [col, color] : kPanelColors) ImGui::PushStyleColor(col, color);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em * 1.6f, em * 1.2f));
+    constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar |
+                                        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("##notice", nullptr, kFlags)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kHeading);
+        ImGui::TextUnformatted(g_notice_title.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, em * 0.3f));
+        ImGui::PushTextWrapPos(w - em * 1.6f);
+        ImGui::TextUnformatted(g_notice_text.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, em * 0.5f));
+        float bw = em * 8;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(ImGui::GetContentRegionAvail().x - bw, 0.0f));
+        if (g_focus_first > 0 && --g_focus_first == 0) ImGui::SetKeyboardFocusHere();
+        if (ImGui::Button("OK", ImVec2(bw, 0))) g_close = true;
+        // A, Enter and Space close it wherever ImGui's navigation stands (B and Escape close any panel)
+        for (ImGuiKey key : {ImGuiKey_GamepadFaceDown, ImGuiKey_Enter, ImGuiKey_KeypadEnter, ImGuiKey_Space})
+            if (ImGui::IsKeyPressed(key, false)) g_close = true;
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(int(std::size(kPanelColors)));
+}
+
 void DrawPanel() {
+    if (!g_notice_text.empty()) return DrawNotice();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     float em = ImGui::GetFontSize();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -1282,6 +1323,7 @@ void ToggleMenu() {
         g_close = false;
         g_pad_armed = false;
         g_focus_first = open ? 1 : 0;
+        if (!open) g_notice_title.clear(), g_notice_text.clear();
         if (g_context) {
             ImGuiIO& io = ImGui::GetIO();
             io.ClearEventsQueue();
@@ -1295,6 +1337,22 @@ void ToggleMenu() {
 
 void RequestMenu() {
     if (!MenuOpen()) ToggleMenu();
+}
+
+bool ShowNotice(const char* title, const char* text) {
+    if (!gpu::present::MenuAvailable()) return false;
+    {
+        std::lock_guard lock(g_ui);
+        g_notice_title = title;
+        g_notice_text = text;
+    }
+    rt::Log("settings menu: notice '%s'", title);
+    if (!MenuOpen()) ToggleMenu();
+    else {
+        std::lock_guard lock(g_ui);
+        g_focus_first = 1;
+    }
+    return true;
 }
 
 bool MenuWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
