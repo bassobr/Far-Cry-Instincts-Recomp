@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.7 (2026-11-07)
+
+- Water no longer looks blocky or choppy (#14): the game's small wave-distortion texture holds signed values, which
+  the Xbox filters as signed; we filtered the raw bytes as unsigned, so wherever a wave value crossed zero the
+  reflection jumped to a completely different spot, giving hard-edged blocks with round outlines. This affected every
+  water setting and the surface seen from below, in all earlier versions. The original water's depth comparison
+  also scales up to the render resolution properly now.
+- Shadow cascades no longer flicker (#16, #18): after drawing the near shadow map, the console's short shadow range
+  was left in place for the rest of the frame, so on every second frame objects and ground a few metres away were
+  shaded without their shadow. Measured frame by frame while walking and turning, the flicker is gone at 30, 60, 120
+  fps and unlimited. Every view now keeps its own pair of maps. Shadow Cascades switches at once in the F10 menu
+  (before, it only applied after a restart). It stays off by default for now.
+
 ## 0.1.6 (2026-11-07)
 
 - Shadow cascades are off by default (#16). In 0.1.5 they drew the near and the far shadow map on alternate frames,

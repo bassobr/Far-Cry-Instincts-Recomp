@@ -43,11 +43,18 @@ void SetGammaRamp(const uint8_t ramp[768]);
 // ---- PC shadows: shadow cascades (xdk/shadows.cpp; the last three in push buffer order) ----
 // whether the sun gets a near shadow map (shadow_cascades with shadow_distance >= 2, HLE)
 bool ShadowCascades();
-// the game's shadow pass between these draws its 16 bit depth into the near map instead
-void BeginNearShadowPass();
-void EndNearShadowPass();
-// after a pass (near_now: the near one): its receivers read the other map at m x (u, v, depth, 1) (on: valid)
-void SetShadowCascade(bool on, bool near_now, const float m[3][4]);
+bool CascadesSetting();  // the setting's value (shadow_cascades)
+// the F10 menu switches them live; the next shadow pass follows (they need shadow_distance >= 2 at the start)
+void SetShadowCascades(bool on);
+// cascades switched off: the receivers read the game's own maps again (push buffer order)
+void DropSunShadows();
+// the game's sun shadow pass for a view (0-3) between these draws its 16 bit depth into the view's near or far map
+// instead of the guest's map; afterwards the receivers of that guest map read it (sun: it was the sun's; other: the
+// view's pass before drew the other cascade, whose texture coordinates and depth are m x (u, v, depth, 1) of this one's)
+void BeginSunShadowPass(int view, bool near_pass);
+void EndSunShadowPass(bool sun, bool other, const float m[3][4]);
+// a view's frame without a sun shadow pass: its receivers read the guest's own maps again
+void DropSunShadow(int view);
 // ---- end PC shadows ----
 // performance: held while the device context is in use (the render thread's commands, the settings menu's frames,
 // CPU reads of render targets)

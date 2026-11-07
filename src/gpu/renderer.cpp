@@ -306,6 +306,18 @@ bool g_replay_now = false, g_replaying = false;
 uint32_t g_stage_video[4] = {};  // per stage of the current draw: width << 16 | height of a linear guest texture
 // ---- end PC features ----
 
+// ---- signed textures (GitHub #14) ----
+// SET_TEXTURE_FILTER bits 28..31 (A, R, G, B signed, D3DTSS_COLORSIGN): the NV2A filters those channels as two's
+// complement values. The host filters UNORM bytes, so between a texel of +3 (0x03) and one of -3 (0xFD) it gave
+// 0x80 = -128: across every sign change of the ocean's 64x64 du/dv texture the bump offset swung to its extremes,
+// one source texel wide, which the reflection showed as hard-edged blocks along the waves' contours ("blocky with
+// round edges"), at any resolution. Such a stage's texture is decoded with those channels as offset binary
+// (XOR 0x80: linear in the signed value, so the GPU's bilinear, trilinear and anisotropic filtering are right) and
+// the pixel shader turns the filtered value back into the two's complement the stage used before (psh.cpp,
+// Config::signs): at texel centres nothing changes. FCI_NO_SIGNED_FILTER=1 = as before (diagnostics).
+uint8_t g_stage_signs[4] = {};  // per stage of the current draw: channels decoded as offset binary (bit 0 A .. 3 B)
+// ---- end signed textures ----
+
 // ---- diagnostics: FCI_TRACE_HUD (GitHub #17) ----
 // How draws are classified for the widescreen HUD (DrawOne, Present).
 // FCI_TRACE_HUD=<s>[,<s>...]: one whole frame from each of these seconds (after the first draw) on, a line per draw:
@@ -788,29 +800,101 @@ DepthTarget* GetDepth(uint32_t address, uint32_t width, uint32_t height, bool z1
 // other map (the one the game did not draw this frame) come from the matrix of the two sun cameras (both
 // orthographic along the sun: an affine map of texture coordinates and depth). Each map has the game's own camera,
 // snapping (whole texels, no shimmer) and depth range, so the polygon offset is the game's in each; what moves is
-// one frame old in the other map. The game marks the near pass and sends the matrix in push buffer order
-// (BeginNearShadowPass, EndNearShadowPass, SetShadowCascade).
-constexpr uint32_t kNearTag = 0x10000000;  // near maps live at the shadow map's address + this (beyond guest RAM)
-bool g_near_pass = false;                   // the game's near shadow pass is being drawn
-struct Cascade {
-    bool on = false;
-    uint32_t far_address = 0;  // the shadow map whose receivers use it
+// one frame old in the other map. The game marks its passes and sends the matrix in push buffer order
+// (BeginSunShadowPass, EndSunShadowPass).
+// Both maps are the renderer's own, per view (split screen: one pair each): every sun pass draws into a host target at
+// the guest map's address + (1 + 2 view + cascade) x kCascadeTag, never into the guest map's own host target, and the
+// receivers that sample the guest map get the maps of the pass that set up their coordinates (a binding per guest
+// address, renewed after each pass). Before, the far pass drew into the guest map's own target and the maps were
+// whatever 16 bit targets had been drawn last: in split screen the views shared them (each view read the other
+// view's far map), and a frame whose last 16 bit target was not the sun's would have left the receivers with near
+// coordinates in the far map. A pass without the sun (a spot light) or without the other cascade's map still gives
+// its receivers its own map: never a map that does not match their coordinates.
+constexpr uint32_t kCascadeTag = 0x10000000;  // beyond guest RAM
+struct SunPass {
+    bool active = false;
+    int view = 0, which = 0;  // which: 0 near, 1 far
+    // the guest maps the pass drew (address) and the host targets standing in for them
+    uint32_t address[4] = {};
+    DepthTarget* target[4] = {};
+    int maps = 0;
+};
+SunPass g_sun_pass;
+struct ViewMaps {
+    uint32_t address = 0;            // the guest map they stand in for
+    DepthTarget* map[2] = {};        // near, far
+};
+ViewMaps g_view_maps[4];
+struct ShadowBinding {  // what receivers of a guest map read (set after each pass)
+    uint32_t address = 0;
+    DepthTarget* current = nullptr;  // the map the last pass drew: the receivers' coordinates are its
+    bool cascade = false;            // and with both maps:
     DepthTarget* near_map = nullptr;
     DepthTarget* far_map = nullptr;
     // (u, v, depth) in either map = these x the receivers' (the game's: this frame's map) (u, v, depth, 1)
     float n[3][4] = {}, f[3][4] = {};
 };
-Cascade g_cascade;
+ShadowBinding g_bindings[8];
 struct CascadeConstants {
     float n[3][4], f[3][4];  // psh.cpp's cascade_n, cascade_f
     float fade[4];           // x: 1 / the fading edge in near map coordinates
 };
 uint64_t g_cascade_draws = 0;  // draws into near maps (statistics)
-DepthTarget* g_last_near = nullptr;  // the near map the last near pass drew
-DepthTarget* g_last_far = nullptr;   // the 16 bit depth target last drawn outside a near pass
-uint32_t g_last_shadow_address = 0, g_last_shadow_width = 0;  // the 16 bit depth target last drawn outside a near pass
 DepthTarget* g_stage_depth[4] = {};  // the depth target a stage samples (GetTexture), else null
+const ShadowBinding* g_stage_binding[4] = {};  // and the binding it came from
+std::atomic<bool> g_cascades_on{false};  // shadow_cascades (live; with near_scale 0 they stay off)
+bool g_cascades_logged = false;
 constexpr float kCascadeFade = 10.0f;
+// diagnostics: FCI_TRACE_CASCADE=<from>-<to> (seconds since the start, as FCI_DUMP_FRAMES_WINDOW): a line per frame
+// with the sun passes (EndSunShadowPass, DropSunShadow), the 16 bit targets drawn (address, draws, n: a cascade map)
+// and the receivers of shadow maps (with the cascade, without: their map's address)
+struct CascadeTrace {
+    bool init = false;
+    double from = -1, to = -1;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    uint64_t frame = 0, sequence = 0;
+    double now = 0;
+    char passes[64] = {};
+    struct Count { uint32_t address; bool near_map; uint32_t draws; };
+    Count z16[8] = {};
+    int n_z16 = 0;
+    uint32_t with = 0, without = 0, without_address = 0;
+    bool On() {
+        if (!init) {
+            init = true;
+            char v[64] = {};
+            if (GetEnvironmentVariableA("FCI_TRACE_CASCADE", v, sizeof v)) std::sscanf(v, "%lf-%lf", &from, &to);
+        }
+        if (from < 0) return false;
+        now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return now >= from && now <= to;
+    }
+    void Pass(char c) {
+        const size_t n = std::strlen(passes);
+        if (n + 1 < sizeof passes) passes[n] = c, passes[n + 1] = 0;
+    }
+    void Target(uint32_t address, bool near_map) {
+        for (int i = 0; i < n_z16; i++)
+            if (z16[i].address == address && z16[i].near_map == near_map) return void(z16[i].draws++);
+        if (n_z16 < 8) z16[n_z16++] = {address, near_map, 1};
+    }
+    void Frame() {
+        frame++;
+        if (On()) {
+            char t[256] = {};
+            for (int i = 0; i < n_z16; i++) {
+                const size_t n = std::strlen(t);
+                std::snprintf(t + n, sizeof t - n, " %08X%s:%u", z16[i].address, z16[i].near_map ? "n" : "",
+                              z16[i].draws);
+            }
+            rt::Log("render: cascade trace: %06llu at %.3f s, frame %llu passes '%s' z16%s receivers %u cascade, %u "
+                    "not (%08X)", (unsigned long long)++sequence, now, (unsigned long long)frame, passes, t, with,
+                    without, without_address);
+        }
+        passes[0] = 0, n_z16 = 0, with = without = without_address = 0;
+    }
+};
+CascadeTrace g_cascade_trace;
 // ---- end PC shadows ----
 
 struct Surfaces {
@@ -856,10 +940,10 @@ Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool ref
         if (!shadow && !swizzled && row >= 640) out.wide = g_q.wide;  // PC features: widescreen
     }
     uint32_t pitch = s.Reg(SET_SURFACE_PITCH);
-    // PC shadows: the game's near shadow pass draws into the near map (see "shadow cascades"), its depth only (the
-    // shadow passes write no colour: the colour target is a dummy at physical 0)
-    const bool to_near = g_near_pass && zeta == 1 && g_q.near_scale && want_depth;
-    if (to_near) want_color = false, out.scale = float(g_q.near_scale);
+    // PC shadows: the game's sun shadow passes draw into the view's near or far map (see "shadow cascades"), their
+    // depth only (the shadow passes write no colour: the colour target is a dummy at physical 0)
+    const bool to_cascade = g_sun_pass.active && zeta == 1 && want_depth;
+    if (to_cascade) want_color = false, out.scale = float(g_sun_pass.which ? g_q.shadow_scale : g_q.near_scale);
     if (want_color && color) {
         uint32_t address = ResolveDma(s.Reg(SET_CONTEXT_DMA_COLOR)) + s.Reg(SET_SURFACE_COLOR_OFFSET);
         out.color = GetTarget(address, color, out.width, out.height, pitch & 0xFFFF, swizzled, out.scale, out.samples,
@@ -868,10 +952,18 @@ Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool ref
     }
     if (want_depth && zeta) {
         uint32_t address = ResolveDma(s.Reg(SET_CONTEXT_DMA_ZETA)) + s.Reg(SET_SURFACE_ZETA_OFFSET);
-        if (to_near) address += kNearTag;  // PC shadows
+        const uint32_t guest = address;
+        if (to_cascade) address += kCascadeTag * uint32_t(1 + 2 * g_sun_pass.view + g_sun_pass.which);  // PC shadows
         out.depth = GetDepth(address, out.width, out.height, zeta == 1, out.scale, out.samples, out.wide);
-        if (to_near) g_last_near = out.depth;  // PC shadows
-        else if (zeta == 1) g_last_shadow_address = address, g_last_shadow_width = out.width, g_last_far = out.depth;
+        if (to_cascade && out.depth) {  // PC shadows: the pass's maps
+            int i = 0;
+            while (i < g_sun_pass.maps && g_sun_pass.address[i] != guest) i++;
+            if (i < 4) {
+                g_sun_pass.address[i] = guest, g_sun_pass.target[i] = out.depth;
+                g_sun_pass.maps = std::max(g_sun_pass.maps, i + 1);
+            }
+        }
+        if (zeta == 1 && g_cascade_trace.from >= 0) g_cascade_trace.Target(address, to_cascade);  // diagnostics
     }
     const float sx = float(out.scale) * out.wide;
     out.clip.left = LONG(out.clip.left * sx + 0.5f), out.clip.right = LONG(out.clip.right * sx + 0.5f);
@@ -1619,6 +1711,16 @@ ID3D11ShaderResourceView* DepthView(DepthTarget& d);
 // a depth texture on a depth target's memory (a shadow map the GPU just rendered): the host depth itself
 ID3D11ShaderResourceView* DepthTexture(const texture::Desc& d, float* scale, psh::Sampler& kind, int stage) {
     DepthTarget* found = nullptr;
+    // PC shadows: a guest map the sun's passes stand in for: the map of the last pass (and with it the other cascade)
+    if (g_q.near_scale && (d.color == 0x2C || d.color == 0x30))
+        for (const ShadowBinding& b : g_bindings)
+            if (b.current && b.address == d.address && b.current->srv && b.current->width >= d.width &&
+                b.current->height >= d.height) {
+                found = b.current;
+                if (stage >= 0 && stage < 4) g_stage_binding[stage] = &b;
+                break;
+            }
+    if (!found)
     for (auto& t : g_depths)
         if (t->address == d.address && (t->srv || !t->z16) && t->width >= d.width && t->height >= d.height &&
             (!found || t->last_write > found->last_write))
@@ -1657,7 +1759,8 @@ ID3D11ShaderResourceView* GetTextureOf(const State& s, int stage, psh::Sampler& 
     g_texture_entry = nullptr;  // button prompts
     uint32_t base = 0x40 * stage;
     g_stage_video[stage] = 0;  // PC features: fmv_scale
-    g_stage_depth[stage] = nullptr;  // PC shadows
+    g_stage_depth[stage] = nullptr, g_stage_binding[stage] = nullptr;  // PC shadows
+    g_stage_signs[stage] = 0;  // signed textures (GitHub #14)
     uint32_t control0 = s.Reg(SET_TEXTURE_CONTROL0 + base);
     if (!(control0 & 0x40000000)) return nullptr;
     uint32_t format = s.Reg(SET_TEXTURE_FORMAT + base);
@@ -1713,6 +1816,15 @@ ID3D11ShaderResourceView* GetTextureOf(const State& s, int stage, psh::Sampler& 
 
     uint64_t key = Mix(Mix(Mix(d.address, d.color), Mix(d.width, d.height)), Mix(Mix(d.depth, d.levels),
                                                                                   Mix(d.cube, Mix(d.pitch, d.palette))));
+    // ---- signed textures (GitHub #14): decoded with the signed channels as offset binary, a texture of its own
+    // (not with the texture dump/replacement, whose files hold the game's bytes, nor for DXT kept as blocks) ----
+    static const bool no_signed = GetEnvironmentVariableA("FCI_NO_SIGNED_FILTER", nullptr, 0) > 0;
+    const uint8_t signs = no_signed || texpack::Active() || texture::BlockFormat(d)
+                              ? 0
+                              : uint8_t(s.Reg(SET_TEXTURE_FILTER + base) >> 28);
+    if (signs) key = Mix(key, 0x5167u | uint32_t(signs) << 16);
+    g_stage_signs[stage] = signs;
+    // ---- end signed textures ----
     TextureEntry& entry = g_textures[key];
     g_texture_entry = &entry, g_texture_desc = d;  // button prompts
     // PC features, fmv_scale: Bink fills the title's and menus' videos into linear textures (not render targets)
@@ -1742,6 +1854,12 @@ ID3D11ShaderResourceView* GetTextureOf(const State& s, int stage, psh::Sampler& 
         }
     }
     auto images = texture::Decode(d);
+    if (signs) {  // ---- signed textures (GitHub #14): A, R, G, B signed = bits 0..3 -> BGRA8 bytes 3, 2, 1, 0 ----
+        const uint32_t flip = (signs & 1 ? 0x80000000u : 0) | (signs & 2 ? 0x00800000u : 0) |
+                              (signs & 4 ? 0x00008000u : 0) | (signs & 8 ? 0x00000080u : 0);
+        for (texture::Image& image : images)
+            for (uint32_t& pixel : image.pixels) pixel ^= flip;
+    }
     entry.srv = images.empty() ? nullptr : CreateTexture(d, kind, images);
     if (made_at) rt::hitch::Note(rt::hitch::kTexture, rt::hitch::Now() - made_at, size);
     if (texpack::Active()) PackCreated(entry, d, kind, size, images);  // ---- texture dump/replacement ----
@@ -1753,7 +1871,10 @@ ID3D11ShaderResourceView* GetTextureOf(const State& s, int stage, psh::Sampler& 
 ID3D11ShaderResourceView* GetTexture(const State& s, int stage, psh::Sampler& kind, float* scale) {
     ID3D11ShaderResourceView* srv = GetTextureOf(s, stage, kind, scale);
     if (srv && g_texture_entry && g_texture_entry->prompt_page)
-        if (ID3D11ShaderResourceView* page = prompt_icons::Page(g_device.Get(), g_texture_desc, g_q.scale)) return page;
+        if (ID3D11ShaderResourceView* page = prompt_icons::Page(g_device.Get(), g_texture_desc, g_q.scale)) {
+            g_stage_signs[stage] = 0;  // signed textures (GitHub #14): our page, plain bytes
+            return page;
+        }
     return srv;
 }
 // ---- end button prompts ----
@@ -2947,21 +3068,30 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     PixelConstants pc{};
     uint32_t programs = s.Reg(SET_SHADER_STAGE_PROGRAM);
     for (DepthTarget*& t : g_stage_depth) t = nullptr;
+    for (const ShadowBinding*& b : g_stage_binding) b = nullptr;
     for (int i = 0; i < 4; i++) {
         pc.tex_scale[i][0] = pc.tex_scale[i][1] = 1.0f;
         if (!StageSamples((programs >> (5 * i)) & 0x1F)) continue;
         psh::Sampler kind = psh::Sampler::k2D;
         srvs[i] = GetTexture(s, i, kind, pc.tex_scale[i]);
         config.sampler[i] = kind;
+        config.signs[i] = srvs[i] ? g_stage_signs[i] : 0;  // signed textures (GitHub #14)
         samplers[i] = GetSampler(s, i);
     }
     // ---- PC shadows: a receiver of a shadow map with a near cascade reads that too (t4, b5) ----
-    bool cascade = false;
-    for (int i = 0; i < 4; i++)
-        if (config.sampler[i] == psh::Sampler::kShadow && g_stage_depth[i] && g_cascade.on &&
-            g_stage_depth[i]->address == g_cascade.far_address)
-            cascade = true;
+    const ShadowBinding* cascade_of = nullptr;
+    for (int i = 0; i < 4 && !cascade_of; i++)
+        if (config.sampler[i] == psh::Sampler::kShadow && g_stage_binding[i] && g_stage_binding[i]->cascade)
+            cascade_of = g_stage_binding[i];
+    const bool cascade = cascade_of != nullptr;
     config.cascade = cascade;
+    if (g_cascade_trace.from >= 0)  // diagnostics: FCI_TRACE_CASCADE
+        for (int i = 0; i < 4; i++)
+            if (config.sampler[i] == psh::Sampler::kShadow && g_stage_depth[i]) {
+                if (cascade) g_cascade_trace.with++;
+                else g_cascade_trace.without++, g_cascade_trace.without_address = g_stage_depth[i]->address;
+                break;
+            }
     // ---- end PC shadows ----
     // (with color writes off, as in the shadow map passes over a dummy color target at physical 0 and the
     // visibility tests, the color target is bound but not refreshed from guest memory: that was a 4 MB upload and
@@ -3336,11 +3466,11 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     if (cascade) {
         static Constants<CascadeConstants> cascade_constants;
         CascadeConstants cc{};
-        std::memcpy(cc.n, g_cascade.n, sizeof cc.n);
-        std::memcpy(cc.f, g_cascade.f, sizeof cc.f);
+        std::memcpy(cc.n, cascade_of->n, sizeof cc.n);
+        std::memcpy(cc.f, cascade_of->f, sizeof cc.f);
         cc.fade[0] = kCascadeFade;
         ID3D11Buffer* b = cascade_constants.Update(cc);
-        ID3D11ShaderResourceView* maps[2] = {g_cascade.near_map->srv.Get(), g_cascade.far_map->srv.Get()};
+        ID3D11ShaderResourceView* maps[2] = {cascade_of->near_map->srv.Get(), cascade_of->far_map->srv.Get()};
         g_context->PSSetConstantBuffers(5, 1, &b);
         g_context->PSSetShaderResources(4, 2, maps);
     }
@@ -3430,7 +3560,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         g_context->DrawIndexed(UINT(indices.size()), 0, 0);
     }
     }
-    if (g_near_pass && surf.depth && surf.depth->z16) g_cascade_draws++;  // PC shadows: statistics
+    if (g_sun_pass.active && !g_sun_pass.which && surf.depth && surf.depth->z16) g_cascade_draws++;  // PC shadows: statistics
     if (depth_read_only) {  // (the depth's view off the stages before it is writable again)
         ID3D11ShaderResourceView* none[4] = {};
         g_context->PSSetShaderResources(0, 4, none);
@@ -3775,13 +3905,11 @@ void SetHle(bool on) {
         g_q.shadow_scale = uint32_t(std::clamp(std::lround(density * k), 1l, 8l));
         rt::Log("render: shadow distance x%.2f: shadow maps %ux (texels %.2fx the size at shadow_scale %u)", k,
                 g_q.shadow_scale, density * k / g_q.shadow_scale, density);
-        // shadow cascades: the console's square in a near map at shadow_scale, the rest as before
-        // off by default since 0.1.6: near and far maps on alternate frames flickered on players' machines (GitHub #16)
-        const std::string cascades = settings::String("shadow_cascades", "off");
-        if (k >= 2.0f && (cascades == "on" || cascades == "1")) {
+        // shadow cascades: the console's square in a near map at shadow_scale, the rest as before (switched live:
+        // SetShadowCascades)
+        if (k >= 2.0f) {
             g_q.near_scale = density;
-            rt::Log("render: shadow cascades: near map %ux%u over the console's square (the game's shadow pass "
-                    "alternating near and far)", 1024 * density, 1024 * density);
+            SetShadowCascades(CascadesSetting());
         }
     }
     {
@@ -3836,6 +3964,18 @@ void Present(uint32_t front) {
     g_before_video.clear();
     float aspect = (shown && shown->wide != 1.0f && g_frame_3d) || video ? pcmode::Aspect() : 4.0f / 3.0f;
     if (g_hud_trace.On()) g_hud_trace.Frame(aspect);  // diagnostics: FCI_TRACE_HUD
+    g_cascade_trace.Frame();                          // diagnostics: FCI_TRACE_CASCADE
+    {  // diagnostics: FCI_SHADOW_CASCADES_FLIP=<s>: shadow_cascades switched every s seconds (the menu's live switch)
+        static const double flip = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("FCI_SHADOW_CASCADES_FLIP", v, sizeof v) ? std::atof(v) : 0.0;
+        }();
+        static auto next = std::chrono::steady_clock::now();
+        if (flip > 0 && g_q.near_scale && std::chrono::steady_clock::now() >= next) {
+            next = std::chrono::steady_clock::now() + std::chrono::milliseconds(int64_t(flip * 1000));
+            SetShadowCascades(!g_cascades_on.load());
+        }
+    }
     g_frame_3d = false;
     g_frame_video = false;
     g_post_3d = false;
@@ -3869,40 +4009,82 @@ bool SyncToGuest(uint32_t address, bool late) {
 void SetGammaRamp(const uint8_t ramp[768]) { present::SetGamma(ramp); }
 
 // ---- PC shadows: shadow cascades (see above; called in push buffer order) ----
-bool ShadowCascades() { return g_q.near_scale != 0; }
-void BeginNearShadowPass() {
-    g_near_pass = true;
+bool ShadowCascades() { return g_q.near_scale != 0 && g_cascades_on.load(std::memory_order_relaxed); }
+bool CascadesSetting() {
+    const std::string v = settings::String("shadow_cascades", "off");
+    return v == "on" || v == "1";
+}
+void SetShadowCascades(bool on) {
+    if (g_cascades_on.exchange(on) == on && g_cascades_logged) return;
+    g_cascades_logged = true;
+    if (!g_q.near_scale)
+        rt::Log("render: shadow cascades %s (no effect: they need shadow_distance 2 or more at the start)", on ? "on" : "off");
+    else
+        rt::Log("render: shadow cascades %s: near map %ux%u over the console's square (the game's shadow pass "
+                "alternating near and far)", on ? "on" : "off", 1024 * g_q.near_scale, 1024 * g_q.near_scale);
+}
+void DropSunShadows() {
+    for (ShadowBinding& b : g_bindings) b = ShadowBinding{};
+    for (ViewMaps& v : g_view_maps) v = ViewMaps{};
+    g_sun_pass.active = false;
+}
+void BeginSunShadowPass(int view, bool near_pass) {
+    g_sun_pass = SunPass{};
+    g_sun_pass.active = true, g_sun_pass.view = view & 3, g_sun_pass.which = near_pass ? 0 : 1;
     g_ds.Invalidate();  // performance: state cache (other targets follow)
 }
-void EndNearShadowPass() { g_near_pass = false; }
-void SetShadowCascade(bool on, bool near_now, const float m[3][4]) {
-    g_cascade.on = on && g_last_near && g_last_far && g_last_near->srv && g_last_far->srv;
-    g_cascade.near_map = g_last_near;
-    g_cascade.far_map = g_last_far;
-    g_cascade.far_address = g_last_shadow_address;
-    // this frame's map: as the receivers address it; the other: m (from the game's two cameras) about the XDK's pixel
-    // centre (+0.53125 guest texels in c59: both maps hold their content offset by it, m maps the cameras' 0.5 +- 0.5
-    // clip)
-    static const float kSame[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
-    float other[3][4];
-    std::memcpy(other, m, sizeof other);
-    if (g_last_shadow_width) {
-        const float g = 0.53125f / float(g_last_shadow_width);
-        other[0][3] += g - g * (other[0][0] + other[0][1]);
-        other[1][3] += g - g * (other[1][0] + other[1][1]);
-        other[2][3] -= g * (other[2][0] + other[2][1]);
+void EndSunShadowPass(bool sun, bool other, const float m[3][4]) {
+    if (!g_sun_pass.active) return;
+    const SunPass pass = g_sun_pass;
+    g_sun_pass.active = false;
+    ViewMaps& vm = g_view_maps[pass.view];
+    // this pass's maps for their receivers; with one map of the sun's and the other cascade's map of the view's pass
+    // before, both
+    const bool one = pass.maps == 1 && sun;
+    if (!one || vm.address != pass.address[0]) vm = ViewMaps{};
+    if (one) vm.address = pass.address[0], vm.map[pass.which] = pass.target[0];
+    const bool both = one && other && vm.map[0] && vm.map[1] && vm.map[0]->srv && vm.map[1]->srv;
+    for (int i = 0; i < pass.maps; i++) {
+        ShadowBinding* b = nullptr;
+        for (ShadowBinding& x : g_bindings)
+            if (x.address == pass.address[i] || (!b && !x.current)) b = &x;
+        if (!b) b = &g_bindings[0];
+        *b = ShadowBinding{};
+        b->address = pass.address[i], b->current = pass.target[i];
+        if (!both) continue;
+        b->cascade = true, b->near_map = vm.map[0], b->far_map = vm.map[1];
+        // this frame's map: as the receivers address it; the other: m (from the game's two cameras) about the XDK's
+        // pixel centre (+0.53125 guest texels in c59: both maps hold their content offset by it, m maps the cameras'
+        // 0.5 +- 0.5 clip)
+        static const float kSame[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+        float o[3][4];
+        std::memcpy(o, m, sizeof o);
+        const float g = 0.53125f / float(pass.target[i]->width);
+        o[0][3] += g - g * (o[0][0] + o[0][1]);
+        o[1][3] += g - g * (o[1][0] + o[1][1]);
+        o[2][3] -= g * (o[2][0] + o[2][1]);
+        std::memcpy(b->n, pass.which ? o : kSame, sizeof b->n);
+        std::memcpy(b->f, pass.which ? kSame : o, sizeof b->f);
     }
-    std::memcpy(g_cascade.n, near_now ? kSame : other, sizeof g_cascade.n);
-    std::memcpy(g_cascade.f, near_now ? other : kSame, sizeof g_cascade.f);
+    if (g_cascade_trace.from >= 0)  // diagnostics: n/f with both maps, N/F this one only, s not the sun, digit: maps
+        g_cascade_trace.Pass(pass.maps != 1 ? char('0' + std::min(pass.maps, 9))
+                             : !sun ? 's' : !both ? (pass.which ? 'F' : 'N') : pass.which ? 'f' : 'n');
     static uint64_t frames = 0, draws = 0;
-    if (g_cascade.on && ++frames % 3000 == 1) {
-        rt::Log("render: shadow cascades: near map %ux%u, far %ux%u at %08X, %.1f near draws per frame (last 3000)",
-                HostWidthOf(g_last_near->width, g_last_near->scale, 1.0f),
-                HostHeightOf(g_last_near->height, g_last_near->scale),
-                HostWidthOf(g_last_far->width, g_last_far->scale, 1.0f), HostHeightOf(g_last_far->height, g_last_far->scale),
-                g_last_shadow_address, double(g_cascade_draws - draws) / (frames > 1 ? 3000 : 1));
+    if (both && ++frames % 3000 == 1) {
+        rt::Log("render: shadow cascades: view %d near map %ux%u, far %ux%u for %08X, %.1f near draws per frame "
+                "(last 3000)", pass.view, HostWidthOf(vm.map[0]->width, vm.map[0]->scale, 1.0f),
+                HostHeightOf(vm.map[0]->height, vm.map[0]->scale), HostWidthOf(vm.map[1]->width, vm.map[1]->scale, 1.0f),
+                HostHeightOf(vm.map[1]->height, vm.map[1]->scale), vm.address,
+                double(g_cascade_draws - draws) / (frames > 1 ? 3000 : 1));
         draws = g_cascade_draws;
     }
+}
+void DropSunShadow(int view) {
+    ViewMaps& vm = g_view_maps[view & 3];
+    for (ShadowBinding& b : g_bindings)
+        if (vm.address && b.address == vm.address) b = ShadowBinding{};
+    vm = ViewMaps{};
+    if (g_cascade_trace.from >= 0) g_cascade_trace.Pass('-');  // diagnostics
 }
 // ---- end PC shadows ----
 

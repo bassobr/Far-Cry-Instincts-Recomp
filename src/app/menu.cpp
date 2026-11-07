@@ -35,6 +35,7 @@
 #include "gpu/ao.h"
 #include "gpu/fps_overlay.h"
 #include "gpu/present.h"
+#include "gpu/renderer.h"  // PC shadows: shadow_cascades
 #include "gpu/water.h"  // PC water
 #include "hle/host_pad.h"  // controllers (SDL3)
 #include "hle/pc_input.h"
@@ -286,9 +287,9 @@ const Setting kSettings[] = {
     {"shadow_distance", "SHADOW DISTANCE", "1", [] { return Range(1, 8, 1, 1, 0, "x"); }, When::Restart,
      "Reach of the sun's shadows, times the console's (~15 m)."},
     {"shadow_cascades", "SHADOW CASCADES", "off",
-     [] { return Choices{{"off", "OFF (DEFAULT)"}, {"on", "ON (EXPERIMENTAL)"}}; }, When::Restart,
-     "Experimental, with shadow distance 2x or more: the console's shadows near you in a map of their own (sharp, "
-     "every caster), the far ones as before. The game draws near and far on alternate frames, which can flicker."},
+     [] { return Choices{{"off", "OFF (DEFAULT)"}, {"on", "ON"}}; }, When::Live,
+     "With shadow distance 2x or more (set at start): the console's shadows near you in a map of their own (sharp, "
+     "every caster), the far ones as before; the game draws near and far on alternate frames. Switches at once."},
     {"shadow_filter", "SHADOW FILTER", "soft",
      [] { return Choices{{"soft", "SOFT (DEFAULT)"}, {"sharp", "SHARP (CONSOLE)"}}; }, When::Restart,
      "Soft shadow edges, or the NV2A's 2x2 filter."},
@@ -492,6 +493,7 @@ void ApplyLive(const Setting& s) {
                 settings::Set(axis, settings::String("mouse_sensitivity", "1"));
         hle::pc::ReloadMouse();
     }
+    else if (key == "shadow_cascades") gpu::render::SetShadowCascades(gpu::render::CascadesSetting());  // PC shadows
     else if (key == "pause_on_focus_loss") SetPauseOnFocusLoss(settings::Bool("pause_on_focus_loss", false));
     else if (key == "button_prompts") hle::prompts::Reload();
     else if (key == "pad_dead_zone" || key == "pad_rumble") hle::host::ReloadOptions();

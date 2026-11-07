@@ -38,6 +38,11 @@ float2 signed2(float2 x) {
     float2 v = round(x * 255);
     return (v >= 128 ? v - 256 : v) / 127;
 }
+// signed textures (GitHub #14): the same for a filtered signed texel (fractions kept; 127..128 does not occur)
+float2 signed2f(float2 x) {
+    float2 v = x * 255;
+    return (v > 127.5 ? v - 256 : v) / 127;
+}
 )";
 
 const char* RegisterName(uint32_t reg) {
@@ -161,6 +166,9 @@ uint64_t Key(const State& s, const Config& config) {
     }
     if (shadow) mix(s.Reg(SET_SHADOW_COMPARE_FUNC));
     if (shadow && config.cascade) mix(0xCA5CADE5);  // PC shadows: cascades
+    // signed textures (GitHub #14)
+    const uint32_t signs = config.signs[0] | config.signs[1] << 4 | config.signs[2] << 8 | config.signs[3] << 12;
+    if (signs) mix(0x5167u << 16 | signs);
     return h;
 }
 
@@ -285,7 +293,7 @@ std::string Generate(const State& s, const Config& config) {
             // (c / d), at a multiple of the guest's size: each of the four guest texels around the point is read at
             // its centre, turned back into the guest's depth and compared as the NV2A compares a depth texel with
             // r/q (texel <op> reference, as for the shadow maps below), weighted as its bilinear filter weights them;
-            // with a point filter (the ocean's) only the texel the point lies in
+            // with a point filter (the ocean's) only the host texel the point lies in (below)
             const bool ms = sampler == Sampler::kSceneDepthMS;
             const bool point = ((s.Reg(SET_TEXTURE_FILTER + 0x40 * i) >> 24) & 0xF) == 1;
             std::string op;
@@ -300,6 +308,12 @@ std::string Generate(const State& s, const Config& config) {
             default: op = "true"; break;
             }
             if (program != 1 && program != 2) op = "true";  // (not seen: no comparison, the depth itself)
+            // GitHub #14: with the point filter the host texel the point lies in, not the centre of the guest texel:
+            // the ocean's coordinates are its own pixel, so on the console each pixel compared its own depth; read
+            // per guest texel that became blocks of scale x scale host pixels (the same texel at 1x)
+            char point_base[160];
+            snprintf(point_base, sizeof point_base,
+                     "        base = (floor(p.xy * tex_scale[%d].xy) + 0.5) / tex_scale[%d].xy - 0.5, f = 0;\n", i, i);
             char depth[2048];
             snprintf(depth, sizeof depth,
                      "    {\n"
@@ -319,7 +333,7 @@ std::string Generate(const State& s, const Config& config) {
                      "        t%d = %s;\n"
                      "    }\n",
                      i, i, i, i, ms ? ", n" : "", i, ms ? ", n" : "",
-                     point ? "        base = floor(p.xy), f = 0;\n" : "", point ? 1 : 4, i, i, ms ? "at, 0" : "int3(at, 0)", i, i, i,
+                     point ? point_base : "", point ? 1 : 4, i, i, ms ? "at, 0" : "int3(at, 0)", i, i, i,
                      op.c_str(), i,
                      (program == 1 || program == 2)
                          ? "dot(lit, float4((1 - f.x) * (1 - f.y), f.x * (1 - f.y), (1 - f.x) * f.y, f.x * f.y)).xxxx"
@@ -453,10 +467,10 @@ std::string Generate(const State& s, const Config& config) {
         case 6:  // bump environment map, offsets from an earlier stage
         case 7:
             snprintf(line, sizeof line,
-                     "    float2 d%d = signed2(t%d.bg);\n"
+                     "    float2 d%d = %s(t%d.bg);\n"
                      "    float4 u%d = T[%d] + float4(d%d.x * bump[%d].x + d%d.y * bump[%d].z, "
                      "d%d.x * bump[%d].y + d%d.y * bump[%d].w, 0, 0);\n",
-                     i, prev, i, i, i, i, i, i, i, i, i, i);
+                     i, (config.signs[prev] & 0xC) ? "signed2f" : "signed2", prev, i, i, i, i, i, i, i, i, i, i);
             out += line;
             snprintf(coords, sizeof coords, "u%d", i);
             sample(coords);
@@ -480,6 +494,20 @@ std::string Generate(const State& s, const Config& config) {
         }
         // TEXTURE_CONTROL0 ALPHA_KILL: a texel with alpha 0 kills the pixel (cut-out foliage and fences)
         bool samples = program == 1 || program == 2 || program == 3 || program == 6 || program == 7 || program >= 15;
+        // ---- signed textures (GitHub #14): the channels filtered as offset binary back to the two's complement
+        // bytes the stage gave before (unchanged at texel centres, filtered in the signed values in between) ----
+        if (samples && config.signs[i]) {
+            const uint8_t m = config.signs[i];
+            snprintf(line, sizeof line,
+                     "    {\n"
+                     "        float4 sv = t%d * 255 - 128;\n"
+                     "        t%d = bool4(%s, %s, %s, %s) ? (sv < 0 ? sv + 256 : sv) / 255 : t%d;\n"
+                     "    }\n",
+                     i, i, m & 2 ? "true" : "false", m & 4 ? "true" : "false", m & 8 ? "true" : "false",
+                     m & 1 ? "true" : "false", i);
+            out += line;
+        }
+        // ---- end signed textures ----
         if (samples && (s.Reg(SET_TEXTURE_CONTROL0 + 0x40 * i) & kTextureAlphaKill)) {
             snprintf(line, sizeof line, "    if (t%d.a == 0) discard;\n", i);
             out += line;

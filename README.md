@@ -201,7 +201,7 @@ there.
 | `aniso` | `16` | Anisotropic filtering, 1–16 (1 = off) |
 | `shadow_scale` | `2` (Steam Deck `4`) | Shadow map resolution, 1–8 times the console's |
 | `shadow_distance` | `1` | Sun shadow range, 1–8 times the console's (the map grows with it) |
-| `shadow_cascades` | `off` | Experimental, with `shadow_distance` 2 or more: the shadows near you get their own map, drawn as on the console at `shadow_scale`, and the far ones continue in the large map. The two maps are drawn on alternate frames, which can make near shadows flicker |
+| `shadow_cascades` | `off` | With `shadow_distance` 2 or more: the shadows near you get their own map, drawn as on the console at `shadow_scale`, and the far ones continue in the large map (the two maps are drawn on alternate frames). Switches at once in the F10 menu |
 | `shadow_filter` | `soft` | `soft` or `sharp` (as the console) |
 | `ao` | `ssao` (Steam Deck `gtao`) | Ambient occlusion: `off`, `ssao`, `gtao` |
 | `ao_strength` | `1` | 0–4 |

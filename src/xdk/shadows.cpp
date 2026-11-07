@@ -24,7 +24,9 @@
 // the next with k times it, as before (a second pass in the same frame draws no casters: tried first, the far map
 // stayed empty). After each pass the pass's sun camera (a local of the pass, read where its frame was) gives its
 // view-projection; the renderer gets the map from this pass's texture coordinates to the other map's, drawn the
-// frame before (gpu/renderer.cpp, "shadow cascades").
+// frame before (gpu/renderer.cpp, "shadow cascades"). The radius goes back to k times the game's after every pass:
+// the rest of the frame reads it too, and with the console's radius left there after a near pass the receivers a few
+// metres away were shaded without their shadow in every other frame (GitHub #16, flicker in 0.1.5).
 #include <windows.h>
 
 #include <cmath>
@@ -103,6 +105,24 @@ void ToTexture(const double clip[4][4], double out[4][4]) {
     Mul(kTex, clip, out);
 }
 
+// shadow cascades: per view (split screen: one pass each, told apart by the view's environment)
+struct View {
+    uint32_t env = 0;
+    uint64_t passes = 0;        // this view's passes so far
+    uint64_t done[2] = {};      // the pass that last drew each map (near, far) with the sun, 0 = none
+    double clip[2][4][4] = {};  // and its camera
+};
+View g_views[4];
+
+View& ViewOf(uint32_t env) {
+    View* v = nullptr;
+    for (View& x : g_views)
+        if (x.env == env || (!v && !x.env)) v = &x;
+    if (!v) v = &g_views[0], *v = View{};
+    v->env = env;
+    return *v;
+}
+
 }  // namespace
 
 HLE_STDCALL(Game_ShadowPass, 7) {
@@ -118,34 +138,39 @@ HLE_STDCALL(Game_ShadowPass, 7) {
         }
     }
     // ---- shadow cascades: the near pass (the console's radius) and the far one on alternate frames ----
-    if (k >= 2.0f && radius > 0 && gpu::render::ShadowCascades()) {
-        // per view (split screen: one pass each)
-        struct View {
-            uint32_t env = 0;
-            uint64_t passes = 0;           // this view's passes so far
-            uint64_t done[2] = {};         // the pass that last drew each map (near, far), 0 = none
-            double clip[2][4][4] = {};     // and its camera
-        };
-        static View views[4];
-        View* v = nullptr;
-        for (View& x : views)
-            if (x.env == env || (!v && !x.env)) v = &x;
-        if (!v) v = &views[0], *v = View{};
-        v->env = env;
+    const bool cascades = gpu::render::ShadowCascades();
+    static bool cascades_before = false;
+    if (cascades_before && !cascades) {  // switched off in the F10 menu: the game's own maps from here on
+        for (View& x : g_views) x = View{};
+        xdk::RenderMark([] { gpu::render::DropSunShadows(); });
+    }
+    cascades_before = cascades;
+    if (k >= 2.0f && radius > 0 && cascades) {
+        View* v = &ViewOf(env);
+        const int view = int(v - g_views);
         const uint64_t pass = ++v->passes;
         const int which = pass & 1;  // 0: near, 1: far
         const float r_pass = which ? radius * k : radius;
         const uint32_t cam = c.esp - kPassCamera;
         SetF(cam + kCamWidth, 0);  // (so that a pass without the sun is told apart)
         SetF(env + kEnvRadius, r_pass);
-        if (!which) xdk::RenderMark([] { gpu::render::BeginNearShadowPass(); });
+        xdk::RenderMark([view, which] { gpu::render::BeginSunShadowPass(view, !which); });
         const uint32_t r = xdk::CallOriginal(c, GUEST_ORIG(Game_ShadowPass));
-        if (!which) xdk::RenderMark([] { gpu::render::EndNearShadowPass(); });
+        // the rest of the frame sees the far radius in every frame, whichever pass ran: the receivers' shading
+        // depends on it (GitHub #16, second report: with the near pass's radius left there, objects and ground a few
+        // metres away lost their shadow in every other frame although both maps held it).
+        // FCI_SHADOW_CASCADE_RADIUS=pass keeps the pass's radius (0.1.5, to reproduce)
+        static const bool pass_radius = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("FCI_SHADOW_CASCADE_RADIUS", v, sizeof v) && !std::strcmp(v, "pass");
+        }();
+        if (!pass_radius) SetF(env + kEnvRadius, radius * k);
         double clip[4][4];
-        bool ok = SunCamera(cam, SquareSide(env, r_pass), clip);
+        const bool sun = SunCamera(cam, SquareSide(env, r_pass), clip);
+        bool ok = sun;
         const float far_plane = xdk::GF(cam + 0x34);
         // the other map's texture coordinates from this one's: T other_clip this_clip^-1 T^-1 (the other map was drawn
-        // by the pass before, with its camera)
+        // by the view's pass before, with its camera)
         float m[3][4] = {};
         if (ok) {
             std::memcpy(v->clip[which], clip, sizeof clip);
@@ -174,13 +199,14 @@ HLE_STDCALL(Game_ShadowPass, 7) {
                     far_plane, m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0],
                     m[2][1], m[2][2], m[2][3]);
         }
-        const bool near_now = !which;
-        xdk::RenderMark([ok, near_now, m] { gpu::render::SetShadowCascade(ok, near_now, m); });
+        xdk::RenderMark([sun, ok, m] { gpu::render::EndSunShadowPass(sun, ok, m); });
         return r;
     }
-    if (k >= 2.0f && gpu::render::ShadowCascades()) {  // no sun this frame: no near map for the receivers
-        static const float none[3][4] = {};
-        xdk::RenderMark([] { gpu::render::SetShadowCascade(false, false, none); });
+    if (k >= 2.0f && cascades) {  // no sun this frame: the receivers read the game's maps
+        View& v = ViewOf(env);
+        v.done[0] = v.done[1] = 0;
+        const int view = int(&v - g_views);
+        xdk::RenderMark([view] { gpu::render::DropSunShadow(view); });
     }
     // ---- end shadow cascades ----
     // the frame copies the eased radius here before every pass, so this does not compound
