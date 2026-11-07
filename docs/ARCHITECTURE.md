@@ -90,8 +90,10 @@ Steam Deck OLED (Proton 10, 8 compilers) about 5.8 min. It needs about 1 GB of d
      path to the MMIO emulation; stack accesses and accesses through a base register that cannot reach it skip the
      check.
    - Status flags are local variables. A liveness analysis over the function's control flow decides per instruction
-     which flags are read later; only those are computed. Flags are treated as dead across calls; on a tail jump
-     they are handed over in `Cpu`.
+     which flags are read later; only those are computed. A whole-program pass works out, to a fixpoint, which flags
+     each function reads on entry and which flags its callers read after it returns; only there are flags handed
+     over in `Cpu` across calls and returns (the hand-written x87 math of the C runtime relies on it). On a tail
+     jump they are handed over as far as the target reads them.
    - Branches inside a function are `goto`, jump tables `switch`, jumps into other functions tail calls. Loop back
      edges are preemption points for the scheduler. Direct calls call `f_XXXXXXXX` directly, indirect ones go through
      `rt::CallIndirect` (the table lookup inline) or `rt::Call`, kernel imports through `rt::KernelCall(ordinal)`.

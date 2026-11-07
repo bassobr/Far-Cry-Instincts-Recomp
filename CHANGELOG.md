@@ -2,6 +2,12 @@
 
 ## 0.1.4 (unreleased)
 
+- The water surface seen from below no longer flickers (#9). A recompiler bug: status flags were not passed between a
+  function and the code it calls or returns to. The C runtime's hand-written x87 `acos` and `asin` rely on that, so
+  they returned wrong values and sometimes NaN; under water the game computes the window to the sky with `acos`,
+  and a NaN made the whole surface opaque for a frame. The recompiler now carries flags across calls and returns
+  where the code reads them. Every `acos`/`asin` in the game was affected; the view up through the surface now
+  shows the full window to the sky.
 - Crash on a sniper shot fixed (#7): the smoke trail of the Barrett (AI snipers) and the SL8 fades out with the
   game's `tanh`, whose handlers sit behind byte-packed tables that the recompiler did not follow. It now follows code
   pointers in such tables (11 more functions; nothing else in the generated code changes). The game code is rebuilt

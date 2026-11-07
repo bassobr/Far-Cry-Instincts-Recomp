@@ -140,17 +140,58 @@ void FunctionWriter::Prepare() {
     }
 }
 
-// backward dataflow over the function's instructions; flags are dead across calls and at exits
+// the target of a direct call (0 for others)
+static uint32_t DirectCallTarget(const Decoded& d) {
+    if (d.ins.meta.category != ZYDIS_CATEGORY_CALL) return 0;
+    const auto& op0 = d.ops[0];
+    if (op0.type != ZYDIS_OPERAND_TYPE_IMMEDIATE || !op0.imm.is_relative) return 0;
+    return uint32_t(d.va + d.ins.length + int32_t(op0.imm.value.s));
+}
+
+// the flags live where this instruction leaves the function without a call: what the function jumps (or falls) into
+// reads on entry, all of them where that is not known (indirect jumps, the default of a jump table)
+uint32_t FunctionWriter::ExitFlags(const Decoded& d) const {
+    if (!d.exits) return 0;
+    const auto& functions = cg_.analysis().functions;
+    const auto& op0 = d.ops[0];
+    const uint32_t next = d.va + d.ins.length;
+    const bool rel = op0.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && op0.imm.is_relative;
+    const uint32_t target = rel ? uint32_t(next + int32_t(op0.imm.value.s)) : 0;
+    uint32_t live = 0;
+    auto to = [&](uint32_t t) { live |= functions.count(t) ? cg_.FlagsAtEntry(t) : kStatusFlags; };
+    switch (d.ins.meta.category) {
+    case ZYDIS_CATEGORY_UNCOND_BR:
+        if (!rel) return kStatusFlags;
+        to(target);
+        return live;
+    case ZYDIS_CATEGORY_COND_BR:
+        if (!rel) return kStatusFlags;
+        if (!index_.count(target)) to(target);
+        if (d.falls_through && !index_.count(next)) to(next);
+        return live;
+    default:
+        if (d.falls_through && !index_.count(next)) to(next);
+        else live = kStatusFlags;
+        return live;
+    }
+}
+
+// backward dataflow over the function's instructions; flags are live where the function leaves without a call as far
+// as the code there reads them on entry, at returns as far as a caller reads them (both AnalyzeFlags), and across a
+// call as far as the callee reads them on entry
 void FunctionWriter::Liveness() {
     std::vector<uint32_t> live_in(insns_.size(), 0);
+    const uint32_t at_ret = cg_.ReturnsFlags(fn_.start);
     bool changed = true;
     while (changed) {
         changed = false;
         for (size_t i = insns_.size(); i-- > 0;) {
             auto& d = insns_[i];
-            uint32_t out = d.exits ? kStatusFlags : 0;
+            uint32_t out = ExitFlags(d);
+            if (d.ins.meta.category == ZYDIS_CATEGORY_RET) out |= at_ret;
             for (uint32_t s : d.succ) out |= live_in[index_[s]];
-            uint32_t in = d.ins.meta.category == ZYDIS_CATEGORY_CALL ? 0 : Tested(d.ins) | (out & ~Defined(d.ins));
+            uint32_t in = d.ins.meta.category == ZYDIS_CATEGORY_CALL ? cg_.FlagsAtEntry(DirectCallTarget(d))
+                                                                        : Tested(d.ins) | (out & ~Defined(d.ins));
             if (out != d.live_out || in != live_in[i]) {
                 d.live_out = out;
                 live_in[i] = in;
@@ -158,6 +199,79 @@ void FunctionWriter::Liveness() {
             }
         }
     }
+    entry_flags_ = index_.count(fn_.start) ? live_in[index_[fn_.start]] : 0;
+}
+
+uint32_t FunctionWriter::FlagSummary(std::vector<std::pair<uint32_t, uint32_t>>* returns,
+                                     std::vector<uint32_t>* targets, std::vector<uint32_t>* tails) {
+    Prepare();
+    Liveness();
+    const auto& functions = cg_.analysis().functions;
+    for (const auto& d : insns_) {
+        if (uint32_t t = DirectCallTarget(d); t && functions.count(t)) {
+            targets->push_back(t);
+            if (d.live_out & kStatusFlags) returns->push_back({t, d.live_out & kStatusFlags});
+        }
+        // jumps (and falls) into other functions: their entries feed this one's liveness
+        const auto& op0 = d.ops[0];
+        if (d.exits && (d.ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR || d.ins.meta.category == ZYDIS_CATEGORY_COND_BR) &&
+            op0.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && op0.imm.is_relative) {
+            const uint32_t t = uint32_t(d.va + d.ins.length + int32_t(op0.imm.value.s));
+            if (!index_.count(t)) targets->push_back(t), tails->push_back(t);
+        }
+        if (d.exits && d.falls_through && !index_.count(d.va + d.ins.length)) {
+            targets->push_back(d.va + d.ins.length);
+            tails->push_back(d.va + d.ins.length);
+        }
+    }
+    return entry_flags_;
+}
+
+// to a fixpoint: what a function reads on entry depends on what it calls and jumps into, what it must return with on
+// its callers; most functions neither read nor return flags, so the code of nearly all stays as it was
+void Codegen::AnalyzeFlags() {
+    const auto& functions = analysis_.functions;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> users;  // the functions that call or jump into one
+    std::vector<uint32_t> work;
+    for (const auto& [va, fn] : functions) work.push_back(va);
+    bool first = true;
+    size_t rounds = 0;
+    while (!work.empty()) {
+        rounds++;
+        std::sort(work.begin(), work.end());
+        work.erase(std::unique(work.begin(), work.end()), work.end());
+        std::vector<uint32_t> next;
+        for (uint32_t va : work) {
+            FunctionWriter writer(*this, functions.at(va));
+            std::vector<std::pair<uint32_t, uint32_t>> returns;
+            std::vector<uint32_t> targets, tails;
+            const uint32_t in = writer.FlagSummary(&returns, &targets, &tails);
+            // what it returns with, the code it jumps into returns with for it
+            if (const uint32_t mine = ReturnsFlags(va))
+                for (uint32_t t : tails)
+                    if (functions.count(t)) returns.push_back({t, mine});
+            if (first)
+                for (uint32_t t : targets) users[t].push_back(va);
+            if (in != FlagsAtEntry(va)) {
+                flags_in_[va] = in;
+                for (uint32_t u : users[va]) next.push_back(u);  // their calls and jumps to it read more now
+            }
+            for (const auto& [t, mask] : returns) {
+                uint32_t& have = flags_out_[t];
+                if ((have | mask) != have) {
+                    have |= mask;
+                    next.push_back(t);  // its returns hand more flags back now
+                }
+            }
+        }
+        first = false;
+        work.swap(next);
+    }
+    size_t entry = 0, out = 0;
+    for (const auto& [va, in] : flags_in_) entry += in != 0;
+    for (const auto& [va, mask] : flags_out_) out += mask != 0;
+    std::printf("flags across calls: %zu functions read them on entry, %zu return them (%zu rounds)\n", entry, out,
+                rounds);
 }
 
 // leaving the function without a call hands the flags over through Cpu
@@ -182,8 +296,13 @@ std::string FunctionWriter::CallTo(uint32_t target, uint32_t ret) const {
         return F("c.esp -= 4; W32(c.esp, 0x%08Xu); FCI_SAVE f_%08X(c); "
                  "if (setjmp(*Landing(c, 0x%08Xu))) { SetjmpBarrier(c); f = c.flags; } else { SetjmpBarrier(c); } FCI_LOAD",
                  ret, target, ret);
-    if (cg_.analysis().functions.count(target))
-        return F("c.esp -= 4; W32(c.esp, 0x%08Xu); FCI_SAVE f_%08X(c); FCI_LOAD", ret, target);
+    if (cg_.analysis().functions.count(target)) {
+        // flags across the call (AnalyzeFlags): handed over when the callee reads them on entry, taken back when this
+        // function reads the ones the callee returns with
+        const char* in = cg_.FlagsAtEntry(target) ? " c.flags = f;" : "";
+        const char* back = cur_ && (cur_->live_out & cg_.ReturnsFlags(target)) ? " f = c.flags;" : "";
+        return F("c.esp -= 4; W32(c.esp, 0x%08Xu); FCI_SAVE%s f_%08X(c); FCI_LOAD%s", ret, in, target, back);
+    }
     return F("c.esp -= 4; W32(c.esp, 0x%08Xu); FCI_SAVE Call(c, 0x%08Xu); FCI_LOAD", ret, target);
 }
 
@@ -467,6 +586,7 @@ void Codegen::Write(const std::filesystem::path& dir, int partitions, uint64_t x
     const auto& functions = analysis_.functions;
     // off unless FCI_RECOMP_XMM_LIVE=1 when fci-recomp runs (codegen_internal.h)
     if (XmmLiveOn()) AnalyzeXmm();
+    AnalyzeFlags();
 
     {
         std::ofstream h(dir / "funcs.h");

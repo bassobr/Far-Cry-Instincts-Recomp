@@ -67,6 +67,19 @@ public:
     uint16_t XmmExitLive(const XmmExit& e, uint32_t self, bool with_exit = true) const;
     uint16_t XmmCallReads(const XmmNode& n) const;
     uint16_t XmmReads(uint32_t start) const { return xmm_[start].reads; }
+    // status flags across calls (codegen.cpp, AnalyzeFlags): the flags a function reads on entry before it sets them
+    // (its caller has to hand its own over), and whether a caller reads the flags a function returns with. Both hold
+    // for the hand-written x87 CRT (acos, asin, ...: a helper classifies the argument with cmp and returns, the
+    // caller branches on those flags or passes them on into the next helper)
+    void AnalyzeFlags();
+    uint32_t FlagsAtEntry(uint32_t start) const {
+        auto it = flags_in_.find(start);
+        return it == flags_in_.end() ? 0 : it->second;
+    }
+    uint32_t ReturnsFlags(uint32_t start) const {
+        auto it = flags_out_.find(start);
+        return it == flags_out_.end() ? 0 : it->second;
+    }
 
 private:
     const xbe::Image& image_;
@@ -76,6 +89,8 @@ private:
     mutable std::unordered_map<uint32_t, XmmSummary> xmm_;
     uint16_t xmm_indirect_reads_ = 0, xmm_indirect_exit_ = 0;
     std::unordered_map<uint32_t, bool> xmm_address_taken_;  // may be reached through a code pointer
+    std::unordered_map<uint32_t, uint32_t> flags_in_;  // AnalyzeFlags: flags read on entry, by function
+    std::unordered_map<uint32_t, uint32_t> flags_out_;  // AnalyzeFlags: flags callers read after it returns
 };
 
 }  // namespace recomp

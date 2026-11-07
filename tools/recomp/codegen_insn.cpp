@@ -185,7 +185,9 @@ bool FunctionWriter::EmitBranch(const Decoded& d, bool* handled) {
     }
     case ZYDIS_MNEMONIC_RET: {
         uint32_t pop = ins.operand_count_visible ? uint32_t(op0.imm.value.u) : 0;
-        S(F("RETURN(0x%08Xu); c.esp += %uu; FCI_SAVE return;", fn_.start, 4 + pop));
+        // a caller reads the flags this function returns with (AnalyzeFlags)
+        S(F("RETURN(0x%08Xu); c.esp += %uu; FCI_SAVE%s return;", fn_.start, 4 + pop,
+            cg_.ReturnsFlags(fn_.start) ? " c.flags = f;" : ""));
         return true;
     }
     case ZYDIS_MNEMONIC_JMP: {

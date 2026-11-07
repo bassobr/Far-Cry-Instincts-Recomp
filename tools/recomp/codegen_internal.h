@@ -51,6 +51,10 @@ public:
     FunctionWriter(Codegen& cg, const Function& fn) : cg_(cg), fn_(fn) {}
     std::string Write();
     void XmmSummarize(XmmFunction* out);  // xmm_live.cpp
+    // AnalyzeFlags: the flags this function reads on entry; the direct call targets whose returned flags it reads (with
+    // the flags), every function it calls or jumps into, and those it jumps (or falls) into
+    uint32_t FlagSummary(std::vector<std::pair<uint32_t, uint32_t>>* returns, std::vector<uint32_t>* targets,
+                         std::vector<uint32_t>* tails);
     // the statements of one instruction with every flag it defines computed (for the semantics test);
     // empty when it has no translation
     std::string EmitOne(Decoded d);
@@ -58,6 +62,7 @@ public:
 private:
     void Prepare();
     void Liveness();
+    uint32_t ExitFlags(const Decoded& d) const;  // flags live where d leaves the function without a call
 
     // instruction level, codegen_insn.cpp; false when the instruction has no translation
     bool EmitInsn(const Decoded& d);
@@ -100,6 +105,7 @@ private:
     bool ea_ram_ = false;  // the explicit memory operand is RAM for sure (stack, constant address)
     bool ea_base_ = false;  // it is [eb + displacement below kBaseDispLimit]: checked through the base register
     std::string body_;
+    uint32_t entry_flags_ = 0;  // Liveness: the status flags read on entry before they are set
 };
 
 const char* Cond(ZydisMnemonic m);  // C++ condition over `f` for jcc/setcc/cmovcc/fcmovcc, nullptr otherwise
