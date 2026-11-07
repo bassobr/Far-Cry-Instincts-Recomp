@@ -325,8 +325,9 @@ code. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   under Proton.
 - The story's cutscenes, such as the opening on the boat, are scripted sequences in the levels and can't be skipped
   (as on the Xbox); `skip_intro` covers the logo videos at start.
-- Direct mouse look has been measured on foot, while zoomed and in split screen; vehicles and mounted guns use the
-  same input path but have had less testing. `mouse_mode = stick` brings back the old behaviour.
+- Direct mouse look has been measured on foot, while zoomed, swimming, in feral vision, on the quad and in split
+  screen; boats, the glider and mounted guns use the same input path but have not been tested yet.
+  `mouse_mode = stick` brings back the old behaviour.
 - Online play (Xbox Live, system link) is not supported.
 
 ## Credits

@@ -21,16 +21,18 @@
 // camera this frame shows (Game_CameraUpdate from 0x000F0C55, xdk/game.cpp) gets the turn added already
 // (PredictView); the next frame's copy carries it for real. Where the game holds the view back, the turn the
 // player took last frame falls short of what was asked. Pitch: the shown angle stays within the limits the game
-// was seen to hold (85 degrees up and down on foot, measured; narrowed where a turn fell short, widened where the
-// view went further, up to 90), so looking up or down never shows past the limit for more than the first frame at
-// a new, narrower limit. Yaw (only a mounted gun's arc or a cutscene that ignores the command hold it): a
-// direction whose turn fell short is not added ahead until a turn in it goes through again (in a cutscene: the
-// first one or two frames of motion show a turn of that frame's size, then nothing).
+// was seen to hold (85 degrees up and down on foot, measured; narrowed where a turn fell short, e.g. 45 on the
+// ATV, back to 85 once the view went well past it, up to 90), so looking up or down never shows past the limit
+// for more than the first frame at a new, narrower limit. Yaw (a vehicle's or a mounted gun's arc or a cutscene
+// hold it): a direction whose turn fell short is not added ahead until a turn in it, or one away from it, goes
+// through again (in a cutscene: the first one or two frames of motion show a turn of that frame's size, then
+// nothing).
 #include <windows.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 
 #include "hle/mouse_look.h"
 #include "hle/pc_input.h"
@@ -47,6 +49,15 @@ constexpr uint32_t kClientLocalPlayer = 0x34;   // word: local player index (0 =
 
 constexpr uint32_t kCamPitch = 0xC, kCamYaw = 0x14;  // degrees; pitch grows downwards, yaw to the left
 
+// In a vehicle and on a mounted gun the yaw is held within a limit relative to the vehicle or the gun
+// (fLimitLRAngles 100-150, angHLimit 15-130 degrees in the levels' data), and the game takes the relative angle
+// modulo 360 before it clamps it: a frame's turn that carries it past 180 lands at the opposite limit (measured on
+// the ATV, limit 110: 200 degrees right in one frame ended 110 degrees left). A stick never turns that far in a
+// frame. The mouse's yaw goes in steps of at most kMaxYawStep a frame, the rest in the next frames: less than
+// 180 minus the widest limit, so a fast flick into a limit stays there. On foot (no limit) only flicks faster than
+// kMaxYawStep a frame (3000 degrees/s at 120 fps, 1500 at 60) take a frame longer.
+constexpr double kMaxYawStep = 25.0;
+
 const bool trace_look = GetEnvironmentVariableA("FCI_TRACE_LOOK", nullptr, 0) > 0;
 const bool no_ahead = GetEnvironmentVariableA("FCI_NO_LOOK_AHEAD", nullptr, 0) > 0;  // diagnosis: the camera a frame late
 
@@ -61,6 +72,7 @@ struct Ahead {
     bool have_last = false;
     bool yaw_blocked[2] = {};    // [direction]: the game held a yaw turn this way back
     float pitch_limit[2] = {-85.0f, 85.0f};  // up, down: as far as the game was seen to let the view go
+    double yaw_left = 0;         // the mouse's yaw beyond kMaxYawStep, for the next frames
 } g_ahead;
 
 void AddF(uint32_t va, float v) {
@@ -83,7 +95,11 @@ HLE_STDCALL(Game_LookInput, 4) {
     }
     double yaw = 0, pitch = 0;
     const float fov = g_ahead.camera == client + kClientView ? g_ahead.fov : 0.0f;  // last frame's view
-    if (hle::pc::TakeLookDegrees(fov, &yaw, &pitch) && (yaw || pitch)) {
+    if (!hle::pc::TakeLookDegrees(fov, &yaw, &pitch)) yaw = pitch = 0;
+    yaw += g_ahead.yaw_left;
+    const double left = yaw - std::clamp(yaw, -kMaxYawStep, kMaxYawStep);
+    g_ahead.yaw_left = left, yaw -= left;
+    if (yaw || pitch) {
         // the player wraps its pitch before it clamps it (-20 - 200 ends at the lower limit, 85): the mouse's part
         // stops at straight up or down, from the view's pitch of last frame plus the stick's turn of this one
         const float now = xdk::GF(client + kClientView + kCamPitch) + xdk::GF(cmd + kCmdPitch);
@@ -95,9 +111,10 @@ HLE_STDCALL(Game_LookInput, 4) {
     g_ahead.pending = true;
     g_ahead.asked[0] = float(-yaw), g_ahead.asked[1] = float(-pitch);
     if (trace_look)
-        rt::Log("look: input stick %.3f %.3f -> yaw %+.4f pitch %+.4f (mouse %+.4f %+.4f) fov %.4f actions %08X %08X",
+        rt::Log("look: input stick %.3f %.3f -> yaw %+.4f pitch %+.4f (mouse %+.4f %+.4f) fov %.4f actions %08X %08X%s",
                 xdk::ArgF(a, 2), xdk::ArgF(a, 3), xdk::GF(cmd + kCmdYaw), xdk::GF(cmd + kCmdPitch), yaw, pitch, fov,
-                rt::R32(cmd + 4), rt::R32(cmd + 8));
+                rt::R32(cmd + 4), rt::R32(cmd + 8),
+                left ? (" (yaw " + std::to_string(left) + " next frames)").c_str() : "");
     return r;
 }
 
@@ -115,8 +132,13 @@ void hle::PredictView(uint32_t camera, float game_fov) {
     // the pitch limits: where the view went, and where last frame's turn fell short (other turns, the stick's, the
     // bob, add noise: only clear cases count)
     float* limit = g.pitch_limit;
-    // (a cutscene's camera may point anywhere: the player's view never goes past straight up or down)
-    limit[0] = std::max(std::min(limit[0], real[1]), -90.0f), limit[1] = std::min(std::max(limit[1], real[1]), 90.0f);
+    // (a cutscene's camera may point anywhere: the player's view never goes past straight up or down). A view well
+    // past a limit learned before means it no longer holds (the player got off a vehicle or a gun): back to the
+    // limits on foot, so the turn beyond it is shown at once and not a frame late; a little past it (a vehicle
+    // that tilts) moves it there
+    constexpr float kGone = 3.0f;
+    if (real[1] < limit[0]) limit[0] = std::max(real[1] < limit[0] - kGone ? std::min(real[1], -85.0f) : real[1], -90.0f);
+    if (real[1] > limit[1]) limit[1] = std::min(real[1] > limit[1] + kGone ? std::max(real[1], 85.0f) : real[1], 90.0f);
     if (g.have_last)
         for (int i = 0; i < 2; i++) {
             const float asked = g.asked_last[i];
@@ -124,7 +146,8 @@ void hle::PredictView(uint32_t camera, float game_fov) {
             float done = real[i] - g.real_last[i];
             if (i == 0) done = std::remainder(done, 360.0f);
             const bool short_of = done / asked < 0.5f;
-            if (i == 0) g.yaw_blocked[asked > 0] = short_of;
+            // (a yaw turn that goes through leaves the limit on the other side: ahead again when turning back to it)
+            if (i == 0) g.yaw_blocked[asked > 0] = short_of, g.yaw_blocked[asked <= 0] &= short_of;
             else if (short_of) limit[asked > 0] = real[1];
         }
     float shown[2] = {real[0], real[1]};

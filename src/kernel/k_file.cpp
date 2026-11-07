@@ -38,6 +38,37 @@ struct Device {
 
 const bool g_trace_reads = GetEnvironmentVariableA("FCI_TRACE_FILES", nullptr, 0) > 0;
 
+// FCI_TEST_PATCH=<old>|<new>[;<old>|<new>...] (tests): every file read replaces the text <old> by <new> of the same
+// length, e.g. an entity's Pos="..." in a level's data, to place a vehicle or a gun where a test starts
+void TestPatch(void* data, uint32_t size) {
+    static const std::vector<std::pair<std::string, std::string>> patches = [] {
+        std::vector<std::pair<std::string, std::string>> r;
+        char env[2048];
+        DWORD n = GetEnvironmentVariableA("FCI_TEST_PATCH", env, sizeof env);
+        if (!n || n >= sizeof env) return r;
+        std::string all(env, n);
+        for (size_t at = 0; at <= all.size();) {
+            size_t end = all.find(';', at);
+            if (end == std::string::npos) end = all.size();
+            std::string item = all.substr(at, end - at);
+            size_t bar = item.find('|');
+            if (bar != std::string::npos && item.size() - bar - 1 == bar && bar)
+                r.emplace_back(item.substr(0, bar), item.substr(bar + 1));
+            else if (!item.empty())
+                rt::Log("file: FCI_TEST_PATCH '%s' ignored (old and new must have the same length)", item.c_str());
+            at = end + 1;
+        }
+        return r;
+    }();
+    if (patches.empty()) return;
+    auto* bytes = static_cast<char*>(data);
+    for (const auto& [from, to] : patches)
+        for (char* p = bytes; (p = std::search(p, bytes + size, from.begin(), from.end())) != bytes + size; p += from.size()) {
+            std::memcpy(p, to.data(), to.size());
+            rt::Log("file: FCI_TEST_PATCH '%s' -> '%s'", from.c_str(), to.c_str());
+        }
+}
+
 // FCI_READ_STATS=1: every 10 s the file reads of that time (DVD folder or image, hard disk): count, bytes, time
 // spent inside the reads, slowest read; to compare the disc image with extracted files
 const bool g_read_stats = GetEnvironmentVariableA("FCI_READ_STATS", nullptr, 0) > 0;
@@ -482,6 +513,7 @@ KERNEL_EXPORT(219, NtReadFile) {
             n = MountedDisc()->Read(*f->entry, pos, rt::Host(a[5]), a[6]);
             timer.Done(n);
         }
+        if (n) TestPatch(rt::Host(a[5]), n);
         f->pos = pos + n;
         uint32_t status = !a[6]                   ? X_STATUS_SUCCESS
                           : pos >= f->entry->size ? X_STATUS_END_OF_FILE
@@ -512,6 +544,7 @@ KERNEL_EXPORT(219, NtReadFile) {
         timer.Done(n);
     }
     uint32_t status = !ok ? X_STATUS_UNSUCCESSFUL : (n == 0 && a[6]) ? X_STATUS_END_OF_FILE : X_STATUS_SUCCESS;
+    if (ok && n) TestPatch(rt::Host(a[5]), n);
     if (g_trace_reads)
         rt::Log("file: read %s %X at %llX -> %08X: %X bytes, event %X apc %08X", f->guest.c_str(), a[6],
                 a[7] ? (unsigned long long)rt::R64(a[7]) : ~0ull, a[5], n, a[1], a[2]);

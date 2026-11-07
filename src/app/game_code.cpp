@@ -15,6 +15,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <exception>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -109,8 +111,33 @@ struct Progress {
 
 Progress g_progress;
 std::wstring g_failure;  // the step that failed, written by the build thread before it ends
-HWND g_window = nullptr;
 constexpr UINT kBuildDone = WM_APP + 1;
+
+// The progress window lives on a thread of its own and the build never waits on it: when it cannot be made (no
+// display: a session without one, an X server that refuses the connection under Proton) or its thread hangs
+// in the window system, the build runs to the end all the same.
+enum class WindowState { Starting, Shown, Failed };
+std::atomic<WindowState> g_window_state{WindowState::Starting};
+std::atomic<HWND> g_window{nullptr};
+std::atomic<bool> g_build_over{false};  // the window closes itself if it comes up after the build
+
+const char* WindowNote() {
+    switch (g_window_state.load()) {
+        case WindowState::Shown: return "";
+        case WindowState::Failed: return ", without the progress window";
+        default: return ", the progress window not up yet";
+    }
+}
+
+constexpr int64_t kNoteMs = 15000;  // a line in the log this often while compiling
+
+// CPU time a process has used, seconds
+double CpuSeconds(HANDLE process) {
+    FILETIME created, ended, kernel, user;
+    if (!GetProcessTimes(process, &created, &ended, &kernel, &user)) return 0;
+    auto s = [](const FILETIME& f) { return double((uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime) / 1e7; };
+    return s(kernel) + s(user);
+}
 
 bool RecordFailure(const std::wstring& what) {
     g_failure = what;
@@ -141,7 +168,8 @@ public:
         if (log_ != INVALID_HANDLE_VALUE) WriteFile(log_, text.data(), DWORD(text.size()), &n, nullptr);
     }
 
-    // null when it did not start; its output goes to build.log
+    // null when it did not start; its output goes to build.log. Without a console (DETACHED_PROCESS): the output
+    // goes to the log's handle anyway, and under Wine/Proton no console host is started for each compiler.
     HANDLE Start(std::wstring command, const fs::path& dir) {
         Note(fs::path(command).string());
         STARTUPINFOW si{sizeof(si)};
@@ -150,13 +178,21 @@ public:
         si.hStdOutput = log_;
         si.hStdError = log_;
         PROCESS_INFORMATION pi{};
-        DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS;
+        DWORD flags = DETACHED_PROCESS | CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS;
         if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, flags, nullptr, dir.c_str(), &si, &pi)) {
             rt::Log("game code: could not start %s (%lu)", fs::path(command).string().c_str(), GetLastError());
             return nullptr;
         }
-        AssignProcessToJobObject(job_, pi.hProcess);
-        ResumeThread(pi.hThread);
+        if (!AssignProcessToJobObject(job_, pi.hProcess))
+            rt::Log("game code: a build process is not in the job (%lu); it is ended by hand if the build stops",
+                    GetLastError());
+        if (ResumeThread(pi.hThread) == DWORD(-1)) {  // a process that never runs would hold the build forever
+            rt::Log("game code: could not resume %s (%lu)", fs::path(command).string().c_str(), GetLastError());
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return nullptr;
+        }
         CloseHandle(pi.hThread);
         return pi.hProcess;
     }
@@ -255,7 +291,11 @@ bool Translate(Build& b, Processes& run) {
 
 std::wstring CompileCommand(const Build& b, const Job& job) {
     const fs::path include = CompilerDir() / "include";
-    std::wstring command = Quote(CompilerDir() / "clang.exe") + L" --driver-mode=cl /nologo -TP " FCI_GAME_FLAGS;
+    // /vctoolsdir: the code needs nothing of Visual Studio (no system headers, no linking here), and without it
+    // clang-cl searches for an installation, through COM (the Setup Configuration API) among others; under
+    // Wine/Proton COM needs the window system, which a session without a display does not have
+    std::wstring command = Quote(CompilerDir() / "clang.exe") + L" --driver-mode=cl /nologo -TP /vctoolsdir " +
+                           Quote(CompilerDir()) + L" " FCI_GAME_FLAGS;
     command += L" -DFCI_ABI_HASH=" + Hex(FCI_ABI_HASH) + L" -DFCI_BUILD_KEY=" + Hex(b.key);
     std::error_code ec;
     if (fs::exists(Profile(), ec))
@@ -306,7 +346,16 @@ bool Compile(Build& b, Processes& run, std::vector<Job>& jobs) {
     std::vector<HANDLE> running;
     std::vector<const Job*> running_jobs;
     size_t next = 0;
+    int64_t next_note = NowMs() + kNoteMs;
     while (next < todo.size() || !running.empty()) {
+        if (NowMs() >= next_note) {
+            // the log shows the build going on without the window too, and compilers that do not run
+            next_note += kNoteMs;
+            double cpu = 0;
+            for (HANDLE p : running) cpu += CpuSeconds(p);
+            rt::Log("game code: %u of %zu files compiled, %zu compilers running (%.1f s CPU so far)%s",
+                    g_progress.files_done.load(), todo.size(), running.size(), cpu, WindowNote());
+        }
         for (; running.size() < b.slots && next < todo.size(); next++) {
             HANDLE process = run.Start(CompileCommand(b, todo[next]), GenDir());
             if (!process) {
@@ -341,7 +390,8 @@ bool Link(Build& b, Processes& run, const std::vector<Job>& jobs) {
     const fs::path rsp = WorkDir() / "link.rsp";
     {
         std::wofstream r(rsp);
-        r << L"/nologo /dll /noentry /nodefaultlib /machine:x64 /debug /incremental:no\n";
+        // /lldignoreenv: no search for Visual Studio and the Windows SDK either (as for clang above)
+        r << L"/nologo /dll /noentry /nodefaultlib /lldignoreenv /machine:x64 /debug /incremental:no\n";
         r << L"/pdb:" << Quote(OutDir() / "game_code.pdb") << L"\n/out:" << Quote(DllPath()) << L"\n";
         r << L"/implib:" << Quote(WorkDir() / "game_code.lib") << L"\n";
         r << Quote(CompilerDir() / "FarCryInstincts.lib") << L"\n";
@@ -502,6 +552,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case kBuildDone: DestroyWindow(hwnd); return 0;
+        case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -525,6 +576,7 @@ HWND OpenWindow() {
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, kTitle, style, x, y, w, h, nullptr, nullptr, inst, nullptr);
+    if (!hwnd) return nullptr;
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi);
     g_font = CreateFontIndirectW(&metrics.lfMessageFont);
@@ -562,7 +614,37 @@ void ShowFailure() {
     MessageBoxW(nullptr, text.c_str(), kTitle, MB_ICONERROR);
 }
 
-// the build on its own thread, the window on this one; false when it failed or the player stopped it
+// the progress window's thread: the window and its messages until the build is over
+void WindowThread() {
+    // FCI_TEST_PROGRESS_WINDOW=fail|hang (tests): the window cannot be made / its thread never comes back
+    char test[8] = {};
+    GetEnvironmentVariableA("FCI_TEST_PROGRESS_WINDOW", test, sizeof test);
+    if (!strcmp(test, "hang")) {
+        rt::Log("game code: FCI_TEST_PROGRESS_WINDOW=hang: the progress window's thread blocks");
+        Sleep(INFINITE);
+    }
+    HWND hwnd = strcmp(test, "fail") ? OpenWindow() : nullptr;
+    if (!hwnd) {
+        const DWORD error = GetLastError();
+        g_window_state = WindowState::Failed;
+        rt::Log("game code: no progress window (%s, error %lu); the build goes on without it",
+                test[0] ? "FCI_TEST_PROGRESS_WINDOW=fail" : "CreateWindowEx failed", error);
+        return;
+    }
+    g_window = hwnd;
+    g_window_state = WindowState::Shown;
+    rt::Log("game code: progress window shown");
+    if (g_build_over) DestroyWindow(hwnd);  // the build ended while the window was being made
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    DeleteObject(g_font);
+    DeleteObject(g_heading_font);
+}
+
+// the build on this thread, the window on its own; false when it failed or the player stopped it
 bool BuildWithWindow(Build& b) {
     if (std::wstring blocker = Blocker(); !blocker.empty()) {
         rt::Log("game code: %s", fs::path(blocker).string().c_str());
@@ -570,22 +652,29 @@ bool BuildWithWindow(Build& b) {
         return false;
     }
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);  // no sleep while it works
-    g_window = OpenWindow();
-    bool ok = false;
-    std::thread worker([&] {
-        ok = RunBuild(b);
-        if (ok) g_progress.stage = Stage::Done;
-        PostMessageW(g_window, kBuildDone, ok, 0);
-    });
-    MSG msg;
-    while (IsWindow(g_window) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    std::thread window;
+    try {
+        window = std::thread(WindowThread);
+    } catch (const std::exception&) {
+        g_window_state = WindowState::Failed;
+        rt::Log("game code: no thread for the progress window; the build goes on without it");
     }
-    worker.join();
-    DeleteObject(g_font);
-    DeleteObject(g_heading_font);
+    const bool ok = RunBuild(b);
+    if (ok) g_progress.stage = Stage::Done;
+    g_build_over = true;
+    if (HWND hwnd = g_window) PostMessageW(hwnd, kBuildDone, ok, 0);
+    if (window.joinable()) {
+        // a window thread stuck in the window system is left behind (it holds nothing of the build)
+        HANDLE thread = window.native_handle();
+        if (WaitForSingleObject(thread, 3000) == WAIT_OBJECT_0) {
+            window.join();
+        } else {
+            rt::Log("game code: the progress window's thread did not end; left behind");
+            window.detach();
+        }
+    }
     SetThreadExecutionState(ES_CONTINUOUS);
+    if (ok) rt::Log("game code: build finished%s", WindowNote());
     if (!ok && !g_progress.cancel) ShowFailure();
     if (g_progress.cancel) rt::Log("game code: build stopped by the player");
     return ok;

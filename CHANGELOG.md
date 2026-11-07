@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.4 (unreleased)
+
+- Mouse look in vehicles: a fast flick no longer makes the view jump to the opposite edge of a vehicle's look range
+  (the game wraps the angle before limiting it; on a boat a 30° flick in one frame was enough). The mouse turns at
+  most 25° sideways per frame and the rest follows in the next frames, which on foot only matters above 3000°/s at
+  120 fps. The pitch limit learned on a vehicle is released again on foot.
+- First start: the game-code build no longer depends on the progress window or a display. The compilers no longer
+  look for a Visual Studio installation (which under Proton needs the window system), they run without a console,
+  and the log shows the build's progress every 15 seconds. If the window cannot be shown, the build goes on
+  without it.
+
 ## 0.1.3 (2026-11-07)
 
 - Direct mouse look (#2): the mouse no longer goes through the right stick. Every mouse count turns the view by a
