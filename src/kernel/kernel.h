@@ -66,6 +66,7 @@ enum : uint32_t {
     X_STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034,
     X_STATUS_OBJECT_NAME_COLLISION = 0xC0000035,
     X_STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A,
+    X_STATUS_SHARING_VIOLATION = 0xC0000043,
     X_STATUS_MUTANT_NOT_OWNED = 0xC0000046,
     X_STATUS_FILE_IS_A_DIRECTORY = 0xC00000BA,
     X_STATUS_NOT_A_DIRECTORY = 0xC0000103,
@@ -91,6 +92,28 @@ bool Relaunch(uint32_t routine);
 inline std::wstring HandoverEvent(unsigned long process) { return L"Local\\FCIHandover-" + std::to_wstring(process); }
 // FCI_START_LEVEL=<level>[:<mission>[:<players>]], false when unset (or this process is a relaunch)
 bool StartLevelSetting(std::string* level, std::string* mission, int* players);
+
+// save games (k_save.cpp, GitHub #29). FCI keeps a profile in UDATA\55530008\<profile>\: two checkpoints (*.fcs),
+// profile.sav, one *.mt, renamer.ren, each signed (HMAC-SHA1 over the file, the digest at its end); a checkpoint
+// is saved in several steps (delete the older one, write the new one, rewrite profile.sav), and a profile with a
+// bad signature or not exactly two checkpoints counts as damaged for good.
+// At boot: every profile checked; a damaged one is put back to its last good state (kept by the host after each
+// save, data\hdd\save_backup), the damaged files moved to data\hdd\save_damaged.
+void CheckSaves();
+// a save file (partition 1, UDATA/TDATA) is about to change; blocks for good once the process is ending and the
+// last save is finished (a new save must not be cut by the exit)
+void NoteSaveChange(const std::filesystem::path& host);
+void SaveWriterOpened();
+void SaveWriterClosed();
+// before the process ends (window closed, relaunch, quit): waits up to max_ms until no save file is open for
+// writing and none changed for quiet_ms, then lets no new save start
+void FinishSaves(const char* why, uint32_t max_ms, uint32_t quiet_ms);
+// FCI_SAVE_GUARD=0: none of the above but the check and the log (tests; a way out)
+bool SaveGuardOff();
+// HMAC-SHA1 of host memory (key up to 64 bytes), as XcHMAC
+void HmacSha1(const uint8_t* key, size_t key_size, const uint8_t* data, size_t size, uint8_t digest[20]);
+// the hard disk folder (data\hdd) given to SetDevicePaths
+std::filesystem::path HddFolder();
 
 // guest strings
 std::string ReadCString(uint32_t ptr);

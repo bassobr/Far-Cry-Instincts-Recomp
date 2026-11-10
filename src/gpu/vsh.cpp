@@ -21,7 +21,10 @@ struct VSOut {
     float4 t2 : TEXCOORD2;
     float4 t3 : TEXCOORD3;
     float wdepth : WDEPTH;  // w / zmax: the depth W-buffering stores, linear in eye space
-    float wdepth_c : WDEPTH1;  // the same, centroid-interpolated in the pixel shader (psh.cpp)
+    // the same, centroid-interpolated in the pixel shader (psh.cpp). A float4 of its own: as a float beside wdepth the
+    // vertex shader packed both into one register (.x, .y), the pixel shader put the centroid one into a register of
+    // its own (another interpolation mode), and the stages did not link (D3D11 debug layer #343/#345 on every draw)
+    float4 wdepth_c : WDEPTH1;
 };
 )";
 

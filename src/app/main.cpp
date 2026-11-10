@@ -198,6 +198,7 @@ int main() {
     kernel::MountDisc(std::move(game.disc));
     kernel::SetDevicePaths(game.dvd, exe_dir / "data" / "hdd");
     kernel::Init(image);
+    kernel::CheckSaves();  // a profile damaged by an earlier end in the middle of a save gets its last good state back
     rt::StartScheduler();
     rt::StartProfiler();
     kernel::InitTimers();

@@ -27,6 +27,7 @@
 #include "runtime/guest_time.h"
 #include "runtime/log.h"
 #include "video/display.h"
+#include "xdk/xdk.h"  // LevelSeconds (FCI_INPUT_SCRIPT_CLOCK)
 
 namespace hle::pc {
 
@@ -258,7 +259,7 @@ void UpdateWheel(double now, int real_notches, double script_from, double script
 // points. Nothing turns below ~0.37; from 0.95 on the game accelerates the turn the longer the stick is held
 // (125 deg/s rising past 240 deg/s within 0.6 s), so the mouse stays below that, at up to 0.94 (~124 deg/s).
 // Pitch turns at ~0.55 times the yaw rate (measured at 0.65, 0.8 and 0.9), ~78 deg/s at 0.94. The top points
-// were corrected with the scripted mouse test (FCI_KEY_SCRIPT): fast and slow motion turn the same angle.
+// were corrected with the scripted mouse test (FCI_KEY_SCRIPT, README): fast and slow motion turn the same angle.
 struct Point {
     double deflection, rate;
 };
@@ -403,6 +404,13 @@ bool TraceOn() {
 }  // namespace
 
 double ScriptSeconds() {
+    // FCI_INPUT_SCRIPT_CLOCK=level (diagnostics, frame-rate audit): the scripts count the game's own clock from the
+    // level's first frame, so runs at different frame rates press the same inputs at the same game time
+    static const bool level_clock = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("FCI_INPUT_SCRIPT_CLOCK", v, sizeof v) && !std::strcmp(v, "level");
+    }();
+    if (level_clock) return xdk::LevelSeconds();
     static const int64_t start = rt::GuestQpc();
     static const double frequency = [] {
         LARGE_INTEGER f;
@@ -459,7 +467,8 @@ void ApplyKeyboardMouse(Pad& p, bool focused) {
         if (code == kWheelUp || code == kWheelDown) return now < g_wheel[code == kWheelDown].down_until;
         if (held[code]) return true;
         if (!focused) return false;
-        bool is_down = (GetAsyncKeyState(code) & 0x8000) != 0;
+        // a mouse button only for a press in the client area of the window in front (GitHub #28, video/display.cpp)
+        bool is_down = (GetAsyncKeyState(code) & 0x8000) != 0 && display::ButtonForGame(code);
         if (g_stale[code]) {  // settings menu
             if (!is_down) g_stale[code] = false;
             return false;

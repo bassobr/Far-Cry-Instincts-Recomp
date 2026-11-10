@@ -175,6 +175,62 @@ void CaptureMouse(bool on) {
         ClipCursor(nullptr);
     }
 }
+// ---- mouse buttons for the game (GitHub #28) ----
+// The poll reads the buttons with GetAsyncKeyState, which sees a button wherever it went down: on the title bar or
+// the frame (a drag or resize of the window), or the click that brings the window to the front. A press reaches the
+// game only if it began in the client area of the window in front, outside a move/size loop and the settings menu,
+// and did not bring the window to the front (announced by WM_MOUSEACTIVATE, or the window came to the front at or
+// after the press: a window made while another program was in front gets no WM_MOUSEACTIVATE). Set by the window's
+// button-down message, cleared by its release (window message or raw input, which arrives wherever the pointer is), a
+// press on the frame, focus loss and a move/size loop.
+std::atomic<unsigned> g_buttons_for_game{0};  // a bit per button (ButtonBit)
+std::atomic<bool> g_size_move{false};         // between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE
+UINT g_activation_click = 0;  // WM_MOUSEACTIVATE on the client area: the button-down message it announces
+bool g_front = false;         // in front, as of the last activation message (WM_ACTIVATE, WM_ACTIVATEAPP, WM_NCACTIVATE)
+bool g_came_front = false;    // g_front_since is set
+DWORD g_front_since = 0;      // GetTickCount when the window came to the front
+const bool g_trace_buttons = GetEnvironmentVariableA("FCI_TRACE_MOUSE_BUTTONS", nullptr, 0) > 0;
+
+int ButtonBit(int vk) {
+    switch (vk) {
+    case VK_LBUTTON: return 0;
+    case VK_RBUTTON: return 1;
+    case VK_MBUTTON: return 2;
+    case VK_XBUTTON1: return 3;
+    case VK_XBUTTON2: return 4;
+    }
+    return -1;
+}
+
+// the button of a (client or non-client) button-down message, -1 for other messages
+int ButtonOfDown(UINT msg, WPARAM wp) {
+    switch (msg) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_NCLBUTTONDOWN: case WM_NCLBUTTONDBLCLK: return 0;
+    case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: case WM_NCRBUTTONDOWN: case WM_NCRBUTTONDBLCLK: return 1;
+    case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: case WM_NCMBUTTONDOWN: case WM_NCMBUTTONDBLCLK: return 2;
+    case WM_XBUTTONDOWN: case WM_XBUTTONDBLCLK: case WM_NCXBUTTONDOWN: case WM_NCXBUTTONDBLCLK:
+        return HIWORD(wp) == XBUTTON2 ? 4 : 3;
+    }
+    return -1;
+}
+
+const char* const kButtonNames[] = {"left", "right", "middle", "x1", "x2"};
+
+void ButtonsNotForGame(const char* why) {
+    if (g_buttons_for_game.exchange(0) && g_trace_buttons) rt::Log("mouse: buttons held let go for the game (%s)", why);
+}
+
+// the pointer is over the window's client area (no other window in front of it)
+bool CursorInClient(HWND hwnd) {
+    POINT p;
+    if (!GetCursorPos(&p) || WindowFromPoint(p) != hwnd) return false;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    ScreenToClient(hwnd, &p);
+    return PtInRect(&rc, p) != 0;
+}
+// ---- end mouse buttons for the game ----
+
 bool g_fullscreen = false;  // borderless over the whole monitor
 WINDOWPLACEMENT g_windowed{sizeof(WINDOWPLACEMENT)};
 // ---- display output options (app/output.h) ----
@@ -451,8 +507,89 @@ void NotePromptInput(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 // ---- end button prompts ----
 
+// ---- mouse buttons for the game (GitHub #28): which presses may reach the game ----
+void NoteMouseButtons(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    const char* activation = msg == WM_ACTIVATE      ? "WM_ACTIVATE"
+                             : msg == WM_ACTIVATEAPP ? "WM_ACTIVATEAPP"
+                             : msg == WM_NCACTIVATE  ? "WM_NCACTIVATE"
+                                                     : nullptr;
+    if (activation) {
+        // when the window came to the front. A window made while another program is in front is still the active
+        // window of its thread: the click that brings it to the front gets no WM_MOUSEACTIVATE, only WM_NCACTIVATE
+        // (TRUE) right before its button-down. GetTickCount, not GetMessageTime: that is still the previous message's
+        const bool front = GetForegroundWindow() == hwnd;
+        if (front && !g_front) g_front_since = GetTickCount(), g_came_front = true;
+        g_front = front;
+        if (g_trace_buttons)
+            rt::Log("mouse: %s %llu, window in front %d, active %d, tick %lu", activation, (unsigned long long)wp, front,
+                    GetActiveWindow() == hwnd, (unsigned long)GetTickCount());
+    }
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        // a press on the client area of the window in the background: it brings the window to the front, no more
+        g_activation_click = LOWORD(lp) == HTCLIENT ? HIWORD(lp) : 0;
+        if (g_trace_buttons) rt::Log("mouse: WM_MOUSEACTIVATE, hit test %d, message %04x", int(LOWORD(lp)), unsigned(HIWORD(lp)));
+        return;
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) g_activation_click = 0, ButtonsNotForGame("focus lost");
+        return;
+    case WM_ENTERSIZEMOVE:
+        g_size_move = true;
+        ButtonsNotForGame("window moved or sized");
+        if (g_trace_buttons) rt::Log("mouse: the window is moved or sized (buttons not for the game)");
+        return;
+    case WM_EXITSIZEMOVE:
+        g_size_move = false;
+        if (g_trace_buttons) rt::Log("mouse: the window is no longer moved or sized");
+        return;
+    case WM_LBUTTONUP: g_buttons_for_game &= ~1u; return;
+    case WM_RBUTTONUP: g_buttons_for_game &= ~2u; return;
+    case WM_MBUTTONUP: g_buttons_for_game &= ~4u; return;
+    case WM_XBUTTONUP: g_buttons_for_game &= HIWORD(wp) == XBUTTON2 ? ~16u : ~8u; return;
+    }
+    const int bit = ButtonOfDown(msg, wp);
+    if (bit < 0) return;
+    const unsigned mask = 1u << bit;
+    if (msg >= WM_NCLBUTTONDOWN && msg <= WM_NCXBUTTONDBLCLK) {  // the title bar, the frame, its buttons
+        g_buttons_for_game &= ~mask;
+        g_activation_click = 0;
+        if (g_trace_buttons)
+            rt::Log("mouse: %s button down on the window frame (hit test %d): not for the game", kButtonNames[bit], int(wp));
+        return;
+    }
+    const char* why = nullptr;
+    // came to the front at or after the press (the press's time is when it happened, before it was dispatched): the
+    // press brought it there. An Alt+Tab or a press elsewhere before brought it there earlier than the press
+    const LONG front_after_press = LONG(g_front_since - DWORD(GetMessageTime()));
+    if (g_activation_click) {
+        why = "the click that brings the window to the front";
+    } else if (g_came_front && front_after_press >= 0 && front_after_press < 5000) {
+        why = "the click that brings the window to the front (no WM_MOUSEACTIVATE)";
+    } else if (app::MenuOpen()) {
+        why = "settings menu";
+    } else if (g_size_move) {
+        why = "the window is moved or sized";
+    } else if (GetForegroundWindow() != hwnd) {
+        why = "the window is not in front";
+    } else {
+        POINT p{short(LOWORD(lp)), short(HIWORD(lp))};
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (!PtInRect(&rc, p)) why = "outside the client area";  // a mouse capture (the menu's) sends those too
+    }
+    g_activation_click = 0;
+    if (why) g_buttons_for_game &= ~mask;
+    else g_buttons_for_game |= mask;
+    if (g_trace_buttons)
+        rt::Log("mouse: %s button down in the client area: %s%s (pressed at tick %lu; came to the front %ld ms after it)",
+                kButtonNames[bit], why ? "not for the game, " : "for the game", why ? why : "",
+                (unsigned long)GetMessageTime(), g_came_front ? long(front_after_press) : 0L);
+}
+// ---- end mouse buttons for the game ----
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     NotePromptInput(hwnd, msg, wp, lp);  // button prompts
+    NoteMouseButtons(hwnd, msg, wp, lp);  // GitHub #28
     // ---- settings menu: F10 and, while it is open, the keyboard and mouse go to the menu ----
     LRESULT menu_result = 0;
     if (app::MenuWndProc(hwnd, msg, wp, lp, &menu_result)) return menu_result;
@@ -461,9 +598,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         rt::Log("window closed");
         hle::host::StopRumble();
+        // a save in progress (checkpoint, level end) is finished first and no new one starts (GitHub #29)
+        kernel::FinishSaves("window closed", 5000, 400);
         LeaveExclusiveForExit();  // display output options
         rt::FlushLog();
         ExitProcess(0);
+    case WM_ENDSESSION:  // Windows shuts down or the user logs off: the process ends after this message
+        if (wp) {
+            rt::Log("Windows ends the session");
+            kernel::FinishSaves("Windows ends the session", 4000, 400);
+            rt::FlushLog();
+        }
+        return 0;
     // ---- display output options ----
     case kExclusiveLeft:
         // F11 left exclusive fullscreen: on to windowed; after focus loss the window waits minimized and goes
@@ -494,6 +640,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case kMenuShown:
         if (wp) CaptureMouse(false);
         else if (g_fullscreen && GetForegroundWindow() == hwnd) CaptureMouse(true);
+        // GitHub #28: the menu's ImGui takes the mouse capture on a press and lets go on the release, which it no
+        // longer sees once the menu closed during the press: every later click (the title bar, other windows) would
+        // come to this window as a client click
+        if (!wp && GetCapture() == hwnd) ReleaseCapture();
         SetCursor(wp || !(g_fullscreen || g_mouse_captured) ? LoadCursor(nullptr, IDC_ARROW) : nullptr);
         return 0;
     // ---- end settings menu ----
@@ -516,20 +666,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         app::WindowActivated(LOWORD(wp) != WA_INACTIVE && !HIWORD(wp));
         // ---- end PC comfort features ----
         break;
+    // ---- mouse buttons for the game (GitHub #28): a drag or resize of the window lets go of the mouse ----
+    case WM_ENTERSIZEMOVE:
+        CaptureMouse(false);
+        break;
+    // ---- end mouse buttons for the game ----
     case WM_INPUT: {
         RAWINPUT input;
         UINT size = sizeof input;
-        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) !=
-                UINT(-1) &&
-            input.header.dwType == RIM_TYPEMOUSE && !(input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
-            g_mouse_captured) {
-            g_mouse_dx += input.data.mouse.lLastX;
-            g_mouse_dy += input.data.mouse.lLastY;
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) ==
+                UINT(-1) ||
+            input.header.dwType != RIM_TYPEMOUSE)
+            break;
+        const RAWMOUSE& m = input.data.mouse;
+        if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE) && g_mouse_captured && !g_size_move) {
+            g_mouse_dx += m.lLastX;
+            g_mouse_dy += m.lLastY;
         }
-        // ---- PC comfort features: wheel notches for the bindings (hle/pc_input.cpp), focused window only ----
-        if (input.header.dwType == RIM_TYPEMOUSE && (input.data.mouse.usButtonFlags & RI_MOUSE_WHEEL) &&
-            GetForegroundWindow() == hwnd)
-            g_wheel += SHORT(input.data.mouse.usButtonData);
+        // ---- mouse buttons for the game (GitHub #28): raw input reports a release wherever the pointer is (the
+        // window's own release message only comes over the client area) ----
+        constexpr USHORT kReleased[] = {RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_UP,
+                                        RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_UP};
+        if (m.usButtonFlags & (RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_RIGHT_BUTTON_UP | RI_MOUSE_MIDDLE_BUTTON_UP |
+                               RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP)) {
+            const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;  // raw input: physical buttons, the rest logical
+            for (int b = 0; b < 5; b++)
+                if (m.usButtonFlags & kReleased[b]) g_buttons_for_game &= ~(1u << (swapped && b < 2 ? 1 - b : b));
+        }
+        // ---- end mouse buttons for the game ----
+        // ---- PC comfort features: wheel notches for the bindings (hle/pc_input.cpp), focused window only; and
+        // (GitHub #28) only over its client area or while it holds the mouse, not over the title bar or the frame ----
+        if ((m.usButtonFlags & RI_MOUSE_WHEEL) && GetForegroundWindow() == hwnd && !g_size_move &&
+            (g_mouse_captured || CursorInClient(hwnd)))
+            g_wheel += SHORT(m.usButtonData);
         // ---- end PC comfort features ----
         break;
     }
@@ -744,6 +913,13 @@ int TakeWheelNotches() {
 }
 
 bool MouseCaptured() { return g_mouse_captured; }
+
+// ---- mouse buttons for the game (GitHub #28) ----
+bool ButtonForGame(int vk) {
+    const int bit = ButtonBit(vk);
+    return bit < 0 || (!g_size_move && (g_buttons_for_game.load(std::memory_order_relaxed) >> bit & 1));
+}
+// ---- end mouse buttons for the game ----
 
 // settings menu
 void MenuShown(bool open) {

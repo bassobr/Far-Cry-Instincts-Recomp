@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>  // PC features: screen masks
 #include <chrono>
 #include <condition_variable>
 #include <cmath>  // PC shadows
@@ -110,6 +111,8 @@ bool g_depth_stencil = GetEnvironmentVariableA("FCI_DEPTH_STENCIL", nullptr, 0) 
 uint64_t g_generation = 1;  // advances at every flush; caches re-check guest memory once per generation
 uint64_t g_draws = 0, g_clears = 0;
 uint64_t g_fast_clears = 0, g_resolves = 0;  // performance: clears through the clear calls, MSAA resolves
+uint64_t g_target_copies = 0;  // GitHub #19: multisampled copies of the target a draw reads while drawing into it
+uint64_t g_mirror_reads = 0, g_mirror_writes = 0;  // GitHub #19: such reads from the target's mirror, draws into it
 uint64_t g_writebacks = 0;  // render target write-backs into guest memory; texture caches must look again
 uint64_t g_write_sequence = 0;  // orders host-side writes to targets that share memory
 
@@ -166,7 +169,12 @@ uint64_t Mix(uint64_t h, uint64_t v) {
 
 
 // ---- performance: FCI_GPU_TIMING=1: GPU time per frame by kind of pass (timestamp queries), every 300 frames ----
-enum class Pass { kNone, kShadow, kScreen, kOffscreen, kAo, kPost, kScreen3D, kScreenBlend, kResolve, kWater, kCount };
+// (kTargetCopy, GitHub #19: multisampled copies of the target a draw reads while drawing into it, counted as resolves)
+enum class Pass {
+    kNone, kShadow, kScreen, kOffscreen, kAo, kPost, kScreen3D, kScreenBlend, kResolve, kWater, kTargetCopy,
+    kSolids,  // PC shadows: the far pass's solid casters (SolidsReplay; in the shadow maps' time too)
+    kCount
+};
 struct GpuTiming {
     struct Mark {
         ComPtr<ID3D11Query> query;
@@ -252,7 +260,7 @@ struct GpuTiming {
                         by[int(f.marks[i].pass)] += double(t[i + 1] - t[i]) * 1000.0 / double(dj.Frequency);
                     rt::Log("hitch gpu: frame %llu GPU %.2f ms (average %.2f): shadow %.2f, screen %.2f, resolves %.2f, "
                             "offscreen %.2f, AO %.2f, post %.2f, between %.2f",
-                            (unsigned long long)f.number, ms, hitch_average, by[1], by[2] + by[6] + by[7], by[8], by[3],
+                            (unsigned long long)f.number, ms, hitch_average, by[1], by[2] + by[6] + by[7], by[8] + by[10], by[3],
                             by[4], by[5], by[0]);
                 }
                 hitch_average = hitch_average > 0 ? hitch_average + (std::min(ms, 2 * hitch_average) - hitch_average) / 30 : ms;
@@ -261,12 +269,14 @@ struct GpuTiming {
         for (auto& m : f.marks) spare.push_back(std::move(m.query));
         f.marks.clear();
         if (counted == 300) {
-            rt::Log("render: GPU per frame %.2f ms: shadow maps %.2f, screen %.2f (3D opaque %.2f, 3D blended %.2f, "
-                    "other %.2f), resolves %.2f, offscreen %.2f, ambient occlusion %.2f, post/present %.2f, between %.2f, "
-                    "PC water %.3f (in screen) (average of 300)",
-                    frame_total / counted, total[1] / counted, (total[2] + total[6] + total[7] + total[9]) / counted,
-                    total[6] / counted, total[7] / counted, total[2] / counted, total[8] / counted, total[3] / counted,
-                    total[4] / counted, total[5] / counted, total[0] / counted, total[9] / counted);
+            rt::Log("render: GPU per frame %.2f ms: shadow maps %.2f (solid casters %.3f), screen %.2f (3D opaque %.2f, 3D blended %.2f, "
+                    "other %.2f), resolves %.2f (copies of the target being drawn %.3f), offscreen %.2f, ambient occlusion "
+                    "%.2f, post/present %.2f, between %.2f, PC water %.3f (in screen) (average of 300)",
+                    frame_total / counted, (total[1] + total[11]) / counted, total[11] / counted,
+                    (total[2] + total[6] + total[7] + total[9]) / counted,
+                    total[6] / counted, total[7] / counted, total[2] / counted, (total[8] + total[10]) / counted,
+                    total[10] / counted, total[3] / counted, total[4] / counted, total[5] / counted, total[0] / counted,
+                    total[9] / counted);
             for (double& v : total) v = 0;
             frame_total = 0, counted = 0;
         }
@@ -295,6 +305,9 @@ bool g_frame_3d = false;  // a W-buffered (3D) draw went into a widened target s
 // the widened camera) and must not be narrowed or clipped to the 4:3 middle
 bool g_post_3d = false;
 float g_view_3d[4] = {};  // viewport (scale x, y, offset x, y) of the last 3D draw into a widened target
+// the HUD without post processing (DrawOne): this frame drew into a smaller target after its 3D view; whether the
+// last frame was a 3D frame without that
+bool g_frame_post = false, g_last_no_post = false;
 // fmv_scale (gpu/fmv.h): a video texture went full screen into a widened target since the last present; the frame
 // is shown at the widescreen aspect and the 2D over it stays in the 4:3 middle
 bool g_frame_video = false;
@@ -326,7 +339,10 @@ uint8_t g_stage_signs[4] = {};  // per stage of the current draw: channels decod
 // FCI_TRACE_HUD=watch (also with times: watch,<s>,...): a line whenever the per-frame summary changes: 3D draws after
 // the post processing (in another view: a new 3D view begins; in the same view: kept), 2D draws over the 3D view left
 // wide after such a new view (not its own 2D before its post processing), narrowed draws, draws classified otherwise
-// than before GitHub #17.
+// than if the HUD began only with post processing (before the HUD under water was fixed), screen masks (binoculars,
+// scopes) and the sides they filled, 2D draws over the view left wide before its post processing and while pixels
+// were counted. A widescreen 3D frame that narrowed nothing but had 8 or more such draws (its HUD stayed wide) has
+// the next frame traced draw by draw (three times per run).
 struct HudTrace {
     bool init = false, watch = false;
     int times = 0;
@@ -334,11 +350,16 @@ struct HudTrace {
     ULONGLONG start = 0;
     int frame = 0;  // 1: this frame is traced, -1: the next one is
     // watch: this frame's summary and the last one logged
-    uint32_t restarts = 0, kept = 0, wide_2d = 0, narrowed = 0, changed = 0;
-    uint32_t last[5] = {~0u, ~0u, ~0u, ~0u, ~0u};
+    uint32_t restarts = 0, kept = 0, wide_2d = 0, narrowed = 0, changed = 0, masks = 0, fills = 0;
+    // 2D draws over the 3D view left wide because the post processing had not begun (the sun's sprite; the whole HUD
+    // when a frame has no post processing), and 2D draws while pixels were counted (never classified)
+    uint32_t before_post = 0, counted = 0;
+    int automatic = 3;  // frames traced draw by draw on their own: after a frame whose HUD stayed wide
+    uint32_t last[9] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
     uint64_t frames = 0, since = 0;
-    // the classification before GitHub #17 (any 3D draw after the post processing began a new view, no clip space
-    // quads as full screen), for comparison: post processing begun, the first draw classified otherwise
+    // the classification as before the HUD under water was fixed (the HUD begins only with post processing: a draw
+    // into a smaller target after the 3D view), for comparison: post processing begun, the first draw classified
+    // otherwise
     bool old_post = false;
     char change[200] = {};
     char first[160] = {};  // the first 2D draw left wide
@@ -372,18 +393,29 @@ struct HudTrace {
     void Frame(float aspect) {
         if (watch) {
             frames++;
-            const uint32_t now[5] = {restarts, kept, wide_2d ? 1u : 0u, narrowed ? 1u : 0u, changed ? 1u : 0u};
+            // (2D before the post processing and counted 2D: whether there were many, the sun's sprite comes and goes)
+            const uint32_t now[9] = {restarts, kept, wide_2d ? 1u : 0u, narrowed ? 1u : 0u, changed ? 1u : 0u, masks,
+                                     fills, before_post >= 8 ? 1u : 0u, counted >= 8 ? 1u : 0u};
             if (std::memcmp(now, last, sizeof now)) {
                 rt::Log("render: hud trace: frame %llu (%.1f s): 3D after the post processing: %u new views, %u in "
                         "the same view%s%s; 2D left wide over a new view %u%s%s; narrowed %u; classified otherwise "
-                        "than before #17 %u%s%s; aspect %.3f (before: %llu frames)",
+                        "than with post processing alone %u%s%s; screen masks %u, sides filled %u; 2D left wide "
+                        "before the post processing %u, while counting pixels %u; aspect %.3f (before: %llu frames)",
                         (unsigned long long)frames, (GetTickCount64() - start) / 1000.0, restarts, kept,
                         restart[0] ? ", first: " : "", restart, wide_2d, wide_2d ? ", first: " : "", first, narrowed,
-                        changed, changed ? ", first: " : "", change, aspect, (unsigned long long)(frames - since));
+                        changed, changed ? ", first: " : "", change, masks, fills, before_post, counted, aspect,
+                        (unsigned long long)(frames - since));
                 std::memcpy(last, now, sizeof last);
                 since = frames;
             }
-            restarts = kept = wide_2d = narrowed = changed = 0;
+            // a widescreen 3D frame whose HUD stayed wide: the next but one draw by draw
+            if (frame == 0 && automatic > 0 && aspect > 1.34f && !narrowed && (before_post >= 8 || counted >= 8)) {
+                automatic--, frame = -1;
+                rt::Log("render: hud trace: frame %llu: HUD left wide (%u 2D draws before the post processing, %u "
+                        "while counting pixels), tracing a frame",
+                        (unsigned long long)frames, before_post, counted);
+            }
+            restarts = kept = wide_2d = narrowed = changed = masks = fills = before_post = counted = 0;
             first[0] = restart[0] = change[0] = 0;
         }
         old_post = false;
@@ -429,6 +461,15 @@ struct Target {
     ComPtr<ID3D11ShaderResourceView> resolved_srv, upload_srv;
     ComPtr<ID3D11RenderTargetView> shrunk_rtv;
     uint64_t resolved_version = ~0ull;
+    // GitHub #19: multisampled, a multisampled copy for a draw that reads this target while drawing into it
+    ComPtr<ID3D11Texture2D> ms_copy;
+    ComPtr<ID3D11ShaderResourceView> ms_copy_srv;
+    uint64_t ms_copy_version = ~0ull;
+    // GitHub #19, the target's mirror ("target mirror" below): the last draw into this target as a candidate for the
+    // pass before such a read
+    uint64_t last_draw_version = ~0ull, last_draw_geometry = 0;
+    const void* last_draw_vs = nullptr;  // null: the last draw could not write the mirror
+    const void* last_draw_ps = nullptr;
     // HLE: copies for CPU reads that do not wait for the GPU (NOOVERWRITE locks), in submission order
     ComPtr<ID3D11Texture2D> late[3];
     uint32_t late_next = 0, late_pending = 0;
@@ -811,6 +852,24 @@ DepthTarget* GetDepth(uint32_t address, uint32_t width, uint32_t height, bool z1
 // coordinates in the far map. A pass without the sun (a spot light) or without the other cascade's map still gives
 // its receivers its own map: never a map that does not match their coordinates.
 constexpr uint32_t kCascadeTag = 0x10000000;  // beyond guest RAM
+// ---- the far pass's solid casters near the player (GitHub #16, fourth report: "bigger meshes (rocks, walls) now
+// don't project any shadow"). The game's caster query (0x00475BE0 -> 0x00483990) walks from outdoors into the
+// visibility areas through portals inside the sun camera's frustum (0x004843D0 -> 0x004845C0); with the console's
+// square its result list stayed empty at both spots measured in 07_Sub-Aquatic_Facility, with the far pass's 61 and 68
+// entries (FCI_TRACE_CASTER_QUERY), and the far map held a large occluder over the near square that the near map lacked
+// (the console at shadow_distance 1 draws the same 48 casters as the near pass there). The far pass has them, but the far
+// map also holds the vegetation at the far pass's level of detail (the reason for the near map). So each far pass's
+// opaque draws (no alpha test, no alpha kill: rocks, walls, buildings, vehicles, trunks; not the leaves) are drawn a
+// second time into a map of their own over the near square (and a margin), at about the near map's resolution, in the
+// far camera's depth; the near map's receivers take the darker of it and the near map. The zoom is the viewport's (a
+// viewport larger than the target): the vertex shaders are the game's, unchanged. FCI_CASCADE_SOLIDS=0 (diagnostics)
+// leaves it out ----
+constexpr float kSolidsMargin = 1.5f;     // the solids' square: the near square's side times this, about its centre
+constexpr uint32_t kSolidsTag = 9;        // their host target: guest map + (9 + view) x kCascadeTag
+const bool g_solids_on = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("FCI_CASCADE_SOLIDS", v, sizeof v) && v[0] == '0');
+}();
 struct SunPass {
     bool active = false;
     int view = 0, which = 0;  // which: 0 near, 1 far
@@ -818,11 +877,23 @@ struct SunPass {
     uint32_t address[4] = {};
     DepthTarget* target[4] = {};
     int maps = 0;
+    // a far pass: its solid casters' map (cleared when the far map is first bound), its square in the far map's
+    // texture coordinates (u0, v0, side u, side v) and the draws it got
+    float solids_square[4] = {};
+    bool solids_wanted = false;
+    DepthTarget* solids = nullptr;
+    uint32_t solids_draws = 0;
 };
 SunPass g_sun_pass;
 struct ViewMaps {
     uint32_t address = 0;            // the guest map they stand in for
     DepthTarget* map[2] = {};        // near, far
+    // the near square in the far map's texture coordinates (u0, v0, side u, side v), from the last near pass
+    float near_square[4] = {};
+    bool near_square_valid = false;
+    // the solid casters of the far pass that drew map[1], and their square in its texture coordinates
+    DepthTarget* solids = nullptr;
+    float solids_square[4] = {};
 };
 ViewMaps g_view_maps[4];
 struct ShadowBinding {  // what receivers of a guest map read (set after each pass)
@@ -833,16 +904,30 @@ struct ShadowBinding {  // what receivers of a guest map read (set after each pa
     DepthTarget* far_map = nullptr;
     // (u, v, depth) in either map = these x the receivers' (the game's: this frame's map) (u, v, depth, 1)
     float n[3][4] = {}, f[3][4] = {};
+    DepthTarget* solids_map = nullptr;  // the far pass's solid casters (null: none), at (far uv - xy) * zw
+    float solids_xform[4] = {};
 };
 ShadowBinding g_bindings[8];
 struct CascadeConstants {
     float n[3][4], f[3][4];  // psh.cpp's cascade_n, cascade_f
-    float fade[4];           // x: 1 / the fading edge in near map coordinates
+    float fade[4];           // x: 1 / the fading edge in near map coordinates, y: 1 with the solid casters' map
+    float solids[4];         // its coordinates: (far map uv - xy) * zw
 };
 uint64_t g_cascade_draws = 0;  // draws into near maps (statistics)
 DepthTarget* g_stage_depth[4] = {};  // the depth target a stage samples (GetTexture), else null
 const ShadowBinding* g_stage_binding[4] = {};  // and the binding it came from
-std::atomic<bool> g_cascades_on{false};  // shadow_cascades (live; with near_scale 0 they stay off)
+std::atomic<bool> g_cascades_on{false};
+// the receivers' maps (t4-t6) are bound: unbound before a shadow pass binds one of them as its depth target (the
+// runtime would otherwise unbind them itself, with a D3D11 debug layer warning #9/#7 at each such pass)
+bool g_cascade_maps_bound = false;  // shadow_cascades (live; with near_scale 0 they stay off)
+// whether a view's passes draw the sun's map alone (EndSunShadowPass): with more maps in a pass (spot lights besides the
+// sun, the game's four map mode) or no sun the renderer cannot pair the passes, and its receivers read each pass's own
+// map; an alternating pass then gave them the console's square in every other frame (GitHub #16: 00_Training's wreck
+// flickered in 100 % of the frames with shadow_cascades on, 0.1.7 included, not with them off)
+// (hysteresis: the game draws a second light's map in some passes only, e.g. every other one at 00_Training's wreck;
+// after any such pass the view stays on the far square until kSunOnlyPasses passes in a row drew the sun alone)
+constexpr int kSunOnlyPasses = 16;
+std::atomic<int> g_sun_only_passes[4] = {kSunOnlyPasses, kSunOnlyPasses, kSunOnlyPasses, kSunOnlyPasses};
 bool g_cascades_logged = false;
 constexpr float kCascadeFade = 10.0f;
 // diagnostics: FCI_TRACE_CASCADE=<from>-<to> (seconds since the start, as FCI_DUMP_FRAMES_WINDOW): a line per frame
@@ -859,6 +944,24 @@ struct CascadeTrace {
     Count z16[8] = {};
     int n_z16 = 0;
     uint32_t with = 0, without = 0, without_address = 0;
+    uint32_t solids = 0;  // the far pass's draws into its solid casters' map
+    // the distinct cascade bindings the frame's receivers used (near/far map, matrices), the first one in full
+    uint64_t keys[8] = {};
+    int n_keys = 0;
+    float first[24] = {};
+    const void* first_maps[2] = {};
+    void Binding(const void* near_map, const void* far_map, const float* n, const float* f) {
+        uint64_t key = reinterpret_cast<uintptr_t>(near_map) * 31 + reinterpret_cast<uintptr_t>(far_map);
+        for (int i = 0; i < 12; i++) {
+            uint32_t a, b;
+            std::memcpy(&a, n + i, 4), std::memcpy(&b, f + i, 4);
+            key = key * 1000003 ^ a, key = key * 1000003 ^ b;
+        }
+        for (int i = 0; i < n_keys; i++)
+            if (keys[i] == key) return;
+        if (!n_keys) std::memcpy(first, n, 48), std::memcpy(first + 12, f, 48), first_maps[0] = near_map, first_maps[1] = far_map;
+        if (n_keys < 8) keys[n_keys++] = key;
+    }
     bool On() {
         if (!init) {
             init = true;
@@ -887,14 +990,40 @@ struct CascadeTrace {
                 std::snprintf(t + n, sizeof t - n, " %08X%s:%u", z16[i].address, z16[i].near_map ? "n" : "",
                               z16[i].draws);
             }
-            rt::Log("render: cascade trace: %06llu at %.3f s, frame %llu passes '%s' z16%s receivers %u cascade, %u "
-                    "not (%08X)", (unsigned long long)++sequence, now, (unsigned long long)frame, passes, t, with,
-                    without, without_address);
+            rt::Log("render: cascade trace: %06llu at %.3f s, frame %llu passes '%s' z16%s solids %u receivers %u "
+                    "cascade, %u not (%08X); %d bindings, first: maps %p %p n %.6f %.6f %.6f %.6f / %.6f %.6f %.6f "
+                    "%.6f / %.6f %.6f %.6f %.6f f %.6f %.6f %.6f %.6f / %.6f %.6f %.6f %.6f / %.6f %.6f %.6f %.6f",
+                    (unsigned long long)++sequence, now, (unsigned long long)frame, passes, t, solids, with, without,
+                    without_address, n_keys, first_maps[0], first_maps[1], first[0], first[1], first[2], first[3],
+                    first[4], first[5], first[6], first[7], first[8], first[9], first[10], first[11], first[12],
+                    first[13], first[14], first[15], first[16], first[17], first[18], first[19], first[20], first[21],
+                    first[22], first[23]);
         }
-        passes[0] = 0, n_z16 = 0, with = without = without_address = 0;
+        passes[0] = 0, n_z16 = 0, with = without = without_address = 0, n_keys = 0, solids = 0;
     }
 };
 CascadeTrace g_cascade_trace;
+// diagnostics: FCI_DUMP_CASCADE_MAPS=<from>-<to> (seconds, the clock of FCI_TRACE_CASCADE): every sun pass's map in
+// that window as cascade_<sequence>_<n|f>.r16 (raw 16 bit depth at host size, rows top down) next to the EXE, and a line
+// per map in cascade_maps.txt (sequence, frame, time, near/far, both maps, host and guest size, the matrix m to the
+// other map's texture coordinates and depth before the pixel centre shift, this pass's clip from world in rows).
+// Offline: does the other map hold the same surfaces where m says (GitHub #16 analysis)?
+struct CascadeDump {
+    bool init = false;
+    double from = -1, to = -1;
+    uint64_t sequence = 0;
+    bool On() {
+        if (!init) {
+            init = true;
+            char v[64] = {};
+            if (GetEnvironmentVariableA("FCI_DUMP_CASCADE_MAPS", v, sizeof v)) std::sscanf(v, "%lf-%lf", &from, &to);
+        }
+        if (from < 0) return false;
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_cascade_trace.start).count();
+        return now >= from && now <= to;
+    }
+};
+CascadeDump g_cascade_dump;
 // ---- end PC shadows ----
 
 struct Surfaces {
@@ -962,6 +1091,35 @@ Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool ref
                 g_sun_pass.address[i] = guest, g_sun_pass.target[i] = out.depth;
                 g_sun_pass.maps = std::max(g_sun_pass.maps, i + 1);
             }
+            // a far pass: the map of its solid casters (kSolidsMargin), cleared once per pass, the guest map's size at
+            // the near map's scale (at most 4: the viewport that zooms into it stays inside D3D 11's bounds)
+            if (g_sun_pass.which && g_sun_pass.solids_wanted && !g_sun_pass.solids) {
+                static const float scale_override = [] {  // diagnostics: FCI_SOLIDS_SCALE=<n> (cost)
+                    char v[8] = {};
+                    return GetEnvironmentVariableA("FCI_SOLIDS_SCALE", v, sizeof v) ? float(std::atof(v)) : 0.0f;
+                }();
+                g_sun_pass.solids = GetDepth(guest + kCascadeTag * (kSolidsTag + uint32_t(g_sun_pass.view)), out.width,
+                                             out.height, true, scale_override > 0 ? scale_override : std::min(float(g_q.near_scale), 4.0f), 1);
+                if (g_sun_pass.solids && g_sun_pass.solids->dsv) {
+                    g_context->ClearDepthStencilView(g_sun_pass.solids->dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+                    // the square on a grid of the far map's guest texel / n (n whole, its side about the one wanted):
+                    // the game moves the far camera by whole guest texels, so the solids' texels stay put in the
+                    // world from pass to pass. Unsnapped, their grid slid by fractions of a texel with every far pass
+                    // and shadow edges changed in every other frame while the camera moved (21:9, walking and turning)
+                    float* sq = g_sun_pass.solids_square;
+                    const DepthTarget& st = *g_sun_pass.solids;
+                    for (int a = 0; a < 2; a++) {
+                        const float guest = float(a ? out.height : out.width);
+                        const float host = float(a ? HostHeightOf(st.height, st.scale) : HostWidthOf(st.width, st.scale, 1.0f));
+                        const float n = std::max(1.0f, std::round(host / (guest * sq[2 + a])));
+                        const float side = host / (guest * n), cell = 1.0f / (guest * n);
+                        const float centre = sq[a] + 0.5f * sq[2 + a];
+                        sq[a] = std::floor((centre - 0.5f * side) / cell) * cell, sq[2 + a] = side;
+                    }
+                } else {
+                    g_sun_pass.solids = nullptr, g_sun_pass.solids_wanted = false;
+                }
+            }
         }
         if (zeta == 1 && g_cascade_trace.from >= 0) g_cascade_trace.Target(address, to_cascade);  // diagnostics
     }
@@ -969,6 +1127,11 @@ Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool ref
     out.clip.left = LONG(out.clip.left * sx + 0.5f), out.clip.right = LONG(out.clip.right * sx + 0.5f);
     out.clip.top = LONG(out.clip.top * out.scale + 0.5f), out.clip.bottom = LONG(out.clip.bottom * out.scale + 0.5f);
     ID3D11RenderTargetView* rtv = out.color ? out.color->rtv.Get() : nullptr;
+    if (g_cascade_maps_bound && out.depth && out.depth->z16) {  // PC shadows: the receivers' maps off first
+        ID3D11ShaderResourceView* none[3] = {};
+        g_context->PSSetShaderResources(4, 3, none);
+        g_cascade_maps_bound = false;
+    }
     g_context->OMSetRenderTargets(rtv ? 1 : 0, rtv ? &rtv : nullptr, out.depth ? out.depth->dsv.Get() : nullptr);
     if (g_gpu_timing.enabled)  // performance: FCI_GPU_TIMING
         g_gpu_timing.Begin(out.depth && out.depth->z16 ? Pass::kShadow
@@ -1074,6 +1237,10 @@ uint64_t SourceHash(const std::string& source, const char* profile) {
                kCacheVersion);
 }
 
+// GitHub #19: set on the thread compiling a shader that has a fallback (a stage on the multisampled target being
+// drawn: DrawOne goes back to the resolved copy), whose failure needs no message box
+thread_local bool g_hlsl_has_fallback = false;
+
 // (performance: also on the shader workers, at the same time)
 ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile, uint64_t key = 0) {
     static std::mutex lock;  // the counters, the dump names
@@ -1100,8 +1267,10 @@ ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile, uint64_
     ComPtr<ID3DBlob> code, errors;
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceCounter(&t0);
+    g_hlsl_has_fallback = source.find("Texture2DMS<float4>") != std::string::npos;  // GitHub #19 (psh.cpp, kTargetMS)
     HRESULT hr = CompileHlsl(source.data(), source.size(), profile, nullptr, nullptr, "main", profile,
                              D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors);
+    g_hlsl_has_fallback = false;
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&freq);
     {
@@ -1457,7 +1626,8 @@ VertexShader* GetVertexShader(const State& s, uint16_t enabled, const uint8_t* f
     return vs.shader ? &vs : nullptr;
 }
 
-ID3D11PixelShader* GetPixelShader(const State& s, const psh::Config& config) {
+// failed (optional): set when the shader cannot be made (it failed to compile), not while it is still being made
+ID3D11PixelShader* GetPixelShader(const State& s, const psh::Config& config, bool* failed = nullptr) {
     uint64_t key = psh::Key(s, config);
     auto it = g_pixel_shaders.find(key);
     if (it == g_pixel_shaders.end()) {
@@ -1488,6 +1658,7 @@ ID3D11PixelShader* GetPixelShader(const State& s, const psh::Config& config) {
         ps.shader = std::move(ps.job->ps);
         ps.job.reset();
     }
+    if (failed && !ps.shader) *failed = true;
     return ps.shader.Get();
 }
 
@@ -1520,7 +1691,165 @@ bool DirtyOverlap(uint32_t address, uint32_t size) {
 // instead of a round trip through guest memory
 ID3D11ShaderResourceView* Resolved(Target& t);
 
-ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[2]) {
+// ---- GitHub #19: a draw that reads the multisampled target it draws into ----
+// FCI draws its terrain and rocks twice over the same strips: a lighting pass, then a colour pass whose stage 3 reads
+// the frame buffer back at the pixel's own position (textures x lighting, see WaterGround). The resolved copy is the
+// average of a pixel's samples: where a piece covers only part of an edge pixel the rest is still sky, and the
+// colour pass came out over-bright there (thin dashed lines along the pieces' edges with MSAA). Such a stage reads a
+// multisampled copy instead (psh::Sampler::kTargetMS: the samples its fragment covers). FCI_NO_TARGET_MS=1 or
+// a shader that fails to compile (DrawOne): the resolved copy as before.
+bool g_target_ms_off = GetEnvironmentVariableA("FCI_NO_TARGET_MS", nullptr, 0) > 0;
+Target* g_stage_target_ms[4] = {};  // per stage of the current draw: the target whose multisampled copy it reads
+bool g_target_ms_skip = false;      // DrawOne, while it takes a stage back to the resolved copy
+bool g_target_ms_flip_on = true;    // diagnostics: FCI_TARGET_MS_FLIP (Present)
+UINT8 WriteMask(uint32_t color_mask);
+
+// the target's multisampled copy as of its current contents
+ID3D11ShaderResourceView* TargetCopy(Target& t) {
+    if (!t.ms_copy) {
+        D3D11_TEXTURE2D_DESC desc;
+        t.texture->GetDesc(&desc);
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &t.ms_copy))) return nullptr;
+        if (FAILED(g_device->CreateShaderResourceView(t.ms_copy.Get(), nullptr, &t.ms_copy_srv))) {
+            t.ms_copy.Reset();
+            return nullptr;
+        }
+    }
+    if (t.ms_copy_version != t.version) {
+        if (g_gpu_timing.enabled) g_gpu_timing.Begin(Pass::kTargetCopy);  // performance: FCI_GPU_TIMING
+        g_context->CopyResource(t.ms_copy.Get(), t.texture.Get());
+        t.ms_copy_version = t.version;
+        g_target_copies++;
+    }
+    return t.ms_copy_srv.Get();
+}
+
+// ---- GitHub #19, the target's mirror. A copy per read costs (3-9 a frame, the whole multisampled target each:
+// ~0.11 ms at 3440x1440 4x, on the Steam Deck 1.45 ms a frame in all). What reads the target is FCI's terrain colour
+// pass, each right after its lighting pass over the same strips (draw trace: A B A B ..., A opaque without blending,
+// writing depth, B LEQUAL without depth writes, the same vertices): it needs, at the samples it covers, what A has just
+// written there. So A writes its colour a second time into the target's mirror (a multisampled target of the same
+// shape, render target 1: the same samples, as coverage and the depth test are the target's), alpha a marker of the
+// draw (1..255), and B reads the mirror instead of a copy: where the marker is A's, the mirror holds the bytes the
+// frame holds (the same float into the same format) as nothing has drawn since (the version). Which draws write it is
+// learnt: a read that finds no mirror takes the copy and makes the draw before it a writer (by its shaders) if that
+// draw wrote the target just before, over the same geometry, and could write the mirror (multisampled, not blended,
+// rgb written, ...); from then on such draws write the mirror (their shader with SV_Target1 once it is made, until then
+// without). psh.cpp reads it. The filter's texels (the own pixel when B covers it all, and a few percent of the
+// neighbours for the coordinates' sub-pixel offset) come from the target's resolved copy, as the copy's do: one resolve
+// per read instead of a multisampled copy (the neighbours may hold what other surfaces drew: not in the mirror; read
+// from the mirror's marked samples instead, FCI_TARGET_MIRROR_MARKED=1, 0.6 % of the pixels came out a few levels
+// apart at the ledge in 06_Cliffs). FCI_TARGET_MS_COPY=1: always the copy, as before; a shader of the mirror that does
+// not compile: the copy from then on ----
+bool g_target_mirror_off = GetEnvironmentVariableA("FCI_TARGET_MS_COPY", nullptr, 0) > 0;
+bool g_target_mirror_flip_on = true;  // diagnostics: FCI_TARGET_MS_FLIP with FCI_TARGET_MS_FLIP_COPY=1 (Present)
+uint64_t g_draw_geometry = 0;          // DrawOne: the current draw's GeometryKey
+uint8_t g_stage_target_mirror = 0;     // per stage (bit) of the current draw: reads the mirror of g_stage_target_ms
+uint32_t g_stage_mirror_mark = 0;      // the marker those stages read
+std::vector<std::pair<const void*, const void*>> g_mirror_writers;  // (vertex shader, pixel shader) of such passes
+constexpr size_t kMirrorWriters = 64;
+
+// a draw's geometry, enough to tell the same strips drawn again (constant time: a few vertices, not all)
+uint64_t GeometryKey(const kelvin::Draw& d) {
+    uint64_t h = Mix(Mix(d.primitive, d.count), Mix(d.enabled, uint32_t(d.raw)));
+    if (d.raw) {
+        h = Mix(h, Mix(d.first, d.span));
+        h = Mix(h, d.ids.size());
+        if (!d.ids.empty()) h = Mix(h, Mix(d.ids.front(), Mix(d.ids[d.ids.size() / 2], d.ids.back())));
+        for (int i = 0; i < kelvin::kAttributes; i++) {  // the first attribute's bytes of the first and last vertex
+            if (!(d.enabled & (1u << i)) || !d.data[i]) continue;
+            const uint32_t bytes = std::min<uint32_t>(kelvin::RawBytes(d.format[i]), 16);
+            uint64_t a = 0, b = 0;
+            std::memcpy(&a, d.data[i], std::min<uint32_t>(bytes, 8));
+            std::memcpy(&b, d.data[i] + size_t(d.span ? d.span - 1 : 0) * d.data_stride[i], std::min<uint32_t>(bytes, 8));
+            h = Mix(h, Mix(a, b));
+            break;
+        }
+    } else if (!d.vertices.empty()) {
+        const std::vector<float>& v = d.vertices;
+        uint32_t x[3];
+        std::memcpy(&x[0], &v.front(), 4), std::memcpy(&x[1], &v[v.size() / 2], 4), std::memcpy(&x[2], &v.back(), 4);
+        h = Mix(h, Mix(x[0], Mix(x[1], x[2])));
+    }
+    return h;
+}
+
+bool MirrorWriter(const void* vs, const void* ps) {
+    for (const auto& w : g_mirror_writers)
+        if (w.first == vs && w.second == ps) return true;
+    return false;
+}
+
+// One mirror serves all targets of its shape (the frame's two buffers): what it holds belongs to the target whose
+// write it was last (owner_write: that draw's g_write_sequence, unique, and the target's version after it)
+struct Mirror {
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    D3D11_TEXTURE2D_DESC desc{};
+    uint32_t next = 0;  // the last marker given (1..255)
+    uint32_t mark = 0;  // the marker of the last draw that wrote it
+    uint64_t owner_write = ~0ull, owner_version = ~0ull, geometry = 0;  // that draw: its write, target version, geometry
+};
+std::vector<std::unique_ptr<Mirror>> g_mirrors;
+
+// the mirror for t's shape, made the first time (null: it cannot be, the copy from then on)
+Mirror* MirrorFor(const Target& t) {
+    D3D11_TEXTURE2D_DESC desc;
+    t.texture->GetDesc(&desc);
+    for (auto& m : g_mirrors)
+        if (m->desc.Width == desc.Width && m->desc.Height == desc.Height && m->desc.Format == desc.Format &&
+            m->desc.SampleDesc.Count == desc.SampleDesc.Count && m->desc.SampleDesc.Quality == desc.SampleDesc.Quality)
+            return m.get();
+    if (g_target_mirror_off) return nullptr;
+    auto m = std::make_unique<Mirror>();
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = 0, desc.CPUAccessFlags = 0, desc.Usage = D3D11_USAGE_DEFAULT;
+    if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &m->texture)) ||
+        FAILED(g_device->CreateRenderTargetView(m->texture.Get(), nullptr, &m->rtv)) ||
+        FAILED(g_device->CreateShaderResourceView(m->texture.Get(), nullptr, &m->srv))) {
+        g_target_mirror_off = true;
+        rt::Log("render: the target's mirror (%ux%u, %u samples) could not be made: copies from now on (GitHub #19)",
+                desc.Width, desc.Height, desc.SampleDesc.Count);
+        return nullptr;
+    }
+    m->desc = desc;
+    const float zero[4] = {};
+    g_context->ClearRenderTargetView(m->rtv.Get(), zero);  // (no marker anywhere)
+    rt::Log("render: a mirror for the pass that reads the target it draws into: %ux%u, %u samples (target %08X, "
+            "GitHub #19)", desc.Width, desc.Height, desc.SampleDesc.Count, t.address);
+    g_mirrors.push_back(std::move(m));
+    return g_mirrors.back().get();
+}
+
+// a stage that reads the multisampled target being drawn: the mirror when the draw before wrote it over the same
+// geometry, else the copy (and the draw before becomes a writer if it could be one). s: the draw's state
+ID3D11ShaderResourceView* SelfRead(Target& t, int stage, const State& s) {
+    if (!g_target_mirror_off && g_target_mirror_flip_on && !psh::StageAlphaUsed(s, stage)) {
+        Mirror* m = nullptr;
+        for (auto& k : g_mirrors)
+            if (k->owner_write == t.last_write) m = k.get();
+        if (m && m->owner_version == t.version && m->geometry == g_draw_geometry) {
+            g_stage_target_mirror |= uint8_t(1u << stage);
+            g_stage_mirror_mark = m->mark;
+            return m->srv.Get();
+        }
+        if (t.last_draw_vs && t.last_draw_version == t.version && t.last_draw_geometry == g_draw_geometry &&
+            !MirrorWriter(t.last_draw_vs, t.last_draw_ps) && g_mirror_writers.size() < kMirrorWriters) {
+            g_mirror_writers.push_back({t.last_draw_vs, t.last_draw_ps});
+            rt::Log("render: the draw before a read of the target it draws into (%08X) writes the target's mirror "
+                    "from now on (%zu such shaders, GitHub #19)", t.address, g_mirror_writers.size());
+        }
+    }
+    return TargetCopy(t);
+}
+// ---- end the target's mirror ----
+// ---- end GitHub #19 ----
+
+// self: the colour target's address when the stage may read it as kTargetMS (GetTextureOf), else ~0u; s: the draw's
+ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[4], psh::Sampler& kind, int stage,
+                                         uint32_t self, const State& s) {
     bool linear = d.color == 0x12, swizzled = d.color == 0x06;  // LIN_A8R8G8B8, SZ_A8R8G8B8
     if (!linear && !swizzled) return nullptr;
     Target* found = nullptr;
@@ -1541,8 +1870,15 @@ ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[2])
         }
         if (Target* t = found) {
             uint32_t first = (d.address - t->address) / d.pitch;
-            auto& r = t->rows[{first, d.height}];
             const uint32_t row0 = HostHeightOf(first, t->scale), row1 = HostHeightOf(first + d.height, t->scale);
+            if (t->samples > 1 && t->address == self)  // GitHub #19: the rows of the target being drawn (split screen)
+                if (ID3D11ShaderResourceView* copy = SelfRead(*t, stage, s)) {  // (or the mirror)
+                    kind = psh::Sampler::kTargetMS, g_stage_target_ms[stage] = t;
+                    scale[0] = float(t->HostWidth()) / float(t->width), scale[1] = float(row1 - row0) / float(d.height);
+                    scale[2] = float(row0), scale[3] = float(row1);
+                    return copy;
+                }
+            auto& r = t->rows[{first, d.height}];
             if (!r.texture) {
                 D3D11_TEXTURE2D_DESC desc{t->HostWidth(), row1 - row0, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
                                           D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
@@ -1561,6 +1897,14 @@ ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[2])
             return r.srv.Get();
         }
         return nullptr;
+    }
+    if (Target* t = found; t && t->samples > 1 && linear && t->address == self) {  // GitHub #19
+        if (ID3D11ShaderResourceView* copy = SelfRead(*t, stage, s)) {  // (or the mirror)
+            kind = psh::Sampler::kTargetMS, g_stage_target_ms[stage] = t;
+            scale[0] = float(t->HostWidth()) / float(t->width), scale[1] = float(t->HostHeight()) / float(t->height);
+            scale[2] = 0, scale[3] = float(t->HostHeight());
+            return copy;
+        }
     }
     if (Target* t = found; t && t->samples > 1) {  // performance: one resolve serves snapshots and the present
         ID3D11ShaderResourceView* r = Resolved(*t);
@@ -1761,6 +2105,8 @@ ID3D11ShaderResourceView* GetTextureOf(const State& s, int stage, psh::Sampler& 
     g_stage_video[stage] = 0;  // PC features: fmv_scale
     g_stage_depth[stage] = nullptr, g_stage_binding[stage] = nullptr;  // PC shadows
     g_stage_signs[stage] = 0;  // signed textures (GitHub #14)
+    g_stage_target_ms[stage] = nullptr;  // GitHub #19
+    g_stage_target_mirror &= uint8_t(~(1u << stage));  // GitHub #19, the target's mirror
     uint32_t control0 = s.Reg(SET_TEXTURE_CONTROL0 + base);
     if (!(control0 & 0x40000000)) return nullptr;
     uint32_t format = s.Reg(SET_TEXTURE_FORMAT + base);
@@ -1811,8 +2157,19 @@ ID3D11ShaderResourceView* GetTextureOf(const State& s, int stage, psh::Sampler& 
             return srv;
         }
     }
-    if (!g_no_snapshot)
-        if (ID3D11ShaderResourceView* srv = TargetSnapshot(d, scale)) return srv;
+    if (!g_no_snapshot) {
+        // GitHub #19: a projective stage with clamped addressing over the colour target this draw writes may read its
+        // multisampled copy
+        uint32_t self = ~0u;
+        const uint32_t program = (s.Reg(SET_SHADER_STAGE_PROGRAM) >> (5 * stage)) & 0x1F;
+        const uint32_t address = s.Reg(SET_TEXTURE_ADDRESS + base), u = address & 0xF, v = (address >> 8) & 0xF;
+        if (g_hle && !g_target_ms_off && g_target_ms_flip_on && !g_target_ms_skip && kind == psh::Sampler::kRect &&
+            (program == 1 || program == 2) &&
+            (u == 3 || u == 5) && (v == 3 || v == 5) && (s.Reg(SET_SURFACE_FORMAT) & 0xF) &&
+            WriteMask(s.Reg(SET_COLOR_MASK)))
+            self = ResolveDma(s.Reg(SET_CONTEXT_DMA_COLOR)) + s.Reg(SET_SURFACE_COLOR_OFFSET);
+        if (ID3D11ShaderResourceView* srv = TargetSnapshot(d, scale, kind, stage, self, s)) return srv;
+    }
 
     uint64_t key = Mix(Mix(Mix(d.address, d.color), Mix(d.width, d.height)), Mix(Mix(d.depth, d.levels),
                                                                                   Mix(d.cube, Mix(d.pitch, d.palette))));
@@ -1979,8 +2336,11 @@ UINT8 WriteMask(uint32_t color_mask) {
                  ((color_mask >> 24) & 1 ? 8 : 0));
 }
 
-ID3D11BlendState* GetBlendState(bool enable, uint32_t src, uint32_t dst, uint32_t equation, UINT8 mask) {
+// mirror (GitHub #19, the target's mirror): render target 1 as well, with the same blend, all channels written
+ID3D11BlendState* GetBlendState(bool enable, uint32_t src, uint32_t dst, uint32_t equation, UINT8 mask,
+                                bool mirror = false) {
     uint64_t key = Mix(Mix(enable, src), Mix(dst, Mix(equation, mask)));
+    if (mirror) key = Mix(key, 0x19191919u);
     auto& state = g_blend_states[key];
     if (state) return state.Get();
     D3D11_BLEND_DESC desc{};
@@ -1990,6 +2350,11 @@ ID3D11BlendState* GetBlendState(bool enable, uint32_t src, uint32_t dst, uint32_
     rt.SrcBlendAlpha = BlendFactor(src, true), rt.DestBlendAlpha = BlendFactor(dst, true);
     rt.BlendOpAlpha = BlendOp(equation);
     rt.RenderTargetWriteMask = mask;
+    if (mirror) {
+        desc.IndependentBlendEnable = TRUE;
+        desc.RenderTarget[1] = rt;
+        desc.RenderTarget[1].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    }
     g_device->CreateBlendState(&desc, &state);
     return state.Get();
 }
@@ -2029,6 +2394,56 @@ struct PixelConstants {
     float final_factor[2][4];
     float depth_bias[4];
 };
+
+// ---- PC shadows: the far pass's solid casters (kSolidsMargin), recorded while the pass draws and drawn into their map
+// at its end in one go (SolidsReplay): switching the depth target to their map and back around each of a few hundred
+// draws cost the GPU ~6 us a draw (00_Training: unlimited fps 368 against 477 without the map). Each recorded draw keeps
+// its own copy of its geometry and constants (the shared rings wrap, the constant buffers are rewritten per draw) ----
+struct SolidsDraw {
+    VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;  // null: depth only (the pixel shader neither writes the depth nor discards)
+    D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11RasterizerState* raster = nullptr;
+    ID3D11DepthStencilState* depth = nullptr;
+    UINT ref = 0;
+    int slots = 0;
+    UINT strides[kAttributes] = {}, offsets[kAttributes] = {};  // into the batch's geometry
+    bool indexed = false;
+    DXGI_FORMAT index_format = DXGI_FORMAT_R16_UINT;
+    UINT index_offset = 0, count = 0;
+    uint32_t constants = 0;  // its entry in the batch's constants
+};
+struct SolidsBatch {
+    std::vector<SolidsDraw> draws;
+    std::vector<uint8_t> geometry;  // pieces 256 byte aligned
+    std::vector<VertexConstants> vc;
+    std::vector<PixelConstants> pc;
+    ComPtr<ID3D11Buffer> buffer;  // the geometry on the GPU (vertices and indices)
+    UINT capacity = 0;
+    UINT Add(const void* data, size_t size) {
+        const size_t at = (geometry.size() + 255) & ~size_t(255);
+        geometry.resize(at + size);
+        std::memcpy(geometry.data() + at, data, size);
+        return UINT(at);
+    }
+    void Clear() { draws.clear(), geometry.clear(), vc.clear(), pc.clear(); }
+};
+SolidsBatch g_solids_batch;
+// the viewport that zooms the far map's coordinates onto the solids' square (false: beyond D3D 11's bounds)
+bool SolidsViewport(const DepthTarget& t, const float* sq, D3D11_VIEWPORT& vp) {
+    const float ws = float(HostWidthOf(t.width, t.scale, 1.0f)), hs = float(HostHeightOf(t.height, t.scale));
+    vp = {-sq[0] * ws / sq[2], -sq[1] * hs / sq[3], ws / sq[2], hs / sq[3], 0, 1};
+    return vp.TopLeftX >= D3D11_VIEWPORT_BOUNDS_MIN && vp.TopLeftY >= D3D11_VIEWPORT_BOUNDS_MIN &&
+           vp.TopLeftX + vp.Width <= D3D11_VIEWPORT_BOUNDS_MAX && vp.TopLeftY + vp.Height <= D3D11_VIEWPORT_BOUNDS_MAX;
+}
+// diagnostics (cost): FCI_SOLIDS_PROFILE=immediate draws each solid caster at once (switching the depth target around
+// it, as first done); =switch only switches, =noswitch only draws again on the far map, beside it (both: immediate)
+const int g_solids_profile = [] {
+    char v[16] = {};
+    GetEnvironmentVariableA("FCI_SOLIDS_PROFILE", v, sizeof v);
+    return !std::strcmp(v, "immediate") ? 1 : !std::strcmp(v, "switch") ? 2 : !std::strcmp(v, "noswitch") ? 3 : 0;
+}();
+// ---- end PC shadows ----
 
 ComPtr<ID3D11Buffer> g_clear_constants;
 ComPtr<ID3D11VertexShader> g_clear_vs;
@@ -3022,6 +3437,154 @@ bool StageSamples(uint32_t program) {
            program == 16;
 }
 
+// ---- PC features: screen masks in widescreen (binoculars, scopes) ----
+// Binoculars and scopes lay a mask over the 3D view: an opaque dark frame with holes (the binoculars' two lenses, the
+// scope's circle), drawn in parts. Binoculars: a lens strip 640x360 across the 4:3 picture (12 vertices, texture
+// 512x128 mirrored) and a frame of 26 quads around it out to 16:9 (x -107.5..746.5, a 1x1 texture tinted #101010,
+// alpha 0.95). Scopes (SL8, Barrett): the circle as 4 quads 512x512 (texture 256x256) and two side bars out to 16:9.
+// While they come up (about 0.5 s) all parts start larger than the screen and shrink about its centre.
+// The HUD rule (DrawOne) narrowed the parts inside the screen into the 4:3 middle and left those covering the screen
+// stretched over the whole width: the lenses/circle sat in a 4:3 middle with the game visible beside them, and while
+// a scope came up the circle was an ellipse. A screen mask is a 2D draw of the HUD (after the post processing) of more
+// than one quad that spans the 4:3 width and at least 0.7 of its view's height, blends over what is behind (or does not
+// blend) and is opaque at its left and right edge: texel alpha at its outermost vertices and along the texture's
+// column between them, times their vertex alpha relative to the draw's highest (masks fade in as a whole), >= 0.75.
+// Single quads keep the full screen rule (tints, fades, the bloom). A mask is narrowed like the HUD, so it keeps its
+// shape, but not cut to the 4:3 middle; each side beyond it is filled with its own edge: the draw once more, stretched
+// kMaskStretch times about a point 2 guest pixels inside that edge and scissored to the strip between the screen edge
+// and the mask, which clamps the edge's texels outwards (at 16:9 FCI's own frame and bars reach the screen edges:
+// nothing to fill). Of nested masks (the lenses inside the frame) only the outermost fills a side: one whose side had
+// another mask further out over its rows of the view in the last frame leaves it to that one (both would blend
+// there, the strip a shade darker than the frame). FCI_NO_SCREEN_MASK=1: classified as before (diagnostics).
+constexpr float kMaskStretch = 1024.0f;
+const bool g_no_screen_mask = GetEnvironmentVariableA("FCI_NO_SCREEN_MASK", nullptr, 0) > 0;
+// FCI_NO_HUD_START=1: the HUD begins only after post processing, as before (diagnostics; DrawOne, "the HUD without
+// post processing")
+const bool g_no_hud_start = GetEnvironmentVariableA("FCI_NO_HUD_START", nullptr, 0) > 0;
+
+struct ScreenMasks {
+    struct Span {
+        float view, lo, hi, top, bottom;  // view: its viewport's y offset (c59.y; split screen: one per player)
+        uint64_t what;  // which part: vertex count and texture (the same part last frame is not another one)
+    };
+    Span last[8] = {}, now[8] = {};
+    int n_last = 0, n_now = 0;
+    void Add(const Span& span) {
+        if (n_now < 8) now[n_now++] = span;
+    }
+    // a mask further out on that side (0 left, 1 right) over these rows in the same view, last frame
+    bool Outer(const Span& m, int side) const {
+        for (int i = 0; i < n_last; i++) {
+            const Span& o = last[i];
+            if (o.what == m.what || std::fabs(o.view - m.view) > 1.0f || o.top > m.top + 1.0f ||
+                o.bottom < m.bottom - 1.0f)
+                continue;
+            if (side == 0 ? o.lo < m.lo - 1.0f : o.hi > m.hi + 1.0f) return true;
+        }
+        return false;
+    }
+    void Frame() {  // Present
+        std::copy(now, now + n_now, last);
+        n_last = n_now, n_now = 0;
+    }
+};
+ScreenMasks g_masks;
+
+// the alpha of a texture's top level (decoded once per content), for the edge test of mask candidates
+const std::vector<uint8_t>* MaskTextureAlpha(const TextureEntry& entry, const texture::Desc& desc) {
+    static std::unordered_map<uint64_t, std::vector<uint8_t>> cache;
+    const uint64_t key = Mix(Mix(entry.hash, desc.address), Mix(desc.color, Mix(desc.width, desc.height)));
+    auto found = cache.find(key);
+    if (found != cache.end()) return &found->second;
+    if (desc.width * desc.height > 1024 * 1024) return nullptr;
+    std::vector<texture::Image> images = texture::Decode(desc);
+    if (images.empty() || images[0].pixels.size() < size_t(desc.width) * desc.height) return nullptr;
+    if (cache.size() >= 64) cache.clear();
+    std::vector<uint8_t>& alpha = cache[key];
+    alpha.resize(size_t(desc.width) * desc.height);
+    for (size_t i = 0; i < alpha.size(); i++) alpha[i] = uint8_t(images[0].pixels[i] >> 24);
+    return &alpha;
+}
+
+// a texture coordinate to [0, 1] as the stage's address mode takes it (1 wrap, 2 mirror, else clamp)
+float MaskAddress(float t, uint32_t mode) {
+    if (mode == 1) return t - std::floor(t);
+    if (mode == 2) {
+        t -= 2.0f * std::floor(t * 0.5f);
+        return t > 1.0f ? 2.0f - t : t;
+    }
+    return std::clamp(t, 0.0f, 1.0f);
+}
+
+// Whether a 2D draw across the 4:3 width (box lo..hi, top..bottom) is a screen mask (above). opacity: the lowest
+// opacity found at the left and right edge (vertex alpha relative to the draw's highest, times texel alpha)
+bool IsScreenMask(const State& s, const Draw& d, const std::vector<float>& vertices, float lo, float hi, float top,
+                  float bottom, float view_height, const TextureEntry* entry, const texture::Desc& desc,
+                  psh::Sampler kind, float* opacity) {
+    opacity[0] = opacity[1] = 0.0f;
+    if (bottom - top < 0.7f * view_height) return false;
+    if (s.Reg(SET_BLEND_ENABLE) && s.Reg(SET_BLEND_FUNC_DFACTOR) != 0x303) return false;  // ONE_MINUS_SRC_ALPHA
+    if (!(d.enabled & 1) || d.stride < 4) return false;
+    const bool textured = StageSamples(s.Reg(SET_SHADER_STAGE_PROGRAM) & 0x1F);
+    const std::vector<uint8_t>* alpha = nullptr;
+    if (textured) {
+        // a texture of a render target or depth (no entry) or another kind: cannot tell
+        if (!entry || (kind != psh::Sampler::k2D && kind != psh::Sampler::kRect)) return false;
+        alpha = MaskTextureAlpha(*entry, desc);
+        if (!alpha) return false;
+    }
+    // offsets of the diffuse colour (attribute 3) and texture coordinate 0 (attribute 9) in a vertex
+    auto offset_of = [&](int attribute) { return 4 * std::popcount(d.enabled & ((1u << attribute) - 1)); };
+    const int diffuse = (d.enabled & (1u << 3)) ? offset_of(3) : -1;
+    const int coords = (d.enabled & (1u << 9)) ? offset_of(9) : -1;
+    if (textured && coords < 0) return false;
+    const uint32_t address = s.Reg(SET_TEXTURE_ADDRESS);
+    const bool rect = kind == psh::Sampler::kRect;
+    auto texel = [&](float u, float v) {
+        if (rect) u /= float(desc.width), v /= float(desc.height);
+        u = MaskAddress(u, address & 0xF), v = MaskAddress(v, (address >> 8) & 0xF);
+        const uint32_t x = std::min(uint32_t(u * desc.width), desc.width - 1);
+        const uint32_t y = std::min(uint32_t(v * desc.height), desc.height - 1);
+        return (*alpha)[size_t(y) * desc.width + x] / 255.0f;
+    };
+    // (the vertex alpha counts against the draw's highest: a mask fades in, then all of it is that transparent)
+    float most = 0.0f;
+    for (size_t v = 0; diffuse >= 0 && v + d.stride <= vertices.size(); v += d.stride)
+        most = std::max(most, std::clamp(vertices[v + diffuse + 3], 0.0f, 1.0f));
+    const float scale = diffuse >= 0 ? 1.0f / std::max(most, 1.0f / 255.0f) : 1.0f;
+    for (int side = 0; side < 2; side++) {
+        const float edge = side == 0 ? lo : hi;
+        float lowest = 2.0f, vertex_alpha = 1.0f, u0 = 0.0f, v0 = 1e30f, v1 = -1e30f;
+        int found = 0;
+        for (size_t v = 0; v + d.stride <= vertices.size(); v += d.stride) {
+            if (std::fabs(vertices[v] - edge) > 0.5f) continue;
+            const float a = diffuse >= 0 ? std::min(std::clamp(vertices[v + diffuse + 3], 0.0f, 1.0f) * scale, 1.0f)
+                                         : 1.0f;
+            vertex_alpha = std::min(vertex_alpha, a);
+            float t = 1.0f;
+            if (alpha) {
+                const float u = vertices[v + coords], w = vertices[v + coords + 1];
+                t = texel(u, w);
+                if (!found) u0 = u;
+                if (std::fabs(u - u0) < 1e-4f) v0 = std::min(v0, w), v1 = std::max(v1, w);
+            }
+            lowest = std::min(lowest, a * t);
+            found++;
+        }
+        if (!found) return false;
+        if (alpha && v1 > v0) {  // the texture's column along that edge, between its outermost vertices
+            const float rows = (v1 - v0) * (rect ? 1.0f : float(desc.height));
+            const int steps = std::clamp(int(rows) + 1, 2, 1024);
+            for (int k = 0; k <= steps; k++)
+                lowest = std::min(lowest, vertex_alpha * texel(u0, v0 + (v1 - v0) * float(k) / float(steps)));
+        }
+        opacity[side] = lowest;
+        if (lowest < 0.75f) return false;
+    }
+    return true;
+}
+// ---- end screen masks ----
+
 }  // namespace
 
 // performance: the draw's shaders, constant buffers and samplers through the state cache (the textures always: binding
@@ -3048,6 +3611,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     std::vector<uint32_t> indices;
     D3D11_PRIMITIVE_TOPOLOGY topology = Topology(d.primitive, d.count, indices);
     if (topology == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED) return;
+    g_draw_geometry = GeometryKey(d);  // GitHub #19, the target's mirror
 
     bool depth_test = s.Reg(SET_DEPTH_TEST_ENABLE), stencil_test = s.Reg(SET_STENCIL_TEST_ENABLE);
     if (stencil_test && !g_depth_stencil && g_hle) {
@@ -3069,11 +3633,14 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     uint32_t programs = s.Reg(SET_SHADER_STAGE_PROGRAM);
     for (DepthTarget*& t : g_stage_depth) t = nullptr;
     for (const ShadowBinding*& b : g_stage_binding) b = nullptr;
+    const TextureEntry* mask_texture = nullptr;  // PC features, screen masks: stage 0's texture (null: none or a target)
+    texture::Desc mask_desc;
     for (int i = 0; i < 4; i++) {
         pc.tex_scale[i][0] = pc.tex_scale[i][1] = 1.0f;
         if (!StageSamples((programs >> (5 * i)) & 0x1F)) continue;
         psh::Sampler kind = psh::Sampler::k2D;
         srvs[i] = GetTexture(s, i, kind, pc.tex_scale[i]);
+        if (i == 0 && srvs[0] && g_texture_entry) mask_texture = g_texture_entry, mask_desc = g_texture_desc;
         config.sampler[i] = kind;
         config.signs[i] = srvs[i] ? g_stage_signs[i] : 0;  // signed textures (GitHub #14)
         samplers[i] = GetSampler(s, i);
@@ -3084,11 +3651,15 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         if (config.sampler[i] == psh::Sampler::kShadow && g_stage_binding[i] && g_stage_binding[i]->cascade)
             cascade_of = g_stage_binding[i];
     const bool cascade = cascade_of != nullptr;
-    config.cascade = cascade;
+    config.cascade = 0;  // the stages on that map (a stage on another shadow map reads only its own)
+    for (int i = 0; i < 4 && cascade; i++)
+        if (config.sampler[i] == psh::Sampler::kShadow && g_stage_binding[i] == cascade_of) config.cascade |= 1u << i;
     if (g_cascade_trace.from >= 0)  // diagnostics: FCI_TRACE_CASCADE
         for (int i = 0; i < 4; i++)
             if (config.sampler[i] == psh::Sampler::kShadow && g_stage_depth[i]) {
-                if (cascade) g_cascade_trace.with++;
+                if (cascade)
+                    g_cascade_trace.with++, g_cascade_trace.Binding(cascade_of->near_map, cascade_of->far_map,
+                                                                    &cascade_of->n[0][0], &cascade_of->f[0][0]);
                 else g_cascade_trace.without++, g_cascade_trace.without_address = g_stage_depth[i]->address;
                 break;
             }
@@ -3098,6 +3669,52 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     // hash every frame, as the CPU's data at physical 0 changes all the time)
     Surfaces surf = BindSurfaces(s, true, depth_test || stencil_test, WriteMask(s.Reg(SET_COLOR_MASK)) != 0);
     if (!surf.color && !surf.depth) return;
+    // ---- GitHub #19: a stage that reads the multisampled copy of the target being drawn (TargetSnapshot) goes back
+    // to the resolved copy when the target bound is another one (not seen) or its shader cannot be made ----
+    auto resolved_stage = [&](int i) {
+        g_target_ms_skip = true;
+        psh::Sampler kind = psh::Sampler::k2D;
+        pc.tex_scale[i][0] = pc.tex_scale[i][1] = 1.0f, pc.tex_scale[i][2] = pc.tex_scale[i][3] = 0.0f;
+        srvs[i] = GetTexture(s, i, kind, pc.tex_scale[i]);
+        g_target_ms_skip = false;
+        config.sampler[i] = kind;
+        config.signs[i] = srvs[i] ? g_stage_signs[i] : 0;
+        Rebind(surf);  // (a resolve unbinds the targets)
+    };
+    for (int i = 0; i < 4; i++) {
+        if (!g_stage_target_ms[i]) continue;
+        if (g_stage_target_ms[i] != surf.color) {
+            static int logged = 0;
+            if (logged < 4) {
+                logged++;
+                rt::Log("render: stage %d reads target %08X, the draw writes %08X: its resolved copy", i,
+                        g_stage_target_ms[i]->address, surf.color ? surf.color->address : 0u);
+            }
+            resolved_stage(i);
+            continue;
+        }
+        static bool logged[2] = {};
+        const bool rows = pc.tex_scale[i][2] != 0.0f;
+        if (!logged[rows]) {
+            logged[rows] = true;
+            rt::Log("render: stage %d reads the target %08X it draws into (host rows %.0f..%.0f, %u samples): its "
+                    "multisampled copy, the samples the fragment covers (GitHub #19)",
+                    i, surf.color->address, pc.tex_scale[i][2], pc.tex_scale[i][3], surf.color->samples);
+        }
+    }
+    for (int i = 0; i < 4; i++)  // the target's mirror: the stages that read it (SelfRead) rather than a copy
+        if (((g_stage_target_mirror >> i) & 1) && config.sampler[i] == psh::Sampler::kTargetMS &&
+            g_stage_target_ms[i] == surf.color)
+            config.mirror_read |= uint8_t(1u << i);
+    // the filter's texels from the target's resolved copy (as the copy has them: where they reach beyond the samples
+    // with the marker the mirror lacks what the frame has there); FCI_TARGET_MIRROR_MARKED=1: from the mirror's
+    // samples with the marker (no resolve, a few levels apart at the edges of surfaces)
+    static const bool mirror_marked = GetEnvironmentVariableA("FCI_TARGET_MIRROR_MARKED", nullptr, 0) > 0;
+    ID3D11ShaderResourceView* mirror_taps = nullptr;
+    for (int i = 0; i < 4 && config.mirror_read && !mirror_marked && !mirror_taps; i++)
+        if ((config.mirror_read >> i) & 1)
+            if ((mirror_taps = Resolved(*g_stage_target_ms[i]))) config.mirror_resolved = true, Rebind(surf);
+    // ---- end GitHub #19 ----
     // a stage reads the depth target this draw tests against (the ocean, DepthTexture): bound read-only for the draw
     // (the game writes no depth there); were it written, the stage reads nothing
     ID3D11DepthStencilView* depth_read_only = nullptr;
@@ -3130,17 +3747,104 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     else if (w_buffer) config.depth = offset ? psh::Depth::kReversedW : psh::Depth::kNone;
     else config.depth = (depth_test || s.Reg(SET_DEPTH_MASK)) ? psh::Depth::kReversedZ : psh::Depth::kNone;
     // ---- end performance ----
-    if (g_gpu_timing.enabled && w_buffer && surf.color && (surf.color->samples > 1 || surf.color->wide != 1.0f))
-        g_gpu_timing.Begin(s.Reg(SET_BLEND_ENABLE) ? Pass::kScreenBlend : Pass::kScreen3D);  // performance: FCI_GPU_TIMING
-    else if (g_gpu_timing.enabled && surf.color && (surf.color->samples > 1 || surf.color->wide != 1.0f))
-        g_gpu_timing.Begin(Pass::kScreen);
+    // ---- GitHub #19: a stage reading the multisampled target being drawn also reads the depth (t7, read-only: such a
+    // draw tests LESS / LEQUAL without writing depth or stencil, as the terrain's colour pass does), so that it takes a
+    // sample its own surface is visible at, not one of an object drawn in front before it (psh.cpp) ----
+    ID3D11ShaderResourceView* target_depth = nullptr;
+    {
+        bool ms = false;
+        for (int i = 0; i < 4; i++) ms |= config.sampler[i] == psh::Sampler::kTargetMS;
+        const uint32_t zfunc = s.Reg(SET_DEPTH_FUNC) & 7;
+        if (ms && surf.color && surf.depth && !surf.depth->z16 && surf.depth->samples == surf.color->samples &&
+            depth_test && !s.Reg(SET_DEPTH_MASK) && !stencil_test && (zfunc == 1 || zfunc == 3))
+            if (ID3D11DepthStencilView* ro = depth_read_only ? depth_read_only : ReadOnlyDsv(*surf.depth))
+                if ((target_depth = DepthView(*surf.depth))) depth_read_only = ro, config.target_ms_depth = reversed ? 2 : 1;
+        static const bool no_depth = GetEnvironmentVariableA("FCI_TARGET_MS_NO_DEPTH", nullptr, 0) > 0;  // diagnostics
+        if (no_depth) config.target_ms_depth = 0;
+        static bool logged = false;
+        if (ms && !logged) {
+            logged = true;
+            rt::Log("render: multisampled reads of the target being drawn %s (GitHub #19)",
+                    config.target_ms_depth == 2 ? "check the reversed depth" : config.target_ms_depth ? "check the depth"
+                                                                                                  : "without the depth");
+        }
+    }
+    // ---- end GitHub #19 ----
+    auto begin_timing = [&] {  // performance: FCI_GPU_TIMING
+        if (g_gpu_timing.enabled && w_buffer && surf.color && (surf.color->samples > 1 || surf.color->wide != 1.0f))
+            g_gpu_timing.Begin(s.Reg(SET_BLEND_ENABLE) ? Pass::kScreenBlend : Pass::kScreen3D);
+        else if (g_gpu_timing.enabled && surf.color && (surf.color->samples > 1 || surf.color->wide != 1.0f))
+            g_gpu_timing.Begin(Pass::kScreen);
+    };
+    begin_timing();
     VertexShader* vs = GetVertexShader(s, d.enabled, d.raw ? d.format : nullptr);
-    ID3D11PixelShader* ps = GetPixelShader(s, config);
+    bool ps_failed = false;
+    ID3D11PixelShader* ps = GetPixelShader(s, config, &ps_failed);
+    if (!ps && config.mirror_read) {  // ---- GitHub #19, the target's mirror: until its shader is made, the copy ----
+        if (ps_failed) {
+            g_target_mirror_off = true;
+            rt::Log("render: a pixel shader reading the target's mirror failed to compile: copies from now on "
+                    "(GitHub #19)");
+        }
+        for (int i = 0; i < 4; i++) {
+            if (!((config.mirror_read >> i) & 1)) continue;
+            if (ID3D11ShaderResourceView* copy = TargetCopy(*g_stage_target_ms[i])) srvs[i] = copy;
+            else resolved_stage(i);
+        }
+        config.mirror_read = 0, config.mirror_resolved = false, ps_failed = false;
+        ps = GetPixelShader(s, config, &ps_failed);
+        begin_timing();  // (after the copy)
+    }
+    if (!ps && ps_failed) {  // ---- GitHub #19: no multisampled reads without their shader: the resolved copy ----
+        bool ms = false;
+        for (int i = 0; i < 4; i++)
+            if (config.sampler[i] == psh::Sampler::kTargetMS) ms = true, resolved_stage(i);
+        if (ms) {
+            g_target_ms_off = true;
+            rt::Log("render: a pixel shader reading the multisampled target it draws into failed to compile: such "
+                    "draws read its resolved copy from now on (GitHub #19)");
+            ps = GetPixelShader(s, config);
+        }
+    }
     if (!vs || !vs->layout || !ps) return;
     // ---- PC water ----
     WaterPass wpass;
     if (g_hle && water::Current() && IsOcean(s, d, surf)) PrepareWater(s, d, surf, wpass, vs, ps);
     // ---- end PC water ----
+    // ---- GitHub #19, the target's mirror (above SelfRead): a draw that could be the pass before a read of its own
+    // target (multisampled, not blended, rgb written, reading no such target itself) is the candidate for it; one whose
+    // shaders are known as such a pass also writes the mirror, as render target 1 (its shader with SV_Target1 once that
+    // is made, until then without), its alpha the draw's marker ----
+    const void* mirror_vs = nullptr;           // the draw as a candidate (null: it cannot write the mirror)
+    ID3D11PixelShader* const mirror_ps = ps;   // (its own shader, without the mirror)
+    Mirror* mirror = nullptr;  // written by this draw
+    if (g_hle && !g_target_mirror_off && surf.color && surf.color->samples > 1 && surf.color->format == 8 &&
+        !surf.color->swizzled && !wpass.active && !depth_read_only && !s.Reg(SET_BLEND_ENABLE) &&
+        (WriteMask(s.Reg(SET_COLOR_MASK)) & 7) == 7) {
+        bool reads = false;
+        for (int i = 0; i < 4; i++) reads |= config.sampler[i] == psh::Sampler::kTargetMS;
+        if (!reads) mirror_vs = vs;
+    }
+    if (mirror_vs && g_target_mirror_flip_on && MirrorWriter(mirror_vs, mirror_ps)) {
+        psh::Config with = config;
+        with.mirror_write = true;
+        bool failed = false;
+        ID3D11PixelShader* m = GetPixelShader(s, with, &failed);
+        if (m && (mirror = MirrorFor(*surf.color))) {
+            if (++mirror->next > 255) {  // the markers start again: none of them left in the mirror
+                const float zero[4] = {};
+                g_context->ClearRenderTargetView(mirror->rtv.Get(), zero);
+                mirror->next = 1, mirror->owner_write = ~0ull;
+            }
+            ps = m;
+        } else if (failed) {
+            g_target_mirror_off = true;
+            rt::Log("render: a pixel shader writing the target's mirror failed to compile: copies from now on "
+                    "(GitHub #19)");
+        }
+    }
+    const bool mirror_write = mirror != nullptr;
+    // ---- end the target's mirror ----
 
     // constants
     static VertexConstants vc;
@@ -3158,8 +3862,11 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     // hud: x' = x * hud[0] + hud[1], y' = y * hud[2] + hud[3] for vertices with w = 1 (identity: as drawn)
     vc.hud[0] = 1.0f, vc.hud[1] = 0.0f, vc.hud[2] = 1.0f, vc.hud[3] = 0.0f;
     bool narrowed = false;
-    bool old_narrowed = false;  // diagnostics: FCI_TRACE_HUD=watch, as before GitHub #17
-    if (g_frame_3d && surf.color && surf.color->wide == 1.0f) g_post_3d = g_hud_trace.old_post = true;
+    bool screen_mask = false;  // screen masks (binoculars, scopes): narrowed, not cut to the 4:3 middle
+    int mask_sides = 0;  // and its sides to fill (bit 0 left, 1 right): where the mask ends, the slice of it to show
+    float mask_fill[2][2] = {};
+    bool old_narrowed = false;  // diagnostics: FCI_TRACE_HUD=watch, as before the HUD without post processing
+    if (g_frame_3d && surf.color && surf.color->wide == 1.0f) g_post_3d = g_frame_post = g_hud_trace.old_post = true;
     // fmv_scale: frames of a video (a video texture drawn, or the overlay showing one) are shown wide too
     const bool video_frame = fmv::Fill() && (g_frame_video || g_last_video || gpu::OverlayActive());
     if (surf.color && surf.color->wide != 1.0f) {
@@ -3179,30 +3886,99 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             if (g_post_3d && g_hud_trace.watch)  // diagnostics: FCI_TRACE_HUD
                 g_hud_trace.Restart(same_view, d.count, s.Reg(SET_BLEND_ENABLE), vsh::Key(s, d.enabled),
                                     psh::Key(s, config), view, g_view_3d);
-            if (!same_view) g_post_3d = false;
-            g_hud_trace.old_post = false;
+            if (!same_view) g_post_3d = g_hud_trace.old_post = false;
             g_frame_3d = true;
             if (program) std::memcpy(g_view_3d, view, sizeof view);
-        } else if (((g_frame_3d && g_post_3d) || fmv::Fill()) && (d.enabled & 1) && d.stride >= 4 && !g_counting &&
+        } else if ((g_frame_3d || fmv::Fill()) && (d.enabled & 1) && d.stride >= 4 && !g_counting &&
                    s.Reg(SET_COLOR_MASK) != 0) {
             // (visibility tests are no HUD: FCI decides per water patch from a pre-transformed test polygon whether to
             // draw it; narrowed into the middle, the patches at the sides counted no pixels and the water was missing)
             float lo = 1e30f, hi = -1e30f, top = 1e30f, bottom = -1e30f;
+            bool unit_w = true;  // every vertex at w = 1 (screen space as drawn; the view's own sprites carry an rhw)
             const std::vector<float>& vertices = kelvin::Vertices(d);  // performance: raw draws convert here
             for (size_t v = 0; v + 4 <= vertices.size(); v += d.stride) {
                 lo = std::min(lo, vertices[v]), hi = std::max(hi, vertices[v]);
                 top = std::min(top, vertices[v + 1]), bottom = std::max(bottom, vertices[v + 1]);
+                unit_w &= vertices[v + 3] == 1.0f;
             }
             // full screen: a quad across the whole width (letterbox bars), or anything covering all of it; a HUD
             // batch whose parts slide out at both sides spans the width too, but neither the height nor one quad
             bool across = lo <= 1.0f && hi >= surf.width - 1.0f;
             bool covers = across && top <= 1.0f && bottom >= surf.height - 1.0f;
-            old_narrowed = (g_frame_3d && g_hud_trace.old_post && !(covers || (across && d.count <= 6))) ||
-                           (video_frame && !g_frame_3d && !covers);  // diagnostics: FCI_TRACE_HUD=watch
             // a quad given in clip space (-1..1; the vertex program spreads it over the screen) covers it too: the
             // feral vision's tint (GitHub #17), narrowed it tinted only the 4:3 middle
             auto clip_full = [](float a, float b) { return a <= -0.99f && b >= 0.99f && b - a <= 2.5f; };
             if (d.count <= 6 && clip_full(lo, hi) && clip_full(top, bottom)) across = covers = true;
+            const bool hud_like = !(covers || (across && d.count <= 6));
+            old_narrowed = (g_frame_3d && g_hud_trace.old_post && hud_like) ||
+                           (video_frame && !g_frame_3d && !covers);  // diagnostics: FCI_TRACE_HUD=watch
+            // ---- the HUD without post processing (GitHub #17, swimming) ----
+            // Some frames have no post processing: no draw into a smaller target between the 3D view and the HUD.
+            // Swimming in 06_Cliffs and 07_Sub-Aquatic_Facility the game draws no glare at all (after the 3D view
+            // only a copy of the picture to another frame sized target and back); the HUD then counted as 2D of the
+            // view and stretched over the whole width as long as one swam. When the last frame was such a frame
+            // too, the HUD begins as well with the first 2D draw over the view that would be narrowed (not full
+            // screen, no band across), lies in screen space (every vertex at w = 1) and on the screen. Only then:
+            // before their post processing other frames draw such 2D of the view as well (particles of a vertex
+            // program, VS B6D4C758F95D8E77, in the intro's cutscene, 05_Mines, 10_Dead_Marshes, their positions the
+            // world's with w = 1, mostly off the screen's rectangle); taken for the HUD, the 2D after them (the
+            // sun's glare) was cut to the 4:3 middle. (The view's own sprites carry the camera's rhw, w != 1; copies
+            // of the picture cover the screen.) The first frame without post processing keeps its HUD wide, as do
+            // the first frames of a level (after a loading screen).
+            const bool on_screen =
+                lo >= -1.0f && hi <= surf.width + 1.0f && top >= -1.0f && bottom <= surf.height + 1.0f;
+            if (g_frame_3d && !g_post_3d && g_last_no_post && unit_w && hud_like && on_screen && !g_no_hud_start) {
+                g_post_3d = true;
+                static bool logged = false;
+                if (!logged)
+                    logged = true, rt::Log("render: the HUD began without post processing (box %.1f,%.1f..%.1f,%.1f, "
+                                           "%u vertices): narrowed from there on",
+                                           lo, top, hi, bottom, d.count);
+            }
+            // ---- end the HUD without post processing ----
+            // ---- screen masks (binoculars, scopes; above IsScreenMask): narrowed whole, the sides filled ----
+            if (g_frame_3d && g_post_3d && across && d.count > 6 && !g_no_screen_mask) {
+                // the view's rows (split screen: the player's half), from its viewport (c58/c59 of its 3D draws)
+                const float view_half = std::fabs(g_view_3d[1]);
+                const float view_y = view_half > 0 ? g_view_3d[3] - 0.53125f : surf.height * 0.5f;
+                const float half = view_half > 0 ? view_half : surf.height * 0.5f;
+                float opacity[2];
+                screen_mask = IsScreenMask(s, d, vertices, lo, hi, top, bottom, 2.0f * half, mask_texture,
+                                           mask_desc, config.sampler[0], opacity);
+                if (screen_mask && g_hud_trace.old_post) old_narrowed = true;  // diagnostics: FCI_TRACE_HUD=watch
+                if (screen_mask) {
+                    const uint64_t what =
+                        uint64_t(d.count) << 32 ^
+                        (mask_texture ? Mix(mask_desc.address, mask_desc.width << 16 | mask_desc.height) : 0);
+                    const ScreenMasks::Span span{g_view_3d[3], lo, hi, std::max(top, view_y - half),
+                                                 std::min(bottom, view_y + half), what};
+                    const float w = surf.color->wide, centre = surf.width * 0.5f;
+                    auto narrow = [&](float x) { return centre + (x - centre) / w; };
+                    // (where its edges land: the output of FCI's HUD program lies about half a guest pixel right of
+                    // the input positions, measured at the scope's bars; the strips end there, at worst a part of a
+                    // host pixel blends twice, never a gap that shows the game)
+                    const float left = narrow(lo + 0.5f), right = narrow(hi + 0.5f);
+                    // (a quarter guest pixel or less is no strip)
+                    if (left > 0.25f && !g_masks.Outer(span, 0))
+                        mask_fill[0][0] = left, mask_fill[0][1] = lo + 2.0f, mask_sides |= 1;
+                    if (right < surf.width - 0.25f && !g_masks.Outer(span, 1))
+                        mask_fill[1][0] = right, mask_fill[1][1] = hi - 2.0f, mask_sides |= 2;
+                    g_masks.Add(span);
+                    static int logged = 0;  // the first ones, and each new kind (count, texture)
+                    static uint64_t seen[16] = {};
+                    bool known = false;
+                    for (int i = 0; i < logged && !known; i++) known = seen[i] == what;
+                    if (!known && logged < 16) {
+                        seen[logged++] = what;
+                        rt::Log("render: screen mask: %u vertices, box %.1f,%.1f..%.1f,%.1f, texture %ux%u format %02X, "
+                                "edge opacity %.2f/%.2f, filled %s%s (wide %.3f)",
+                                d.count, lo, top, hi, bottom, mask_texture ? mask_desc.width : 0,
+                                mask_texture ? mask_desc.height : 0, mask_texture ? mask_desc.color : 0, opacity[0],
+                                opacity[1], mask_sides & 1 ? "left " : "", mask_sides & 2 ? "right" : "", w);
+                    }
+                }
+            }
+            // ---- end screen masks ----
             // ---- fmv_scale: a video texture (title, menus) scaled to fill, from then on the frame is a video's ----
             uint32_t video = g_stage_video[0];
             if (fmv::Fill() && !g_frame_3d && video && StageSamples(s.Reg(SET_SHADER_STAGE_PROGRAM) & 0x1F) &&
@@ -3218,7 +3994,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                 g_frame_video = true;
                 g_video_rect[0] = lo, g_video_rect[1] = top, g_video_rect[2] = hi, g_video_rect[3] = bottom;
                 g_replay_now = !g_replaying && !g_before_video.empty();
-            } else if ((g_frame_3d && g_post_3d && !(covers || (across && d.count <= 6))) ||
+            } else if (screen_mask || (g_frame_3d && g_post_3d && !(covers || (across && d.count <= 6))) ||
                        (video_frame && !g_frame_3d && !covers)) {
                 // over a video all 2D but what covers the screen (fades) goes to the middle, bands across the width
                 // too (the main menu draws a still of its video's band under the video)
@@ -3254,11 +4030,39 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     // ---- diagnostics: FCI_TRACE_HUD ----
     if (!g_hud_trace.init) g_hud_trace.Init();
     if (g_hud_trace.On()) {
-        const bool two_d = vc.screen[3] == 0 && (d.enabled & 1) && d.stride >= 4 && !g_counting &&
-                           s.Reg(SET_COLOR_MASK) != 0 && surf.color && surf.color->wide != 1.0f && g_frame_3d;
+        const bool over_3d = vc.screen[3] == 0 && (d.enabled & 1) && d.stride >= 4 && s.Reg(SET_COLOR_MASK) != 0 &&
+                             surf.color && surf.color->wide != 1.0f && g_frame_3d;
+        const bool two_d = over_3d && !g_counting;
         const bool traced = g_hud_trace.frame == 1;
         const bool left_wide = g_hud_trace.watch && two_d && !narrowed && !g_post_3d && g_hud_trace.restarts;
         if (g_hud_trace.watch && narrowed) g_hud_trace.narrowed++;
+        if (g_hud_trace.watch && two_d && !narrowed && !g_post_3d && !g_hud_trace.restarts) {
+            g_hud_trace.before_post++;
+            // each kind once (shaders, depth test, vertices at w = 1 or not): the view's own 2D
+            static std::vector<uint64_t> kinds;
+            const std::vector<float>& v = kelvin::Vertices(d);
+            bool unit = true;
+            float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+            for (size_t i = 0; i + 4 <= v.size(); i += d.stride) {
+                unit &= v[i + 3] == 1.0f;
+                x0 = std::min(x0, v[i]), x1 = std::max(x1, v[i]);
+                y0 = std::min(y0, v[i + 1]), y1 = std::max(y1, v[i + 1]);
+            }
+            const uint64_t kind = Mix(Mix(vsh::Key(s, d.enabled), psh::Key(s, config)),
+                                      uint64_t(s.Reg(SET_DEPTH_TEST_ENABLE)) << 1 | unit);
+            if (kinds.size() < 64 && std::find(kinds.begin(), kinds.end(), kind) == kinds.end()) {
+                kinds.push_back(kind);
+                rt::Log("render: hud trace: 2D before the post processing (frame %llu): box %.1f,%.1f..%.1f,%.1f count "
+                        "%u w %s depth test %u write %u blend %u vs %016llX ps %016llX mode %u",
+                        (unsigned long long)g_hud_trace.frames, x0, y0, x1, y1, d.count, unit ? "1" : "not 1",
+                        s.Reg(SET_DEPTH_TEST_ENABLE), s.Reg(SET_DEPTH_MASK), s.Reg(SET_BLEND_ENABLE),
+                        (unsigned long long)vsh::Key(s, d.enabled), (unsigned long long)psh::Key(s, config),
+                        s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3);
+            }
+        }
+        if (g_hud_trace.watch && over_3d && g_counting) g_hud_trace.counted++;
+        if (g_hud_trace.watch && screen_mask)
+            g_hud_trace.masks++, g_hud_trace.fills += std::popcount(unsigned(mask_sides));
         const bool changed = g_hud_trace.watch && narrowed != old_narrowed;
         if (traced || left_wide || changed) {
             float lo = 1e30f, hi = -1e30f, top = 1e30f, bottom = -1e30f;
@@ -3269,22 +4073,41 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                     top = std::min(top, vertices[v + 1]), bottom = std::max(bottom, vertices[v + 1]);
                 }
             if (traced)
-                rt::Log("render: hud trace: draw %llu target %08X %ux%u wide %.3f w %d f3d %d post %d narrowed %d "
-                        "count %u stride %u box %.1f,%.1f..%.1f,%.1f w0 %g mask %X blend %u vs %016llX ps %016llX "
-                        "mode %u c58 %g %g c59 %g %g",
+                rt::Log("render: hud trace: draw %llu target %08X %ux%u wide %.3f w %d f3d %d post %d counting %d "
+                        "narrowed %d "
+                        "screen mask %d sides %d count %u stride %u box %.1f,%.1f..%.1f,%.1f w0 %g mask %X blend %u "
+                        "depth test %u write %u vs %016llX ps %016llX mode %u c58 %g %g c59 %g %g",
                         (unsigned long long)g_draws, surf.color ? surf.color->address : 0, surf.width, surf.height,
                         surf.color ? surf.color->wide : 0.0f, int(vc.screen[3] != 0), g_frame_3d, g_post_3d,
-                        narrowed, d.count, d.stride, lo, top, hi, bottom,
+                        g_counting, narrowed, screen_mask, mask_sides, d.count, d.stride, lo, top, hi, bottom,
                         vertices.size() >= 4 && (d.enabled & 1) ? vertices[3] : -1.0f, s.Reg(SET_COLOR_MASK),
-                        s.Reg(SET_BLEND_ENABLE), (unsigned long long)vsh::Key(s, d.enabled),
-                        (unsigned long long)psh::Key(s, config), s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3,
-                        s.constants[58][0], s.constants[58][1], s.constants[59][0], s.constants[59][1]);
+                        s.Reg(SET_BLEND_ENABLE), s.Reg(SET_DEPTH_TEST_ENABLE), s.Reg(SET_DEPTH_MASK),
+                        (unsigned long long)vsh::Key(s, d.enabled), (unsigned long long)psh::Key(s, config),
+                        s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3, s.constants[58][0], s.constants[58][1],
+                        s.constants[59][0], s.constants[59][1]);
             if (changed && !g_hud_trace.changed++)
                 std::snprintf(g_hud_trace.change, sizeof g_hud_trace.change,
                               "%s, target %08X box %.1f,%.1f..%.1f,%.1f count %u vs %016llX ps %016llX",
                               narrowed ? "narrowed" : "wide", surf.color ? surf.color->address : 0, lo, top, hi,
                               bottom, d.count, (unsigned long long)vsh::Key(s, d.enabled),
                               (unsigned long long)psh::Key(s, config));
+            if (changed) {  // every kind of draw classified otherwise once (shaders, vertex count, box to 8 pixels)
+                static std::vector<uint64_t> kinds;
+                const uint64_t kind = Mix(Mix(vsh::Key(s, d.enabled), psh::Key(s, config)),
+                                          Mix(uint64_t(d.count) << 1 | narrowed,
+                                              Mix(uint64_t(int64_t(lo) / 8) << 16 ^ uint64_t(int64_t(top) / 8),
+                                                  uint64_t(int64_t(hi) / 8) << 16 ^ uint64_t(int64_t(bottom) / 8))));
+                if (kinds.size() < 256 && std::find(kinds.begin(), kinds.end(), kind) == kinds.end()) {
+                    kinds.push_back(kind);
+                    rt::Log("render: hud trace: classified otherwise (frame %llu): %s, target %08X box "
+                            "%.1f,%.1f..%.1f,%.1f count %u w0 %g depth test %u write %u vs %016llX ps %016llX",
+                            (unsigned long long)g_hud_trace.frames, narrowed ? "narrowed" : "wide",
+                            surf.color ? surf.color->address : 0, lo, top, hi, bottom, d.count,
+                            vertices.size() >= 4 && (d.enabled & 1) ? vertices[3] : -1.0f,
+                            s.Reg(SET_DEPTH_TEST_ENABLE), s.Reg(SET_DEPTH_MASK),
+                            (unsigned long long)vsh::Key(s, d.enabled), (unsigned long long)psh::Key(s, config));
+                }
+            }
             if (left_wide && !g_hud_trace.wide_2d++)
                 std::snprintf(g_hud_trace.first, sizeof g_hud_trace.first,
                               "box %.1f,%.1f..%.1f,%.1f count %u vs %016llX ps %016llX", lo, top, hi, bottom, d.count,
@@ -3329,7 +4152,8 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     if (g_no_state_cache) g_ds.Invalidate();
     {
         ID3D11BlendState* b = GetBlendState(s.Reg(SET_BLEND_ENABLE) != 0, s.Reg(SET_BLEND_FUNC_SFACTOR),
-                                            s.Reg(SET_BLEND_FUNC_DFACTOR), s.Reg(SET_BLEND_EQUATION), mask);
+                                            s.Reg(SET_BLEND_FUNC_DFACTOR), s.Reg(SET_BLEND_EQUATION), mask,
+                                            mirror_write);  // (GitHub #19)
         if (!g_ds.valid || b != g_ds.blend || std::memcmp(blend_color, g_ds.factor, sizeof blend_color)) {
             g_context->OMSetBlendState(b, blend_color, 0xFFFFFFFF);
             g_ds.blend = b;
@@ -3447,9 +4271,9 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         }
     }
     // ---- end PC features: widescreen and fov ----
-    if (narrowed) {
+    if (narrowed && !screen_mask) {
         // PC features: a narrowed 2D draw stays inside the 4:3 middle, as it stayed inside the console's screen
-        // (HUD parts the game slides off screen must not show up beside it)
+        // (HUD parts the game slides off screen must not show up beside it; screen masks reach beyond it)
         float center = HostWidthOf(surf.width, surf.scale, surf.wide) * 0.5f;
         scissor.left = LONG(center + (scissor.left - center) * vc.hud[0] + 0.5f);
         scissor.right = LONG(center + (scissor.right - center) * vc.hud[0] + 0.5f);
@@ -3462,6 +4286,39 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         ID3D11RenderTargetView* rtv = surf.color ? surf.color->rtv.Get() : nullptr;
         g_context->OMSetRenderTargets(rtv ? 1 : 0, &rtv, depth_read_only);
     }
+    if (target_depth) g_context->PSSetShaderResources(7, 1, &target_depth);  // GitHub #19
+    // ---- GitHub #19, the target's mirror: the writer binds it as render target 1; both get the marker (b6) ----
+    if (mirror_write || config.mirror_read) {
+        struct MirrorConstants {
+            float id[4];
+        };
+        static Constants<MirrorConstants> mirror_constants;
+        MirrorConstants mc{};
+        if (mirror_write) mc.id[0] = float(mirror->next) / 255.0f;
+        if (config.mirror_read) mc.id[1] = float(g_stage_mirror_mark);
+        ID3D11Buffer* b = mirror_constants.Update(mc);
+        g_context->PSSetConstantBuffers(6, 1, &b);
+        if (config.mirror_read) g_mirror_reads++;
+        if (config.mirror_read && config.mirror_resolved) g_context->PSSetShaderResources(6, 1, &mirror_taps);
+        static const bool against_copy = [] {  // diagnostics: FCI_TARGET_MS_DEBUG=6/7 (psh.cpp): the copy as well, t8
+            char v[8] = {};
+            return GetEnvironmentVariableA("FCI_TARGET_MS_DEBUG", v, sizeof v) && (std::atoi(v) == 6 || std::atoi(v) == 7);
+        }();
+        for (int i = 0; i < 4 && against_copy; i++)
+            if ((config.mirror_read >> i) & 1) {
+                ID3D11ShaderResourceView* copy = TargetCopy(*g_stage_target_ms[i]);
+                g_context->PSSetShaderResources(8, 1, &copy);
+                break;
+            }
+    }
+    if (mirror_write) {
+        ID3D11ShaderResourceView* none[4] = {};  // (a stage of the draw before may still hold the mirror)
+        g_context->PSSetShaderResources(0, 4, none);
+        ID3D11RenderTargetView* rtvs[2] = {surf.color->rtv.Get(), mirror->rtv.Get()};
+        g_context->OMSetRenderTargets(2, rtvs, surf.depth ? surf.depth->dsv.Get() : nullptr);
+        g_mirror_writes++;
+    }
+    // ---- end the target's mirror ----
     // ---- PC shadows: a receiver gets the near cascade (psh.cpp) ----
     if (cascade) {
         static Constants<CascadeConstants> cascade_constants;
@@ -3469,14 +4326,55 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         std::memcpy(cc.n, cascade_of->n, sizeof cc.n);
         std::memcpy(cc.f, cascade_of->f, sizeof cc.f);
         cc.fade[0] = kCascadeFade;
+        cc.fade[1] = cascade_of->solids_map ? 1.0f : 0.0f;
+        std::memcpy(cc.solids, cascade_of->solids_xform, sizeof cc.solids);
         ID3D11Buffer* b = cascade_constants.Update(cc);
-        ID3D11ShaderResourceView* maps[2] = {cascade_of->near_map->srv.Get(), cascade_of->far_map->srv.Get()};
+        ID3D11ShaderResourceView* maps[3] = {cascade_of->near_map->srv.Get(), cascade_of->far_map->srv.Get(),
+                                             cascade_of->solids_map ? cascade_of->solids_map->srv.Get() : nullptr};
         g_context->PSSetConstantBuffers(5, 1, &b);
-        g_context->PSSetShaderResources(4, 2, maps);
+        g_context->PSSetShaderResources(4, 3, maps);
+        g_cascade_maps_bound = true;
     }
     // ---- end PC shadows ----
 
+    // ---- PC shadows: a far pass's opaque caster (no alpha test, no alpha kill) also goes into its solids' map
+    // (kSolidsMargin), zoomed by the viewport onto their square, its slope bias scaled with the zoom (the far map's bias
+    // in depth); recorded here for the pass's end (SolidsReplay), with FCI_SOLIDS_PROFILE drawn at once (below) ----
+    bool solid_caster = false;
+    D3D11_VIEWPORT solids_vp{};
+    ID3D11RasterizerState* solids_raster = nullptr;
+    if (g_sun_pass.active && g_sun_pass.which && g_sun_pass.solids && g_sun_pass.maps == 1 &&
+        surf.depth == g_sun_pass.target[0] && ds.DepthEnable && ds.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL &&
+        !s.Reg(SET_ALPHA_TEST_ENABLE) && !s.Reg(SET_BLEND_ENABLE)) {
+        bool kill = false;
+        for (int i = 0; i < 4; i++)
+            kill |= ((programs >> (5 * i)) & 0x1F) != 0 && (s.Reg(SET_TEXTURE_CONTROL0 + 0x40 * i) & kTextureAlphaKill);
+        if (!kill && SolidsViewport(*g_sun_pass.solids, g_sun_pass.solids_square, solids_vp)) {
+            D3D11_RASTERIZER_DESC zoomed = rs;
+            zoomed.SlopeScaledDepthBias = rs.SlopeScaledDepthBias * (solids_vp.Width / float(surf.width)) / surf.scale;
+            solids_raster = GetRasterState(zoomed);
+            solid_caster = true;
+        }
+    }
+    const bool record_solid = solid_caster && g_solids_profile == 0;
+    SolidsDraw solid;
+    // ---- end PC shadows ----
+    // a draw without a colour target (the cascades' shadow passes) runs without its pixel shader where that neither
+    // writes the depth nor discards (alpha test, alpha kill, a clip plane stage): its colour went nowhere (D3D11 debug
+    // layer warning #3146081 at each such draw)
+    ID3D11PixelShader* bound_ps = ps;
+    if (!surf.color && surf.depth && config.depth == psh::Depth::kNone && !s.Reg(SET_ALPHA_TEST_ENABLE)) {
+        bool needed = false;
+        for (int i = 0; i < 4; i++) {
+            const uint32_t program = (programs >> (5 * i)) & 0x1F;
+            needed |= program == 5 || (program != 0 && (s.Reg(SET_TEXTURE_CONTROL0 + 0x40 * i) & kTextureAlphaKill));
+        }
+        if (!needed) bound_ps = nullptr;
+    }
+
     // geometry
+    UINT issued = 0;  // screen masks: the draw call, to issue again for the sides
+    bool issued_indexed = false;
     static Ring vertex_ring(D3D11_BIND_VERTEX_BUFFER), index_ring(D3D11_BIND_INDEX_BUFFER);
     // performance: raw draws put vertices and indices into one buffer with one map
     static Ring geometry_ring(D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER);
@@ -3541,29 +4439,114 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             offsets[i] = st.offset + UINT(d.data[i] - st.lo);
             last = i + 1;
         }
+        if (record_solid) {  // PC shadows: its own copy of the geometry for the solids' map
+            UINT at_solid[kAttributes + 1];
+            for (int k = 0; k <= n; k++) at_solid[k] = g_solids_batch.Add(pieces[k], sizes[k]);
+            solid.slots = last;
+            for (int i = 0; i < last; i++) {
+                solid.strides[i] = strides[i];
+                solid.offsets[i] = (d.enabled & (1u << i)) ? at_solid[of[i]] + UINT(d.data[i] - streams[of[i]].lo) : 0;
+            }
+            solid.indexed = true, solid.index_format = short_ids ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+            solid.index_offset = at_solid[n], solid.count = UINT(count);
+        }
         g_context->IASetVertexBuffers(0, last, vbs, strides, offsets);
-        BindPipeline(vs, topology, ps, vcb, pcb, srvs, samplers);
+        BindPipeline(vs, topology, bound_ps, vcb, pcb, srvs, samplers);
         g_context->IASetIndexBuffer(vb, short_ids ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, at_piece[n]);
         g_context->DrawIndexed(UINT(count), 0, 0);
+        issued = UINT(count), issued_indexed = true;  // screen masks
         // ---- end performance ----
     } else {
     UINT stride = UINT(d.stride * 4);
     UINT offset = vertex_ring.Push(d.vertices.data(), UINT(d.vertices.size() * 4));
+    if (record_solid) {  // PC shadows: its own copy of the geometry for the solids' map
+        solid.slots = 1, solid.strides[0] = stride;
+        solid.offsets[0] = g_solids_batch.Add(d.vertices.data(), d.vertices.size() * 4);
+        solid.indexed = !indices.empty(), solid.index_format = DXGI_FORMAT_R32_UINT;
+        if (solid.indexed) solid.index_offset = g_solids_batch.Add(indices.data(), indices.size() * 4);
+        solid.count = solid.indexed ? UINT(indices.size()) : d.count;
+    }
     ID3D11Buffer* vb = vertex_ring.buffer.Get();
     g_context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
-    BindPipeline(vs, topology, ps, vcb, pcb, srvs, samplers);
+    BindPipeline(vs, topology, bound_ps, vcb, pcb, srvs, samplers);
     if (indices.empty()) {
         g_context->Draw(d.count, 0);
+        issued = d.count;  // screen masks
     } else {
         UINT at = index_ring.Push(indices.data(), UINT(indices.size() * 4));
         g_context->IASetIndexBuffer(index_ring.buffer.Get(), DXGI_FORMAT_R32_UINT, at);
         g_context->DrawIndexed(UINT(indices.size()), 0, 0);
+        issued = UINT(indices.size()), issued_indexed = true;  // screen masks
     }
     }
+    // ---- PC features: screen masks: each side beyond the mask filled with its edge (above IsScreenMask). The draw
+    // again, its x stretched kMaskStretch times about a point just inside its edge, which lands in the middle of the
+    // strip; the strip's columns all show the mask within a fraction of a guest pixel of that point ----
+    if (mask_sides && issued) {
+        const float host_x = float(HostWidthOf(surf.width, surf.scale, surf.wide)) / float(surf.width);
+        for (int side = 0; side < 2; side++) {
+            if (!(mask_sides & (1 << side))) continue;
+            const float edge = mask_fill[side][0], at = mask_fill[side][1];
+            const float middle = side == 0 ? edge * 0.5f : (edge + float(surf.width)) * 0.5f;
+            D3D11_RECT strip = scissor;
+            if (side == 0) strip.right = std::min(strip.right, LONG(std::ceil(edge * host_x)));
+            else strip.left = std::max(strip.left, LONG(std::floor(edge * host_x)));
+            if (strip.left >= strip.right || strip.top >= strip.bottom) continue;
+            vc.hud[0] = kMaskStretch, vc.hud[1] = middle - at * kMaskStretch, vc.hud[2] = 1.0f, vc.hud[3] = 0.0f;
+            vertex_constants.Update(vc);  // (the same buffer, bound)
+            g_context->RSSetScissorRects(1, &strip);
+            if (issued_indexed) g_context->DrawIndexed(issued, 0, 0);
+            else g_context->Draw(issued, 0);
+        }
+    }
+    // ---- end screen masks ----
+    if (mirror_write) Rebind(surf);  // GitHub #19, the target's mirror: render target 0 alone again
+    // ---- PC shadows: the far pass's solid caster: its record for the pass's end (SolidsReplay), the rest of it ----
+    if (record_solid && issued) {
+        // the pixel shader only where it gives the depth (W-buffered) or discards (a clip plane stage)
+        bool clip_stage = false;
+        for (int i = 0; i < 4; i++) clip_stage |= ((programs >> (5 * i)) & 0x1F) == 5;
+        solid.vs = vs, solid.ps = config.depth != psh::Depth::kNone || clip_stage ? ps : nullptr;
+        solid.topology = topology, solid.raster = solids_raster;
+        solid.depth = g_ds.depth, solid.ref = g_ds.ref;  // (this draw's, set above)
+        solid.constants = uint32_t(g_solids_batch.vc.size());
+        g_solids_batch.vc.push_back(vc), g_solids_batch.pc.push_back(pc);
+        g_solids_batch.draws.push_back(solid);
+        g_sun_pass.solids_draws++;
+    } else if (solid_caster && issued) {
+        // FCI_SOLIDS_PROFILE: at once, switching the depth target around it (=immediate), only the switches (=switch), or
+        // only the draw again, on the far map beside it (=noswitch: vertex work, everything clipped)
+        const D3D11_VIEWPORT back{0, 0, float(HostWidthOf(surf.width, surf.scale, surf.wide)),
+                                  float(HostHeightOf(surf.height, surf.scale)), 0, 1};
+        if (g_solids_profile == 3) {
+            const D3D11_VIEWPORT beside{30000, 30000, 1024, 1024, 0, 1};
+            g_context->RSSetViewports(1, &beside);
+            if (issued_indexed) g_context->DrawIndexed(issued, 0, 0);
+            else g_context->Draw(issued, 0);
+            g_context->RSSetViewports(1, &back);
+        } else {
+            const DepthTarget& st = *g_sun_pass.solids;
+            g_context->RSSetState(solids_raster);
+            g_context->OMSetRenderTargets(0, nullptr, st.dsv.Get());
+            g_context->RSSetViewports(1, &solids_vp);
+            const D3D11_RECT all{0, 0, LONG(HostWidthOf(st.width, st.scale, 1.0f)), LONG(HostHeightOf(st.height, st.scale))};
+            g_context->RSSetScissorRects(1, &all);
+            if (g_solids_profile == 1 && issued_indexed) g_context->DrawIndexed(issued, 0, 0);
+            else if (g_solids_profile == 1) g_context->Draw(issued, 0);
+            ID3D11RenderTargetView* rtv = surf.color ? surf.color->rtv.Get() : nullptr;  // back to the far map
+            g_context->OMSetRenderTargets(rtv ? 1 : 0, rtv ? &rtv : nullptr, surf.depth->dsv.Get());
+            g_context->RSSetViewports(1, &back);
+            g_context->RSSetScissorRects(1, &scissor);
+            g_context->RSSetState(g_ds.raster);
+        }
+        g_sun_pass.solids_draws++;
+    }
+    // ---- end PC shadows ----
     if (g_sun_pass.active && !g_sun_pass.which && surf.depth && surf.depth->z16) g_cascade_draws++;  // PC shadows: statistics
     if (depth_read_only) {  // (the depth's view off the stages before it is writable again)
         ID3D11ShaderResourceView* none[4] = {};
         g_context->PSSetShaderResources(0, 4, none);
+        if (target_depth) g_context->PSSetShaderResources(7, 1, none);  // GitHub #19
     }
     if (wpass.active) {
         WaterUnbind(surf);  // PC water
@@ -3571,7 +4554,17 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         ID3D11RenderTargetView* rtv = surf.color ? surf.color->rtv.Get() : nullptr;
         g_context->OMSetRenderTargets(rtv ? 1 : 0, &rtv, surf.depth->dsv.Get());
     }
-    if (surf.color && mask) MarkWritten(*surf.color);
+    if (surf.color && mask) {
+        MarkWritten(*surf.color);
+        // ---- GitHub #19, the target's mirror: this draw as the candidate for a read that follows (SelfRead) ----
+        Target& t = *surf.color;
+        t.last_draw_version = t.version, t.last_draw_geometry = g_draw_geometry;
+        t.last_draw_vs = mirror_vs, t.last_draw_ps = mirror_ps;
+        if (mirror_write)
+            mirror->owner_write = t.last_write, mirror->owner_version = t.version, mirror->geometry = g_draw_geometry,
+            mirror->mark = mirror->next;
+        // ---- end the target's mirror ----
+    }
     g_draws++;
     if (surf.depth && depth_test && s.Reg(SET_DEPTH_MASK)) surf.depth->last_write = ++g_write_sequence;
     DrainMessages();
@@ -3867,11 +4860,13 @@ void Flush() {
     if (g_generation % 600 == 0) g_download_causes.clear();
     if (g_generation % 600 == 0)
         rt::Log("render: generation %llu, %llu draws, %llu clears (%llu fast), %llu resolves, %zu targets, %zu textures, "
-                "%zu+%zu shaders, display %08X",
+                "%zu+%zu shaders, display %08X, %llu multisampled copies of the target being drawn, %llu reads of "
+                "its mirror, %llu draws into it",
                 (unsigned long long)g_generation, (unsigned long long)g_draws, (unsigned long long)g_clears,
                 (unsigned long long)g_fast_clears, (unsigned long long)g_resolves,
                 g_targets.size(), g_textures.size(), g_vertex_shaders.size(), g_pixel_shaders.size(),
-                DisplayAddress());
+                DisplayAddress(), (unsigned long long)g_target_copies, (unsigned long long)g_mirror_reads,
+                (unsigned long long)g_mirror_writes);
     if (g_generation % 600 == 0 && (g_left_out || g_held_frames))  // performance: shaders off the render thread
         rt::Log("render: draws left out until their shaders were ready: %llu, in %llu shown frames (%llu for a vertex "
                 "shader, %llu for a pixel shader); %llu long frames held back",
@@ -3943,6 +4938,7 @@ void SetHle(bool on) {
 }
 
 
+void DumpNearAtPresent();  // diagnostics: FCI_DUMP_CASCADE_MAPS (below)
 void Present(uint32_t front) {
     if (!Ready()) return;
     Target* shown = nullptr;
@@ -3964,6 +4960,7 @@ void Present(uint32_t front) {
     g_before_video.clear();
     float aspect = (shown && shown->wide != 1.0f && g_frame_3d) || video ? pcmode::Aspect() : 4.0f / 3.0f;
     if (g_hud_trace.On()) g_hud_trace.Frame(aspect);  // diagnostics: FCI_TRACE_HUD
+    DumpNearAtPresent();                              // diagnostics: FCI_DUMP_CASCADE_MAPS
     g_cascade_trace.Frame();                          // diagnostics: FCI_TRACE_CASCADE
     {  // diagnostics: FCI_SHADOW_CASCADES_FLIP=<s>: shadow_cascades switched every s seconds (the menu's live switch)
         static const double flip = [] {
@@ -3976,15 +4973,51 @@ void Present(uint32_t front) {
             SetShadowCascades(!g_cascades_on.load());
         }
     }
+    g_last_no_post = g_frame_3d && !g_frame_post;  // the HUD without post processing (DrawOne)
+    g_frame_post = false;
     g_frame_3d = false;
     g_frame_video = false;
     g_post_3d = false;
+    g_masks.Frame();  // PC features: screen masks
     AoPresent();  // ambient occlusion
     g_water_presents++;  // PC water
     if (g_gpu_timing.enabled) g_gpu_timing.Begin(Pass::kPost);  // performance: FCI_GPU_TIMING
     g_ds.Invalidate();  // performance: state cache
     // performance: shaders off the render thread; a long frame with draws left out is not shown
-    if (ShadersPresent()) present::Frame(g_device.Get(), g_context.Get(), srv, w, h, aspect);
+    const bool show = ShadersPresent();
+    {  // GitHub #19, diagnostics: FCI_TARGET_MS_FLIP=<n>@<from>-<to>[,<from>-<to>...]: in these times (seconds since
+       // the first frame) the draws that read the target they draw into alternate every n shown frames between its
+       // multisampled copy and the resolved copy (as before), each frame dumped as frame_<vblank>_<k>_ms / _res.bmp
+       // (A/B in one run); outside them the multisampled copy. With FCI_TARGET_MS_FLIP_COPY=1 between the target's
+       // mirror (_ms) and the multisampled copy (_res) instead, the current fix's two ways
+        static const bool flip_copy = GetEnvironmentVariableA("FCI_TARGET_MS_FLIP_COPY", nullptr, 0) > 0;
+        bool& flip = flip_copy ? g_target_mirror_flip_on : g_target_ms_flip_on;
+        static const ULONGLONG start = GetTickCount64();
+        static int n = 0;
+        static std::vector<std::pair<double, double>> windows = [] {
+            std::vector<std::pair<double, double>> list;
+            char v[256] = {};
+            if (!GetEnvironmentVariableA("FCI_TARGET_MS_FLIP", v, sizeof v)) return list;
+            const char* p = std::strchr(v, '@');
+            n = std::atoi(v);
+            for (double from, to; p && std::sscanf(p + 1, "%lf-%lf", &from, &to) == 2; p = std::strchr(p + 1, ','))
+                list.push_back({from, to});
+            return list;
+        }();
+        const double since = double(GetTickCount64() - start) / 1000.0;
+        bool inside = false;
+        for (const auto& [from, to] : windows) inside |= since >= from && since <= to;
+        static uint32_t shown = 0;
+        if (n > 0 && show && inside) {
+            static char tag[32];
+            snprintf(tag, sizeof tag, "%05u_%s", shown, flip ? "ms" : "res");
+            present::DumpNext(tag);  // this frame, as it was drawn
+            if (++shown % uint32_t(n) == 0) flip = !flip;  // the next ones
+        } else if (!inside) {
+            flip = true;
+        }
+    }
+    if (show) present::Frame(g_device.Get(), g_context.Get(), srv, w, h, aspect);
     g_gpu_timing.FrameEnd();
     texpack::Frame();  // ---- texture dump/replacement: notices changes to the replacement folder ----
     Flush();  // a new generation: the texture caches look at guest memory again
@@ -4024,26 +5057,171 @@ void SetShadowCascades(bool on) {
                 "alternating near and far)", on ? "on" : "off", 1024 * g_q.near_scale, 1024 * g_q.near_scale);
 }
 void DropSunShadows() {
+    for (std::atomic<int>& u : g_sun_only_passes) u.store(kSunOnlyPasses, std::memory_order_relaxed);
     for (ShadowBinding& b : g_bindings) b = ShadowBinding{};
     for (ViewMaps& v : g_view_maps) v = ViewMaps{};
     g_sun_pass.active = false;
 }
 void BeginSunShadowPass(int view, bool near_pass) {
     g_sun_pass = SunPass{};
+    g_solids_batch.Clear();
     g_sun_pass.active = true, g_sun_pass.view = view & 3, g_sun_pass.which = near_pass ? 0 : 1;
+    // a far pass: its solid casters over the last near square (in the last far map's coordinates: this far camera is
+    // at most a frame's movement from that one, well inside the margin), the square written down for the receivers
+    const ViewMaps& vm = g_view_maps[view & 3];
+    if (!near_pass && g_solids_on && vm.near_square_valid) {
+        const float* n = vm.near_square;
+        g_sun_pass.solids_square[2] = n[2] * kSolidsMargin, g_sun_pass.solids_square[3] = n[3] * kSolidsMargin;
+        g_sun_pass.solids_square[0] = n[0] + 0.5f * (n[2] - g_sun_pass.solids_square[2]);
+        g_sun_pass.solids_square[1] = n[1] + 0.5f * (n[3] - g_sun_pass.solids_square[3]);
+        g_sun_pass.solids_wanted = g_sun_pass.solids_square[2] > 0 && g_sun_pass.solids_square[3] > 0;
+    }
     g_ds.Invalidate();  // performance: state cache (other targets follow)
 }
-void EndSunShadowPass(bool sun, bool other, const float m[3][4]) {
+// diagnostics (FCI_DUMP_CASCADE_MAPS): a 16 bit depth target's host texels as raw rows
+bool DumpDepthRaw(DepthTarget& t, const char* name, UINT* width, UINT* height) {
+    if (!t.texture) return false;
+    D3D11_TEXTURE2D_DESC d;
+    t.texture->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ, d.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    D3D11_MAPPED_SUBRESOURCE map{};
+    if (d.SampleDesc.Count != 1 || FAILED(g_device->CreateTexture2D(&d, nullptr, &staging))) return false;
+    g_context->CopyResource(staging.Get(), t.texture.Get());
+    if (FAILED(g_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map))) return false;
+    if (FILE* f = std::fopen(name, "wb")) {
+        for (UINT y = 0; y < d.Height; y++)
+            std::fwrite(static_cast<const uint8_t*>(map.pData) + size_t(y) * map.RowPitch, 2, d.Width, f);
+        std::fclose(f);
+    }
+    g_context->Unmap(staging.Get(), 0);
+    *width = d.Width, *height = d.Height;
+    return true;
+}
+// and at the end of each frame in that window, the near map of view 0 as the frame's receivers left it
+// (cascade_<sequence>_p<frame>.r16): does anything touch it between its pass and the next frame's receivers?
+void DumpNearAtPresent() {
+    if (!g_cascade_dump.On() || !g_view_maps[0].map[0]) return;
+    char name[64];
+    std::snprintf(name, sizeof name, "cascade_%06llu_p%llu.r16", (unsigned long long)++g_cascade_dump.sequence,
+                  (unsigned long long)g_cascade_trace.frame);
+    UINT w = 0, h = 0;
+    DumpDepthRaw(*g_view_maps[0].map[0], name, &w, &h);
+}
+bool SunCascadesUsable(int view) { return g_sun_only_passes[view & 3].load(std::memory_order_relaxed) >= kSunOnlyPasses; }
+// the far pass's solid casters into their map, in one go at the pass's end (SolidsBatch): one switch of the depth target
+// for all of them, their own geometry in one upload; the pixel shaders without textures (no alpha test: they only
+// give the depth)
+void SolidsReplay(const SunPass& pass) {
+    SolidsBatch& b = g_solids_batch;
+    D3D11_VIEWPORT vp;
+    if (!pass.solids || b.draws.empty() || !SolidsViewport(*pass.solids, pass.solids_square, vp)) return b.Clear();
+    const UINT size = UINT(b.geometry.size());
+    if (size > b.capacity || !b.buffer) {
+        b.capacity = std::max(size * 2, 1u << 20);
+        D3D11_BUFFER_DESC desc{b.capacity, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER,
+                               D3D11_CPU_ACCESS_WRITE, 0, 0};
+        b.buffer.Reset();
+        if (FAILED(g_device->CreateBuffer(&desc, nullptr, &b.buffer))) b.capacity = 0;
+    }
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (!b.buffer || FAILED(g_context->Map(b.buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return b.Clear();
+    std::memcpy(map.pData, b.geometry.data(), size);
+    g_context->Unmap(b.buffer.Get(), 0);
+    g_ds.Invalidate();
+    if (g_gpu_timing.enabled) g_gpu_timing.Begin(Pass::kSolids);  // performance: FCI_GPU_TIMING
+    ID3D11ShaderResourceView* none[8] = {};
+    g_context->PSSetShaderResources(0, 8, none);
+    const DepthTarget& st = *pass.solids;
+    g_context->OMSetRenderTargets(0, nullptr, st.dsv.Get());
+    g_context->RSSetViewports(1, &vp);
+    const D3D11_RECT all{0, 0, LONG(HostWidthOf(st.width, st.scale, 1.0f)), LONG(HostHeightOf(st.height, st.scale))};
+    g_context->RSSetScissorRects(1, &all);
+    static Constants<VertexConstants> vertex_constants;
+    static Constants<PixelConstants> pixel_constants;
+    ID3D11Buffer* vbs[kAttributes];
+    for (ID3D11Buffer*& v : vbs) v = b.buffer.Get();
+    // grouped by shaders and states (a depth-only result does not depend on the order), each set when it changes
+    std::stable_sort(b.draws.begin(), b.draws.end(), [](const SolidsDraw& x, const SolidsDraw& y) {
+        return std::tie(x.vs, x.ps, x.raster, x.depth, x.topology) < std::tie(y.vs, y.ps, y.raster, y.depth, y.topology);
+    });
+    const SolidsDraw* last = nullptr;
+    ID3D11Buffer* vcb = vertex_constants.Update(b.vc[b.draws[0].constants]);
+    ID3D11Buffer* pcb = pixel_constants.Update(b.pc[b.draws[0].constants]);
+    g_context->VSSetConstantBuffers(0, 1, &vcb);
+    g_context->PSSetConstantBuffers(1, 1, &pcb);
+    for (const SolidsDraw& d : b.draws) {
+        if (!last || d.vs != last->vs) {
+            g_context->IASetInputLayout(d.vs->layout.Get());
+            g_context->VSSetShader(d.vs->shader.Get(), nullptr, 0);
+        }
+        if (!last || d.topology != last->topology) g_context->IASetPrimitiveTopology(d.topology);
+        if (!last || d.ps != last->ps) g_context->PSSetShader(d.ps, nullptr, 0);
+        if (!last || d.raster != last->raster) g_context->RSSetState(d.raster);
+        if (!last || d.depth != last->depth || d.ref != last->ref) g_context->OMSetDepthStencilState(d.depth, d.ref);
+        last = &d;
+        vertex_constants.Update(b.vc[d.constants]);  // (the same buffer, bound)
+        if (d.ps) pixel_constants.Update(b.pc[d.constants]);
+        g_context->IASetVertexBuffers(0, UINT(d.slots), vbs, d.strides, d.offsets);
+        if (d.indexed) {
+            g_context->IASetIndexBuffer(b.buffer.Get(), d.index_format, d.index_offset);
+            g_context->DrawIndexed(d.count, 0, 0);
+        } else {
+            g_context->Draw(d.count, 0);
+        }
+    }
+    g_ds.Invalidate();
+    if (g_gpu_timing.enabled) g_gpu_timing.Begin(Pass::kShadow);
+    b.Clear();
+}
+void EndSunShadowPass(bool sun, bool other, const float m[3][4], const float clip[4][4]) {
     if (!g_sun_pass.active) return;
     const SunPass pass = g_sun_pass;
     g_sun_pass.active = false;
+    if (pass.which) SolidsReplay(pass);  // the far pass's solid casters, recorded while it drew
+    g_solids_batch.Clear();
+    {  // (render thread only writes it)
+        std::atomic<int>& n = g_sun_only_passes[pass.view];
+        n.store(pass.maps == 1 && sun ? std::min(n.load(std::memory_order_relaxed) + 1, kSunOnlyPasses) : 0,
+                std::memory_order_relaxed);
+    }
+    if (g_cascade_dump.On() && pass.maps == 1 && pass.target[0] && pass.target[0]->texture) {  // FCI_DUMP_CASCADE_MAPS
+        DepthTarget& t = *pass.target[0];
+        const uint64_t n = ++g_cascade_dump.sequence;
+        char name[64];
+        std::snprintf(name, sizeof name, "cascade_%06llu_%c.r16", (unsigned long long)n, pass.which ? 'f' : 'n');
+        UINT w = 0, h = 0;
+        if (DumpDepthRaw(t, name, &w, &h))
+            if (FILE* f = std::fopen("cascade_maps.txt", "a")) {
+                std::fprintf(f, "%06llu frame %llu t %.4f %s sun %d other %d host %ux%u guest %ux%u m", (unsigned long long)n,
+                             (unsigned long long)g_cascade_trace.frame, std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - g_cascade_trace.start).count(),
+                             pass.which ? "far" : "near", int(sun), int(other), w, h, t.width, t.height);
+                for (int i = 0; i < 12; i++) std::fprintf(f, " %.9g", m[i / 4][i % 4]);
+                std::fprintf(f, " clip");
+                for (int i = 0; i < 16; i++) std::fprintf(f, " %.9g", clip[i / 4][i % 4]);
+                std::fprintf(f, "\n");
+                std::fclose(f);
+            }
+    }
     ViewMaps& vm = g_view_maps[pass.view];
     // this pass's maps for their receivers; with one map of the sun's and the other cascade's map of the view's pass
     // before, both
     const bool one = pass.maps == 1 && sun;
     if (!one || vm.address != pass.address[0]) vm = ViewMaps{};
     if (one) vm.address = pass.address[0], vm.map[pass.which] = pass.target[0];
+    if (one && pass.which) {  // the solid casters go with this far map (or none)
+        vm.solids = pass.solids && pass.solids->srv ? pass.solids : nullptr;
+        std::memcpy(vm.solids_square, pass.solids_square, sizeof vm.solids_square);
+    }
     const bool both = one && other && vm.map[0] && vm.map[1] && vm.map[0]->srv && vm.map[1]->srv;
+    if (both && !pass.which) {
+        // the near square in the far map's texture coordinates (m: near to far; both cameras look along the sun, the
+        // depth hardly moves u and v): where the next far pass draws its solid casters
+        vm.near_square[0] = m[0][3] + 0.5f * m[0][2], vm.near_square[1] = m[1][3] + 0.5f * m[1][2];
+        vm.near_square[2] = m[0][0], vm.near_square[3] = m[1][1];
+        vm.near_square_valid = m[0][0] > 0 && m[1][1] > 0;
+    }
     for (int i = 0; i < pass.maps; i++) {
         ShadowBinding* b = nullptr;
         for (ShadowBinding& x : g_bindings)
@@ -4053,30 +5231,79 @@ void EndSunShadowPass(bool sun, bool other, const float m[3][4]) {
         b->address = pass.address[i], b->current = pass.target[i];
         if (!both) continue;
         b->cascade = true, b->near_map = vm.map[0], b->far_map = vm.map[1];
-        // this frame's map: as the receivers address it; the other: m (from the game's two cameras) about the XDK's
-        // pixel centre (+0.53125 guest texels in c59: both maps hold their content offset by it, m maps the cameras'
-        // 0.5 +- 0.5 clip)
+        // this frame's map: as the receivers address it; the other: m (from the game's two cameras) about the point where
+        // the receivers address a map relative to its camera: +0.5 guest texels (measured from the game's texture
+        // matrices, c161: +0.50 in u and v; the terrain's two taps lie +-0.35 about it). It was 0.53125 (the XDK's pixel
+        // centre in c59) until 0.1.7: in the other map that reads (k - 1) x 0.03125 guest texels off (0.22 at k = 8), a
+        // remaining flicker at shadow edges that the tap correction made visible (GitHub #16)
         static const float kSame[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
         float o[3][4];
         std::memcpy(o, m, sizeof o);
-        const float g = 0.53125f / float(pass.target[i]->width);
-        o[0][3] += g - g * (o[0][0] + o[0][1]);
-        o[1][3] += g - g * (o[1][0] + o[1][1]);
-        o[2][3] -= g * (o[2][0] + o[2][1]);
+        // The depth likewise about the receivers' own: their texture matrices put them -0.3 16 bit units off the camera's
+        // depth (measured with the +0.5 texel, c161); mapped without it, the depth in the other map was (1 - a) x 0.3
+        // units off in every other frame (a: the depth scale between the cameras, 1.23 at k = 8), and surfaces that
+        // shadow themselves right at the bias (a rock face the player walks up to) changed in every other frame.
+        // diagnostics: FCI_CASCADE_PIXEL_SHIFT=<u>[/<v>[/<d>]][,...]: u and v replace the 0.5 guest texels, d the -0.3 depth
+        // units (where receivers address a map relative to its camera); several entries take turns every 2 s (the clock
+        // of FCI_TRACE_CASCADE), each change logged
+        constexpr float kDepthCentre = -0.3f;
+        struct Shift {
+            float u, v, d;
+        };
+        static const std::vector<Shift> shifts = [] {
+            std::vector<Shift> out;
+            char v[512] = {};
+            if (GetEnvironmentVariableA("FCI_CASCADE_PIXEL_SHIFT", v, sizeof v))
+                for (char* p = v; *p;) {
+                    Shift x{float(std::strtod(p, &p)), 0, kDepthCentre};
+                    x.v = x.u;
+                    if (*p == '/') x.v = float(std::strtod(p + 1, &p));
+                    if (*p == '/') x.d = float(std::strtod(p + 1, &p));
+                    out.push_back(x);
+                    while (*p == ',' || *p == ' ') p++;
+                }
+            if (out.empty()) out.push_back({0.5f, 0.5f, kDepthCentre});
+            return out;
+        }();
+        size_t which_shift = 0;
+        if (shifts.size() > 1) {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_cascade_trace.start).count();
+            which_shift = size_t(now / 2.0) % shifts.size();
+            static size_t logged = size_t(-1);
+            if (logged != which_shift) {
+                logged = which_shift;
+                rt::Log("render: cascades: pixel shift %g/%g guest texels, depth %+g (FCI_CASCADE_PIXEL_SHIFT) from %.3f s",
+                        shifts[which_shift].u, shifts[which_shift].v, shifts[which_shift].d, now);
+            }
+        }
+        const float gu = shifts[which_shift].u / float(pass.target[i]->width);
+        const float gv = shifts[which_shift].v / float(pass.target[i]->height);
+        const float gd = shifts[which_shift].d / 65535.0f;
+        // T(g) o T(-g), g = (gu, gv, gd)
+        for (int r = 0; r < 3; r++) o[r][3] += (r == 0 ? gu : r == 1 ? gv : gd) - gu * o[r][0] - gv * o[r][1] - gd * o[r][2];
         std::memcpy(b->n, pass.which ? o : kSame, sizeof b->n);
         std::memcpy(b->f, pass.which ? kSame : o, sizeof b->f);
+        if (vm.solids) {  // the far map's solid casters: at (far uv - square's corner) / its side
+            b->solids_map = vm.solids;
+            b->solids_xform[0] = vm.solids_square[0], b->solids_xform[1] = vm.solids_square[1];
+            b->solids_xform[2] = 1.0f / vm.solids_square[2], b->solids_xform[3] = 1.0f / vm.solids_square[3];
+        }
     }
     if (g_cascade_trace.from >= 0)  // diagnostics: n/f with both maps, N/F this one only, s not the sun, digit: maps
         g_cascade_trace.Pass(pass.maps != 1 ? char('0' + std::min(pass.maps, 9))
                              : !sun ? 's' : !both ? (pass.which ? 'F' : 'N') : pass.which ? 'f' : 'n');
-    static uint64_t frames = 0, draws = 0;
+    static uint64_t frames = 0, draws = 0, solid_draws = 0, solid_passes = 0;
+    if (pass.which && pass.solids) solid_draws += pass.solids_draws, solid_passes++;
+    if (pass.which) g_cascade_trace.solids += pass.solids_draws;  // diagnostics: FCI_TRACE_CASCADE
     if (both && ++frames % 3000 == 1) {
-        rt::Log("render: shadow cascades: view %d near map %ux%u, far %ux%u for %08X, %.1f near draws per frame "
-                "(last 3000)", pass.view, HostWidthOf(vm.map[0]->width, vm.map[0]->scale, 1.0f),
-                HostHeightOf(vm.map[0]->height, vm.map[0]->scale), HostWidthOf(vm.map[1]->width, vm.map[1]->scale, 1.0f),
-                HostHeightOf(vm.map[1]->height, vm.map[1]->scale), vm.address,
-                double(g_cascade_draws - draws) / (frames > 1 ? 3000 : 1));
-        draws = g_cascade_draws;
+        rt::Log("render: shadow cascades: view %d near map %ux%u, far %ux%u for %08X, %.1f near draws per frame, solid "
+                "casters %s (%.1f draws per far pass) (last 3000)", pass.view,
+                HostWidthOf(vm.map[0]->width, vm.map[0]->scale, 1.0f), HostHeightOf(vm.map[0]->height, vm.map[0]->scale),
+                HostWidthOf(vm.map[1]->width, vm.map[1]->scale, 1.0f), HostHeightOf(vm.map[1]->height, vm.map[1]->scale),
+                vm.address, double(g_cascade_draws - draws) / (frames > 1 ? 3000 : 1),
+                vm.solids ? "on" : g_solids_on ? "not yet" : "off (FCI_CASCADE_SOLIDS=0)",
+                solid_passes ? double(solid_draws) / double(solid_passes) : 0.0);
+        draws = g_cascade_draws, solid_draws = solid_passes = 0;
     }
 }
 void DropSunShadow(int view) {
@@ -4102,7 +5329,7 @@ long CompileHlsl(const void* source, size_t size, const char* name, const void* 
     if (FAILED(hr)) {
         rt::Log("render: HLSL %s %s %s: compile failed (%08X)", name ? name : "?", entry ? entry : "?",
                 target ? target : "?", unsigned(hr));
-        ShowHlslFailure();
+        if (!g_hlsl_has_fallback) ShowHlslFailure();
     }
     return hr;
 }

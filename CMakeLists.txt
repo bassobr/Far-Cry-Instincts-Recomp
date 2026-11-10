@@ -192,6 +192,7 @@ add_executable(FarCryInstincts
     src/kernel/k_launch.cpp
     src/kernel/k_memory.cpp
     src/kernel/k_misc.cpp
+    src/kernel/k_save.cpp
     src/kernel/k_sync.cpp
     src/kernel/k_thread.cpp
     src/hle/xinput.cpp

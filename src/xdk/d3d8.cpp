@@ -531,23 +531,27 @@ void PresentFlip() {
     // (0 = not at all). Late frames are not caught up on, like a late flip on the console.
     // vsync = 1: the display paces instead (present.cpp: every n-th refresh for fps_limit)
     // (performance: the wait is on the render thread; the guest, one frame ahead at most, waits with it)
+    // A display faster than the cap (vsync on a 144 Hz monitor: every refresh) is held to the cap by the time limit
+    // as well; with variable refresh (G-Sync, FreeSync) that is the usual setup.
     const int limit = pcmode::FpsLimit();
+    auto time_limit = [limit] {
+        static double next = 0;
+        double now = Seconds();
+        if (next < now - 1.0 / limit) next = now;  // late: from now
+        if (next > now) {
+            rt::CpuUnlock cpu;
+            int64_t t = Ticks();
+            WaitUntil(next);
+            gpu::kelvin::AddWork(gpu::kelvin::Work::kLimit, Ticks() - t);  // performance: FCI_TRACE_HITCHES
+        }
+        next += 1.0 / limit;
+    };
     if (flip.interval && pcmode::Vsync()) {
+        if (limit > 0 && gpu::present::VsyncFps() > limit * 1.02) time_limit();
         rt::CpuUnlock cpu;  // (without the render thread: the other guest threads run meanwhile)
         gpu::present::WaitForDisplay();
     } else if (flip.interval && limit != 30) {
-        if (limit > 0) {
-            static double next = 0;
-            double now = Seconds();
-            if (next < now - 1.0 / limit) next = now;  // late: from now
-            if (next > now) {
-                rt::CpuUnlock cpu;
-                int64_t t = Ticks();
-                WaitUntil(next);
-                gpu::kelvin::AddWork(gpu::kelvin::Work::kLimit, Ticks() - t);  // performance: FCI_TRACE_HITCHES
-            }
-            next += 1.0 / limit;
-        }
+        if (limit > 0) time_limit();
     } else  // ---- end PC features ----
     if (flip.interval) {
         rt::CpuUnlock cpu;

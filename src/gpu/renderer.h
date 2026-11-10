@@ -52,9 +52,13 @@ void DropSunShadows();
 // instead of the guest's map; afterwards the receivers of that guest map read it (sun: it was the sun's; other: the
 // view's pass before drew the other cascade, whose texture coordinates and depth are m x (u, v, depth, 1) of this one's)
 void BeginSunShadowPass(int view, bool near_pass);
-void EndSunShadowPass(bool sun, bool other, const float m[3][4]);
+// (clip: this pass's camera, clip from world in rows; only for the diagnostics FCI_DUMP_CASCADE_MAPS)
+void EndSunShadowPass(bool sun, bool other, const float m[3][4], const float clip[4][4]);
 // a view's frame without a sun shadow pass: its receivers read the guest's own maps again
 void DropSunShadow(int view);
+// whether the view's last shadow pass drew the sun's map and nothing else (any thread; set on the render thread, a
+// frame or two behind the game): only then can the pass alternate between the near and the far square
+bool SunCascadesUsable(int view);
 // ---- end PC shadows ----
 // performance: held while the device context is in use (the render thread's commands, the settings menu's frames,
 // CPU reads of render targets)

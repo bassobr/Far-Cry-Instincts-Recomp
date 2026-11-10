@@ -14,6 +14,12 @@ bool TakeMouseMotion(int* dx, int* dy);
 // ---- PC comfort features: wheel notches since the last call (up positive), while the window has the focus ----
 int TakeWheelNotches();
 bool MouseCaptured();
+// ---- end PC comfort features ----
+// GitHub #28: whether a held mouse button (VK_LBUTTON ... VK_XBUTTON2) may reach the game: only a press that began in
+// the client area of the window in front, not the click that brought it there, not on the title bar or the frame,
+// not in a move/size loop or the settings menu. True for every other key code
+bool ButtonForGame(int vk);
+// ---- PC comfort features ----
 // settings menu: opened (the mouse is let go, the pointer shows) or closed (borderless takes the mouse again)
 void MenuShown(bool open);
 // ---- end PC comfort features ----

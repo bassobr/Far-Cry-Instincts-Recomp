@@ -1,4 +1,4 @@
-// PC features: fmv_scale (FarCryInstincts.ini / FCI_FMV_SCALE, see README "Configuration"):
+// PC features: fmv_scale (FarCryInstincts.ini / FCI_FMV_SCALE, see README "Breitbild (Hor+), Sichtfeld, Bildrate"):
 //   fmv_scale = fill (default) | 4:3
 // fill: full screen Bink videos on a widescreen display are as large as they fit without cutting their picture: the
 // black bars FCI encodes into its letterboxed videos are cut, the picture keeps its shape and is centred; 2D drawn over

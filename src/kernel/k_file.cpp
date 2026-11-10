@@ -102,6 +102,8 @@ std::mutex g_paths_lock;
 std::vector<Device> g_devices;
 std::map<std::string, std::string> g_links;  // lower case link name -> target
 
+fs::path g_hdd;  // data\hdd
+
 // FATX superblocks written by formatting (XMountUtilityDrive), by partition number
 std::mutex g_superblock_lock;
 std::map<int, std::vector<uint8_t>> g_superblocks;
@@ -138,9 +140,32 @@ struct FileObject : Object {
     bool fatx = false;  // raw partition that reads back an empty FATX volume
     uint64_t raw_pos = 0;
     HANDLE find = INVALID_HANDLE_VALUE;
+    // a save file (partition 1, UDATA or TDATA; kernel/k_save.cpp): its changes are noted and logged, one line
+    // per handle that wrote ("file: wrote"), so a tester's fci.log shows every save with its size
+    bool save = false;
+    bool writer = false;    // open for writing (counted by SaveWriterOpened)
+    bool deleting = false;  // marked for deletion
+    uint32_t writes = 0, write_errors = 0;
+    uint64_t written = 0, write_end = 0;  // bytes written, end of the furthest write
     ~FileObject() override {
+        if (writes || write_errors) {
+            LARGE_INTEGER size{};
+            if (h != INVALID_HANDLE_VALUE) GetFileSizeEx(h, &size);
+            // a signed file must end with its last write (the signature): bytes behind it break it
+            const bool tail = uint64_t(size.QuadPart) > write_end;
+            rt::Log("file: wrote %s: %llu bytes in %u writes, size now %lld%s%s", guest.c_str(), (unsigned long long)written,
+                    writes, (long long)size.QuadPart, write_errors ? ", WRITE ERRORS" : "",
+                    tail ? ", OLD BYTES BEHIND THE LAST WRITE" : "");
+        }
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
         if (find != INVALID_HANDLE_VALUE) FindClose(find);
+        if (deleting) {
+            // with the old delete semantics (no POSIX delete, e.g. on FAT32/exFAT drives) a file another program
+            // holds open stays in its folder until that one closes it
+            std::error_code ec;
+            if (fs::exists(host, ec)) rt::Log("file: %s still there after its delete (another program holds it?)", guest.c_str());
+        }
+        if (writer) SaveWriterClosed();
     }
     const char* Kind() const override { return "file"; }
 };
@@ -176,6 +201,7 @@ struct Where {
     bool read_only = false;
     bool device_root = false;
     bool disc = false;
+    bool save = false;  // a save file or folder (partition 1, UDATA or TDATA)
     const Disc::Entry* entry = nullptr;  // on the disc: the file or folder, null when missing
 };
 
@@ -193,6 +219,10 @@ bool Resolve(const std::string& guest, Where* w) {
             w->rest = rest;
             w->host = rest.empty() ? d.host : d.host / fs::path(rest);
             w->read_only = d.read_only;
+            // saves: the user's and the title's data on partition 1 (E:), not the cache partitions
+            const std::string under = Lower(rest);
+            w->save = d.name == "\\device\\harddisk0\\partition1" &&
+                      (under.rfind("udata\\", 0) == 0 || under.rfind("tdata\\", 0) == 0);
             // "\Device\Harddisk0\Partition1\" with the separator names the root directory, without it the volume
             w->device_root = lower.size() == d.name.size();
             if (d.name == "\\device\\cdrom0")
@@ -239,10 +269,22 @@ WIN32_FILE_ATTRIBUTE_DATA DiscAttributes(const Disc::Entry& e) {
     return d;
 }
 
+// The time of the last access, as the guest sees it: the time of the last write. FCI takes the checkpoint with the
+// newest access time as the profile's current one (GitHub #29); on FATX that time only moves with writes. NTFS (with
+// its default "system managed" setting) moves it on reads too, at most once an hour: the game reads both
+// checkpoints in name order at boot, and a session later than an hour made the one later in the alphabet the
+// "current" one; when that was the older one (a level's start "03_River.fcs" next to the last level's
+// "Checkpoint_*.fcs"), it did not fit the profile's *.mt and the profile "appeared to be damaged".
+// The same choice (0x00054910: FindFirstFile/FindNextFile, CompareFileTime on the access time) picks what Story Mode
+// "Resume" (0x00150B6F) and "Load savepoint" (0x00057601) load (GitHub #35): a level begun more than an hour before
+// its last checkpoint, then a restart within the hour, made the level's start the "newest" on NTFS, and the game
+// resumed at the start of the chapter.
+const FILETIME& AccessTime(const FILETIME& /*access*/, const FILETIME& write) { return write; }
+
 // FILE_NETWORK_OPEN_INFORMATION
 void WriteNetworkOpen(uint32_t out, const WIN32_FILE_ATTRIBUTE_DATA& d) {
     WriteFileTime(out + 0, d.ftCreationTime);
-    WriteFileTime(out + 8, d.ftLastAccessTime);
+    WriteFileTime(out + 8, AccessTime(d.ftLastAccessTime, d.ftLastWriteTime));
     WriteFileTime(out + 16, d.ftLastWriteTime);
     WriteFileTime(out + 24, d.ftLastWriteTime);
     uint64_t size = (uint64_t(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
@@ -371,6 +413,7 @@ uint32_t OpenFile(uint32_t handle_out, uint32_t access, uint32_t attributes, uin
                 SetIoStatus(iosb, X_STATUS_OBJECT_PATH_NOT_FOUND, 0);
                 return X_STATUS_OBJECT_PATH_NOT_FOUND;
             }
+            if (w.save) NoteSaveChange(host);  // a new profile folder
             fs::create_directory(host, ec);
             info = 2;  // FILE_CREATED
         } else if (disposition == kFileCreate) {
@@ -402,17 +445,52 @@ uint32_t OpenFile(uint32_t handle_out, uint32_t access, uint32_t attributes, uin
         // on a handle without that right (the file stayed, e.g. FCI's checkpoint slot fcs0.fcs, and the profile
         // with one checkpoint file too many counted as damaged)
         bool want_delete = (access & 0x10000) && !read_only;
-        file->h = CreateFileW(host.c_str(), GENERIC_READ | (want_write ? GENERIC_WRITE : 0) | (want_delete ? DELETE : 0),
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, create,
+        // a save file created or emptied by the open itself is a change (k_save.cpp); one only opened for
+        // writing is not, until something is written (the game opens SaveMeta.xbx that way just to read it)
+        file->save = w.save && !read_only;
+        const bool changes = file->save && (create == CREATE_ALWAYS || create == CREATE_NEW || create == TRUNCATE_EXISTING ||
+                                            (create == OPEN_ALWAYS && !exists));
+        if (changes) NoteSaveChange(host);
+        const DWORD rights = GENERIC_READ | (want_write ? GENERIC_WRITE : 0) | (want_delete ? DELETE : 0);
+        file->h = CreateFileW(host.c_str(), rights, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, create,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD err = file->h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        // Another program can hold a save file without sharing it for a moment (a virus scanner, a cloud folder's
+        // sync, a backup tool) or keep a deleted one pending. The game takes a failed open for a missing file: a
+        // failed delete left a third checkpoint, a failed write a broken one, and the profile was damaged. So:
+        // wait for it (up to 3 s, other guest threads run meanwhile), and say what blocked it.
+        if (file->save && !SaveGuardOff() && (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION ||
+                           (err == ERROR_ACCESS_DENIED && exists))) {
+            const DWORD first = err;
+            const uint64_t start = GetTickCount64();
+            {
+                rt::CpuUnlock unlock;
+                while (file->h == INVALID_HANDLE_VALUE && GetTickCount64() - start < 3000 &&
+                       (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED)) {
+                    Sleep(25);
+                    file->h = CreateFileW(host.c_str(), rights, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                          nullptr, create, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    err = file->h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+                }
+            }
+            rt::Log("file: %s was held by another program (%lu), %s after %llu ms", guest.c_str(), first,
+                    file->h != INVALID_HANDLE_VALUE ? "opened" : "STILL NOT OPENED",
+                    (unsigned long long)(GetTickCount64() - start));
+        }
         if (file->h == INVALID_HANDLE_VALUE) {
-            DWORD err = GetLastError();
             uint32_t status = err == ERROR_FILE_EXISTS ? X_STATUS_OBJECT_NAME_COLLISION
                             : err == ERROR_PATH_NOT_FOUND ? X_STATUS_OBJECT_PATH_NOT_FOUND
                             : err == ERROR_ACCESS_DENIED ? X_STATUS_ACCESS_DENIED
+                            : err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION ? X_STATUS_SHARING_VIOLATION
                                                          : X_STATUS_OBJECT_NAME_NOT_FOUND;
+            if (file->save && err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND && err != ERROR_FILE_EXISTS)
+                rt::Log("file: open of %s failed (%lu)", guest.c_str(), err);
             SetIoStatus(iosb, status, 0);
             return status;
+        }
+        if (changes) {
+            file->writer = true;
+            SaveWriterOpened();
         }
     }
     W32(handle_out, NewHandle(file));
@@ -432,10 +510,39 @@ LONGLONG FileSize(HANDLE h) {
     return size.QuadPart;
 }
 
+// a save file is about to change through this handle (written, its end set, deleted, renamed): k_save.cpp
+void Changing(FileObject& f) {
+    if (!f.save) return;
+    NoteSaveChange(f.host);
+    if (!f.writer) {
+        f.writer = true;
+        SaveWriterOpened();
+    }
+}
+
+// marks a file for deletion (or takes the mark back). FATX removes the name at once; Windows, with the classic
+// delete, only when every handle is closed, and another program's handle (a virus scanner, a sync tool) kept a
+// deleted checkpoint in its folder. The POSIX delete (Windows 10 1709, NTFS) removes the name at once like FATX;
+// where it is missing (FAT32/exFAT, older Windows, Wine) the classic one.
+bool Dispose(HANDLE h, bool del) {
+    if (del && !SaveGuardOff()) {
+        struct {
+            DWORD Flags;
+        } ex{0x1 | 0x2 | 0x10};  // FILE_DISPOSITION_FLAG_DELETE | _POSIX_SEMANTICS | _IGNORE_READONLY_ATTRIBUTE
+        constexpr auto kFileDispositionInfoEx = FILE_INFO_BY_HANDLE_CLASS(21);
+        if (SetFileInformationByHandle(h, kFileDispositionInfoEx, &ex, sizeof ex)) return true;
+    }
+    FILE_DISPOSITION_INFO disp{del};
+    return SetFileInformationByHandle(h, FileDispositionInfo, &disp, sizeof disp) != 0;
+}
+
 }  // namespace
+
+std::filesystem::path HddFolder() { return g_hdd; }
 
 void SetDevicePaths(const std::filesystem::path& dvd, const std::filesystem::path& hdd) {
     std::lock_guard lock(g_paths_lock);
+    g_hdd = hdd;
     g_devices.clear();
     g_devices.push_back({"\\device\\cdrom0", dvd, true});
     const char* partitions[] = {"partition0", "partition1", "partition2", "partition3", "partition4", "partition5",
@@ -579,8 +686,20 @@ KERNEL_EXPORT(236, NtWriteFile) {
         SetFilePointerEx(f->h, pos, nullptr, FILE_BEGIN);
     }
     DWORD n = 0;
+    Changing(*f);
     BOOL ok = WriteFile(f->h, rt::Host(a[5]), a[6], &n, nullptr);
     uint32_t status = ok ? X_STATUS_SUCCESS : X_STATUS_DISK_FULL;
+    if (!ok) f->write_errors++, rt::Log("file: write of %X bytes to %s failed (%lu)", a[6], f->guest.c_str(), GetLastError());
+    if (f->save || g_trace_reads) {
+        LARGE_INTEGER zero{}, pos{};
+        SetFilePointerEx(f->h, zero, &pos, FILE_CURRENT);
+        if (ok && f->save) {  // logged when the handle closes
+            f->writes++, f->written += n;
+            f->write_end = std::max(f->write_end, uint64_t(pos.QuadPart));
+        }
+        if (g_trace_reads)
+            rt::Log("file: write %s %X -> %X bytes, now at %llX", f->guest.c_str(), a[6], n, (unsigned long long)pos.QuadPart);
+    }
     SetIoStatus(a[4], status, n);
     Complete(c, a[1], a[2], a[3], a[4]);
     return status;
@@ -599,7 +718,7 @@ KERNEL_EXPORT(211, NtQueryInformationFile) {
     switch (a[4]) {
     case 4:  // FileBasicInformation
         WriteFileTime(out + 0, d.ftCreationTime);
-        WriteFileTime(out + 8, d.ftLastAccessTime);
+        WriteFileTime(out + 8, AccessTime(d.ftLastAccessTime, d.ftLastWriteTime));
         WriteFileTime(out + 16, d.ftLastWriteTime);
         WriteFileTime(out + 24, d.ftLastWriteTime);
         W32(out + 32, Attributes(d.dwFileAttributes));
@@ -663,20 +782,27 @@ KERNEL_EXPORT(226, NtSetInformationFile) {
     case 20: {  // FileEndOfFileInformation
         FILE_END_OF_FILE_INFO eof;
         eof.EndOfFile.QuadPart = R64s(in);
-        SetFileInformationByHandle(f->h, FileEndOfFileInfo, &eof, sizeof eof);
+        Changing(*f);
+        BOOL ok = SetFileInformationByHandle(f->h, FileEndOfFileInfo, &eof, sizeof eof);
+        if (f->save || !ok)
+            rt::Log("file: end of %s set to %lld%s", f->guest.c_str(), (long long)eof.EndOfFile.QuadPart, ok ? "" : " FAILED");
         break;
     }
     case 13: {  // FileDispositionInformation
         FILE_DISPOSITION_INFO disp{R8(in) != 0};
+        Changing(*f);
         if (f->dir) {
             ::CloseHandle(f->h);
             f->h = INVALID_HANDLE_VALUE;
             std::error_code ec;
             fs::remove(f->host, ec);
-        } else if (!SetFileInformationByHandle(f->h, FileDispositionInfo, &disp, sizeof disp)) {
+        } else if (!Dispose(f->h, disp.DeleteFile)) {
             rt::Log("file: delete of %s failed (%lu)", f->guest.c_str(), GetLastError());
+            SetIoStatus(a[1], X_STATUS_ACCESS_DENIED, 0);
             return X_STATUS_ACCESS_DENIED;
         }
+        if (f->save) rt::Log("file: delete %s%s", f->guest.c_str(), disp.DeleteFile ? "" : " (cancelled)");
+        f->deleting = disp.DeleteFile && !f->dir;
         break;
     }
     case 10: {  // FileRenameInformation: ReplaceIfExists, RootDirectory, FileName (OBJECT_STRING)
@@ -685,8 +811,12 @@ KERNEL_EXPORT(226, NtSetInformationFile) {
         bool ro;
         if (!ToHost(target, &host, &ro)) return X_STATUS_OBJECT_PATH_NOT_FOUND;
         if (ro) return X_STATUS_ACCESS_DENIED;  // onto the DVD
+        Changing(*f);
+        if (f->save) NoteSaveChange(host);
         ::CloseHandle(f->h);
         BOOL ok = MoveFileExW(f->host.c_str(), host.c_str(), R8(in) ? MOVEFILE_REPLACE_EXISTING : 0);
+        rt::Log("file: rename %s -> %s%s: %s (%lu)", f->guest.c_str(), target.c_str(), R8(in) ? " (replace)" : "",
+                ok ? "ok" : "FAILED", ok ? 0ul : GetLastError());
         f->host = host;
         f->guest = target;
         f->h = CreateFileW(host.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -802,7 +932,7 @@ KERNEL_EXPORT(207, NtQueryDirectoryFile) {
         W32(out + 0x00, 0);
         W32(out + 0x04, 0);
         WriteFileTime(out + 0x08, d.ftCreationTime);
-        WriteFileTime(out + 0x10, d.ftLastAccessTime);
+        WriteFileTime(out + 0x10, AccessTime(d.ftLastAccessTime, d.ftLastWriteTime));
         WriteFileTime(out + 0x18, d.ftLastWriteTime);
         WriteFileTime(out + 0x20, d.ftLastWriteTime);
         W64(out + 0x28, size);
@@ -841,7 +971,7 @@ KERNEL_EXPORT(207, NtQueryDirectoryFile) {
     W32(out + 0x00, 0);
     W32(out + 0x04, 0);
     WriteFileTime(out + 0x08, fd.ftCreationTime);
-    WriteFileTime(out + 0x10, fd.ftLastAccessTime);
+    WriteFileTime(out + 0x10, AccessTime(fd.ftLastAccessTime, fd.ftLastWriteTime));
     WriteFileTime(out + 0x18, fd.ftLastWriteTime);
     WriteFileTime(out + 0x20, fd.ftLastWriteTime);
     W64(out + 0x28, size);
@@ -858,8 +988,13 @@ KERNEL_EXPORT(195, NtDeleteFile) {
     fs::path host;
     bool ro;
     if (!ToHost(ObjectName(a[0]), &host, &ro) || ro) return X_STATUS_OBJECT_NAME_NOT_FOUND;
+    Where w;
+    Resolve(ObjectName(a[0]), &w);
+    if (w.save) NoteSaveChange(host);
     std::error_code ec;
-    return fs::remove(host, ec) ? X_STATUS_SUCCESS : X_STATUS_OBJECT_NAME_NOT_FOUND;
+    bool ok = fs::remove(host, ec);
+    if (w.save || !ok) rt::Log("file: delete %s%s", ObjectName(a[0]).c_str(), ok ? "" : " failed");
+    return ok ? X_STATUS_SUCCESS : X_STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
 KERNEL_EXPORT(198, NtFlushBuffersFile) {

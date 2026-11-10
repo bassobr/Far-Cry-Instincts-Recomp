@@ -21,12 +21,22 @@ var D3D_g_DeviceCreated = 0x00517EB8
 var D3D_g_FixedFunctionShader = 0x00519BF8  # the device's vertex shader record for FVF draws (CDevice::Init)
 # ---- end graphics HLE ----
 # ---- PC features (src/xdk/game.cpp) ----
+fun Game_BoatStep = 0x0019C730  # thiscall (CVehicle, step time; ret 4), virtual (CVehicle vtable 0x0060E248 +0x3C, the post-step call of the rigid body step 0x003B2FE0 at 0x003B565E): a boat's water model after each physics step (mode +0xA8: 1, 2 CBoat 0x0019C830 with the per-call drag Dampv/Dampvs, 3 wreck 0x0019E3F0, 4 hovercraft 0x0019D630)
 fun Game_CameraUpdate = 0x002A84E0  # CCamera update, camera in ebx: projection and frustum from fov +0x38, aspect +0x384
 fun Game_FirstPersonProjection = 0x002469E0  # renderer in eax: projection of first person items from fov +0x698, viewport and pixel aspect +0x6AC
 fun Game_FrameTimeSource = 0x001FF8F0  # thiscall (frame timer 0x00644488 in ecx), seconds in st(0): the millisecond clock 0x002856F0 x 0.001, the frame timer's time source
+fun Game_LivingAction = 0x003BE8B0  # thiscall (living entity, pe_action*; ret 4), virtual (CLivingEntity vtable 0x00625C40 +0x18): Action; pe_action_move with air control 1 (swimming) sets velocity = direction + the last step's set-velocity change (+0x730)
+fun Game_LivingMove = 0x003C4890  # stdcall (living entity, &step time, &move; ret 0xC), called only by the living step's move 0x003C6560: collision sweep 0x003C2570 only for moves above 1 mm (0x003C5003)
+fun Game_LivingStep = 0x003C6BE0  # thiscall (living entity, step time; ret 4), virtual (CLivingEntity vtable 0x00625C40 +0x44, called by the world step 0x003741E0): a step of a living entity (player, AI): velocity 0x003C5B00, move 0x003C6560
+fun Game_PathFollow = 0x001E50B0  # stdcall (&position, &move; ret 8), path in ebx (points of 16 bytes at [+0x14, +0x18), index +0x20): turns an AI's step move toward the path, pursuit with the move length as look-ahead (only caller 0x003C6859 in the living step move 0x003C6560)
 fun Game_PhysicsStep = 0x003741E0  # stdcall (physics world, frame time; ret 8): CPhysicalWorld time step, called once per frame by 0x001FCF40
 fun Game_PlayerAngles = 0x00098AE0  # thiscall (player, ?; ret 4), virtual (0x005FC3F0): the player's view angles with the water bob (p_waterbob_*, added per frame)
 fun Game_VehicleImpulses = 0x003CC9A0  # thiscall (wheeled vehicle, step time; ret 4), virtual (CWheeledVehicleEntity vtable 0x00625D40 +0xD8, called by the rigid body step 0x003B2FE0): all wheel forces of a step (suspension, engine, tyre friction)
+fun Game_PlayerIsUnderWater = 0x000C7710  # thiscall (script object: CPlayer at +0x10; script function handler; ret 4): the script binding IsUnderWater of a player or AI, the flag CPlayer+0x43C (Merc:CheckDrowning kills on it)
+fun Game_ContactPolygon = 0x00441800  # cdecl (n1, poly1, closed, ids out; eax = slot for the points' address, ecx = n2, edx = poly2): 2D polygon intersection of a trimesh contact area, its point count; called only by 0x00393C60 (CTriMesh::Intersect, edi = the geom_contact, area at +0x68)
+fun Game_PlayerLand = 0x00090460  # thiscall (CPlayer), virtual (CPlayer vtable entry at 0x005FC448): sends the script event Land (0x18) with fEntitySpeed = -[CPlayer+0xB34]
+fun Game_ScriptGlobals = 0x00215C10  # stdcall (frame time, AI ticks; ret 8), _time in xmm0: sets the Lua globals _time, _frametime, _aitick each frame (SetGlobalValue 0x0028B3B0), then the Lua garbage collection
+fun Game_EntityTimer = 0x0001DD40  # thiscall (CEntity, timer period in ms = CEntity+0x3E0; ret 4), virtual (CEntity vtable 0x005F6AA0 +0x124, called by the entity system update at 0x00035162): OnTimer, calls the script state function OnTimer (0x00022850, event 4)
 # ---- end PC features ----
 # ---- PC shadows (src/xdk/shadows.cpp) ----
 fun Game_ShadowPass = 0x00458C80  # (engine, ?, view environment: camera +0, sun shadow radius +0x34, ...; 7 args, ret 0x1C): shadow casting lights, their cameras and depth passes

@@ -22,6 +22,8 @@ int VideoMemoryUsage(int* budget_mb = nullptr);
 // PC features, vsync = 1: waits until the display takes the next frame (call with the guest CPU released, before
 // the frame is presented); false without vsync (the caller paces the frames itself)
 bool WaitForDisplay();
+// vsync: the frame rate the display paces (refresh / refreshes per frame); 0 before the swap chain
+double VsyncFps();
 // D3DGAMMARAMP: 256 red, 256 green, 256 blue
 void SetGamma(const uint8_t ramp[768]);
 

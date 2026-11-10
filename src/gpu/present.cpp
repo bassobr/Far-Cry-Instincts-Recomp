@@ -63,6 +63,7 @@ bool g_tearing = false;
 bool g_resize_pending = false;  // display output options: the buffers follow a fullscreen transition
 double g_refresh = 60;          // settings menu: the display's rate and the fps_limit g_interval is for
 int g_interval_limit = -1;
+std::atomic<double> g_vsync_fps{0};  // vsync: frames per second the display paces (refresh / interval), 0 = unknown
 
 // the composed frame at render resolution (frame, overlay)
 ComPtr<ID3D11Texture2D> g_out;
@@ -874,6 +875,7 @@ bool InitSwap() {
         int limit = pcmode::FpsLimit();
         g_interval = limit > 0 ? std::clamp(int(refresh / limit + 0.5), 1, 4) : 1;
         g_refresh = refresh, g_interval_limit = limit;  // settings menu: fps_limit may change
+        g_vsync_fps = refresh / g_interval;
         rt::Log("present: vsync, %.0f Hz display, every %d refresh (%.1f fps)%s", refresh, g_interval,
                 refresh / g_interval, g_waitable ? "" : ", no waitable object");
     }
@@ -1093,6 +1095,8 @@ void Dump(uint32_t w, uint32_t h, float aspect) {
 
 }  // namespace
 
+double VsyncFps() { return g_vsync_fps.load(std::memory_order_relaxed); }
+
 bool WaitForDisplay() {
     if (!(g_chain_flags & kVsyncFlag)) return pcmode::Vsync();  // vsync, before the swap chain exists: nothing to wait for yet
     if (g_waitable) WaitForSingleObjectEx(g_waitable, 100, TRUE);
@@ -1139,6 +1143,7 @@ void ApplyChanges() {
     if ((g_chain_flags & kVsyncFlag) && pcmode::FpsLimit() != g_interval_limit) {
         g_interval_limit = pcmode::FpsLimit();
         g_interval = g_interval_limit > 0 ? std::clamp(int(g_refresh / g_interval_limit + 0.5), 1, 4) : 1;
+        g_vsync_fps = g_refresh / g_interval;
         rt::Log("present: vsync every %d refresh (%.1f fps)", g_interval, g_refresh / g_interval);
     }
 }

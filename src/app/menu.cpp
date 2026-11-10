@@ -207,10 +207,14 @@ Choices ScaleChoices() {
 }
 
 Choices FpsChoices() {
-    Choices out = {{"auto", "AUTO (DISPLAY'S REFRESH)"}};
-    for (int f : {30, 60, 75, 90, 100, 120, 144, 165, 240})
+    // at most pcmode::kMaxFps: the game logic is verified up to 120 fps (README, frame rate and game logic)
+    Choices out = {{"auto", "AUTO (DISPLAY'S REFRESH, MAX 120)"}};
+    for (int f : {30, 60, 75, 90, 100, 120})
         out.push_back({std::to_string(f), std::to_string(f) + (f == 30 ? " (CONSOLE)" : "")});
-    out.push_back({"0", "UNLIMITED"});
+    if (pcmode::UncappedAllowed()) {  // unsupported_uncapped_fps = 1 in the ini: above 120, not supported
+        for (int f : {144, 165, 240}) out.push_back({std::to_string(f), std::to_string(f) + " (UNSUPPORTED)"});
+        out.push_back({"0", "UNLIMITED (UNSUPPORTED)"});
+    }
     return out;
 }
 
@@ -255,7 +259,7 @@ const Setting kSettings[] = {
     {"fov", "FIELD OF VIEW", "1", [] { return Range(0.5, 2.0, 0.05, 1.0, 2, "x"); }, When::Live,
      "Scale of the game's vertical field of view, on every screen shape (the sides follow with Hor+)."},
     {"fps_limit", "MAX FRAME RATE", "auto", FpsChoices, When::Live,
-     "Highest frame rate; auto = the display's refresh rate, 30 = the console's."},
+     "Highest frame rate, at most 120 (more only with unsupported_uncapped_fps in the ini: not supported); auto = the display's refresh rate, 30 = the console's."},
     {"vsync", "VERTICAL SYNC", "0", OnOff, When::Restart, "Show frames with the monitor's refresh."},
     {"fps_counter", "FPS COUNTER", "0", OnOff, When::Live, "Frame rate and frame times, top left."},
     {"frame_queue", "FRAMES AHEAD", "1",
@@ -430,6 +434,8 @@ bool Truthy(const std::string& v) { return v == "1" || v == "true" || v == "yes"
 int IndexOf(const Setting& s, const Choices& list, std::string v) {
     v = Lower(Trim(v));
     if (v == "console" && !std::strcmp(s.key, "water_quality")) v = "original";  // PC water: the earlier name
+    if (!std::strcmp(s.key, "fps_limit") && std::atoi(v.c_str()) <= 0 && v != "auto" && !pcmode::UncappedAllowed())
+        v = std::to_string(pcmode::kMaxFps);  // the earlier "unlimited" (0) runs at the cap
     bool boolean = list.size() == 2 && list[0].value == "0" && list[1].value == "1";
     if (boolean) return Truthy(v) ? 1 : (v == "0" || v == "false" || v == "no" || v == "off") ? 0 : IndexOf(s, list, Fallback(s));
     for (size_t i = 0; i < list.size(); i++)

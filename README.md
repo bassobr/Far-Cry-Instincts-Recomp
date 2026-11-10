@@ -29,7 +29,9 @@ the other open-source projects listed under [Credits](#credits).
 - Screen-space ambient occlusion: SSAO or GTAO, at full or half resolution
 - Widescreen (Hor+) with the HUD kept in the 4:3 centre, adjustable field of view, full-screen videos fitted to the
   width
-- Unlocked frame rate (default: the display's refresh rate), optional vsync, frames-ahead setting
+- Frame rates up to 120 fps (default: the display's refresh rate), with the parts of the game logic that depended
+  on the Xbox's 30 fps decoupled (see [Frame rate and game logic](#frame-rate-and-game-logic)), optional vsync,
+  frames-ahead setting
 - HDR10 output with paper white, peak brightness and highlight boost settings
 - Level-of-detail and object view distance multipliers
 - An improved ocean shader (Fresnel reflection, refraction, depth-based colour and opacity, sun glint), optionally
@@ -186,6 +188,11 @@ mouse), right / left mouse button = left / right trigger, Space = A, C = B, E = 
 Enter = Start, Escape = Back, arrow keys = D-pad, IJKL = right stick, Left Shift / V = stick clicks. Controllers map
 as on the Xbox, with LB = White and RB = Black.
 
+**Dual-wielding (akimbo):** pick up a second MP5, P90, Desert Eagle, Glock or Beretta, then press the D-pad
+direction of its slot twice (left: primary, right: pistols) to switch between one and two guns. As on the Xbox,
+each trigger fires its own gun: the right trigger (left mouse button) the right gun, the left trigger (right mouse
+button) the left gun, both together both guns. While dual-wielding, the left trigger does not throw grenades.
+
 ## Configuration
 
 Settings are read from `FarCryInstincts.ini` next to the executable (`key = value`, `#` or `;` comments). Every key
@@ -212,7 +219,8 @@ there.
 | `view_distance` | `2` (Steam Deck `1`) | Object view distance, 0.5–8 times the console's |
 | `aspect` | `auto` | `auto` (the output's shape), `4:3`, `16:9`, `16:10`, `21:9`, `W:H` or a number |
 | `fov` | `1` | Field of view multiplier, 0.5–2, on the game's vertical view (67.5° in play), on every aspect ratio; `2` gives 135° vertically (160° horizontally on 21:9) |
-| `fps_limit` | `auto` | `auto` = display refresh rate, `30` = console, `0` = unlimited, or a number |
+| `fps_limit` | `auto` | Highest frame rate, at most 120: `auto` = display refresh rate (up to 120), `30` = console, or a number; `0` and values above 120 are taken as 120 |
+| `unsupported_uncapped_fps` | `0` | **Unsupported:** `1` allows `fps_limit = 0` (unlimited) and values above 120. The game logic is only verified up to 120 fps; bugs above it won't be fixed |
 | `vsync` | `0` | `1` = present with the display's refresh |
 | `frame_queue` | `1` (Steam Deck `2`) | Frames the game may finish ahead of display, 1–3 |
 | `shader_async` | `1` | Compile new shaders in the background (`0` = wait for each) |
@@ -303,6 +311,47 @@ On a Steam Deck (detected from the firmware's board and product names, or `Steam
 `ao = gtao`, `shadow_scale = 4`, `frame_queue = 2`, `lod_distance = 1`, `view_distance = 1`. Values set in the ini
 file, the environment or the menu still win. `FCI_DEVICE=deck` or `FCI_DEVICE=pc` overrides the detection.
 
+## Frame rate and game logic
+
+Far Cry Instincts was written for the Xbox's ~30 fps. The game runs its pace, cutscenes and most movement on time, but
+in some places its logic depends on the number of frames. It adds per frame instead of per second, decides on the first
+of many samples, or assumes that a step lasts 1/30 s. At higher frame rates this made boats slower, kept swimmers below
+the surface, made falls more deadly and made drowning take longer.
+
+A frame-rate audit compares level openings and scenarios (on foot, jumps, falls, vines, vehicles, swimming) at 30, 60,
+90 and 120 fps. These are the parts it decoupled from the frame rate:
+
+| Area | Original at high frame rates | Now | Original behaviour |
+|---|---|---|---|
+| Videos behind the menus (#13) | played 2×/4× too fast | play at their own frame rate | `FCI_NO_VIDEO_PACE=1` |
+| Wheeled vehicles: tyre forces | applied every physics step; an AI truck left its path | at most 60 times per second, like the console | `FCI_VEHICLE_EVERY_STEP=1` |
+| View sway while swimming (#6) | added up per frame, so it grew with the frame rate | per second | `FCI_FRAME_BOB=1` |
+| Boats, Zodiac, jet ski (#26) | top speed ~40 % lower at 120 fps; AI boats arrived late | the water model at the console's 50 steps per second | `FCI_FRAME_WATER_FORCES=1` |
+| Swimming: buoyancy and currents | applied per frame. At 120 fps the player stayed under water after the jump in 13_Black_Forest and drowned. Currents were weaker by 30/fps | per second; small movements are accumulated | `FCI_FRAME_SWIM=1` |
+| AI drowning on a single sample (#22) | an AI attached to another object "drowned" in the 13_Black_Forest opening and the level got stuck | an attached AI never counts as under water for its scripts | `FCI_BOUND_DROWNING=1` |
+| Steps and edges (player and AI) | whether a character follows a step down or takes off depended on the step length; AI ran down stairs faster | the test uses a console-length step | `FCI_FRAME_EDGE=1` |
+| Landing after take-off | happened on the first step, a few milliseconds after take-off | no earlier than 1/30 s of flight, like the console | `FCI_FRAME_LANDING=1` |
+| Fall damage | taken from the speed ~1.5 frames before impact; at 120 fps a 9 m fall was lethal | as at 30 fps | `FCI_FRAME_FALL=1` |
+| Drowning damage | damage per timer tick × frame time; at 120 fps death came after 38.8 s instead of 13.8 s | console time per tick: 13.8–13.9 s at every frame rate | `FCI_FRAME_TIMERS=1` |
+| AI paths around corners | an AI followed its path with a look-ahead of one step; smaller steps made it hug corners and get stuck (an enemy in 05_Mines stayed on a stair landing) | console-length look-ahead; a corner it is stuck in releases it as on the console | `FCI_FRAME_PATH=1` |
+
+The fixes change nothing at 30 fps and below. The environment variables in the last column bring back the original
+behaviour, one by one, for comparisons.
+
+**At most 120 fps.** The game logic is not verified above 120 fps, so `fps_limit` takes at most 120. If you want more
+anyway, set `unsupported_uncapped_fps = 1`. This is unsupported, and bugs above 120 fps won't be fixed.
+
+**Still open** (measured, not fixed yet). `fps_limit = 30` plays exactly like the console:
+- **AI think rate:** every AI thinks every fourth frame: 7.5 times per second on the console, 30 at 120 fps.
+  In our tests (patrol detection in 07_Sub-Aquatic_Facility) this made no measurable difference; detection
+  varies from run to run at every frame rate, including 30 fps.
+- **Slope edges:** at 120 fps the player slides over steep slope edges in only about half the cases where he does at
+  30 fps.
+- **Top of a ladder or vine:** with tapped forward input you get over the top more easily at 30 fps. With the stick
+  held it is the same at every frame rate.
+- **The first frames after a level loads** run without the limiter, even with `fps_limit = 30`.
+- **Cosmetic:** debris and crates settle a little sooner at high frame rates.
+
 ## Architecture
 
 `fci-recomp` (`tools/recomp`) decodes the XBE with Zydis, finds the functions and turns each into a C++ function
@@ -332,6 +381,8 @@ code. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   `mouse_mode = stick` brings back the old behaviour.
 - The Map Editor is a separate program on the disc (`ige.xbe`) that the recomp does not include; choosing it shows a
   notice and the game stays in the main menu.
+- Some parts of the game logic still behave a little differently above 30 fps (listed under
+  [Frame rate and game logic](#frame-rate-and-game-logic)); `fps_limit = 30` plays exactly like the console.
 - Online play (Xbox Live, system link) is not supported.
 
 ## Credits

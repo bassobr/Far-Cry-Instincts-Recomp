@@ -338,6 +338,9 @@ KERNEL_EXPORT(358, HalIsResetOrShutdownPending) { return 0; }
 
 KERNEL_EXPORT(49, HalReturnToFirmware) {
     hle::host::StopRumble();
+    // the game saved before its reboot; a save of another thread still running is finished, none starts after it,
+    // also not while this process waits for the new one's first frames (GitHub #29)
+    FinishSaves("reboot of the title", 5000, 0);
     // XLaunchNewImage of the title itself (FCI reboots between levels): start again with the launch data
     if (Relaunch(a[0])) rt::FlushLog(), ExitProcess(0);
     rt::Log("kernel: HalReturnToFirmware(%u), the title quit", a[0]);
@@ -348,6 +351,7 @@ KERNEL_EXPORT(49, HalReturnToFirmware) {
 KERNEL_EXPORT(360, HalInitiateShutdown) {
     rt::Log("kernel: HalInitiateShutdown");
     hle::host::StopRumble();
+    FinishSaves("shutdown of the title", 5000, 0);
     rt::FlushLog();
     ExitProcess(0);
 }
@@ -492,6 +496,23 @@ KERNEL_EXPORT(336, XcSHAUpdate) {
 KERNEL_EXPORT(337, XcSHAFinal) {
     GuestSha(a[0])->Final(rt::Host(a[1]));
     return 0;
+}
+
+// HMAC-SHA1 on host memory (save game signatures checked by the host, k_save.cpp); key up to 64 bytes
+void HmacSha1(const uint8_t* key_material, size_t key_size, const uint8_t* data, size_t size, uint8_t digest[20]) {
+    uint8_t key[64] = {}, pad[64], inner[20];
+    std::memcpy(key, key_material, std::min<size_t>(key_size, 64));
+    Sha1 s;
+    for (int i = 0; i < 64; i++) pad[i] = key[i] ^ 0x36;
+    s.Init();
+    s.Update(pad, 64);
+    s.Update(data, size);
+    s.Final(inner);
+    for (int i = 0; i < 64; i++) pad[i] = key[i] ^ 0x5C;
+    s.Init();
+    s.Update(pad, 64);
+    s.Update(inner, 20);
+    s.Final(digest);
 }
 
 // KeyMaterial, KeyMaterialLength, Data, DataLength, Data2, Data2Length, Digest

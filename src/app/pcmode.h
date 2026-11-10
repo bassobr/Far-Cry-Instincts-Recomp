@@ -1,7 +1,8 @@
 // PC display features of the HLE graphics path (FarCryInstincts.ini / FCI_<KEY>, see README):
 //   aspect     = auto | 4:3 | 16:9 | 16:10 | 21:9 | <width>:<height> | <ratio>   picture shape of 3D frames (Hor+)
 //   fov        = scale of the game's vertical field of view (1 = as on the console)
-//   fps_limit  = auto (the refresh rate of the window's monitor) | 30 (the console's rate) | 60 | ... | 0 (unlimited)
+//   fps_limit  = auto (the refresh rate of the window's monitor, at most 120) | 30 (the console's rate) | 60 | ... | 120
+//                (the game logic is verified up to 120 fps: kMaxFps; 0 or more than 120 is taken as 120)
 //   vsync      = 0 | 1  wait for the monitor's refresh when presenting
 //   shadow_distance = how far the sun's shadows reach, times the console's (1 = as on the console)
 //   lod_distance  = distances at which objects and vegetation drop to lower LODs and to sprites, times the console's
@@ -17,8 +18,13 @@ float Aspect();
 float Widen();
 // scale of the vertical field of view (1 = the game's own)
 float FovScale();
-// the most frames per second the game may show; 0 = no limit. 30 is the console's (flip every second vblank)
+// the most frames per second the game may show, at most kMaxFps. 30 is the console's (flip every second vblank).
+// 0 = no limit only with FCI_UNCAPPED_FPS=1 (developer measurements; the game logic is not verified above 120)
 int FpsLimit();
+constexpr int kMaxFps = 120;
+// unsupported_uncapped_fps = 1 (ini) or FCI_UNSUPPORTED_UNCAPPED_FPS=1: fps_limit 0 (no limit) and above kMaxFps
+// allowed. Not supported: the game logic is only verified up to kMaxFps
+bool UncappedAllowed();
 // fps_limit = auto: the refresh rate of the monitor the window is on (gpu/present.cpp reports it, Hz)
 void SetDisplayRefresh(int hz);
 constexpr int kFpsAuto = -2;  // SetFpsLimit: follow the display

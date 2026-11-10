@@ -10,6 +10,7 @@
 // templates: Daytime, ...), this hook replaces the first StartLevel command with one that carries it.
 #include <windows.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -120,7 +121,52 @@ void ShareProfile() {
     rt::Log("start level: profile %08X on all controller ports (split screen)", profile);
 }
 
+// FCI_TEST_COMMAND_DELAY=<seconds> (tests): the game object of the level start whose FCI_TEST_COMMAND is still due
+uint32_t g_delayed_game = 0;
+
+// FCI_TEST_COMMAND after the level start command in edx (pushed first): at once, or with FCI_TEST_COMMAND_DELAY
+// later by StartLevelTick; false = no test command
+bool QueueTestCommand(rt::Cpu& c, uint32_t* result, const char* why) {
+    char test[200];
+    DWORD n = GetEnvironmentVariableA("FCI_TEST_COMMAND", test, sizeof test);
+    if (!n || n >= sizeof test) return false;
+    if (GetEnvironmentVariableA("FCI_TEST_COMMAND_DELAY", nullptr, 0) > 0) {
+        g_delayed_game = rt::R32(c.esp + 4);
+        *result = xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));
+        return true;
+    }
+    uint32_t text = c.edx;
+    *result = xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));
+    std::memcpy(rt::Host(text), test, n + 1);
+    c.edx = text;
+    rt::Log("start level: test command '%s'%s", test, why);
+    xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));
+    return true;
+}
 }  // namespace
+
+// FCI_TEST_COMMAND_DELAY=<seconds> (tests): FCI_TEST_COMMAND only after that many seconds of the level (the physics
+// step asks every frame), so with FCI_TEST_COMMAND_REPEAT each process of a restart chain plays that long
+void xdk::StartLevelTick(rt::Cpu& c) {
+    if (!g_delayed_game) return;
+    static const double delay = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("FCI_TEST_COMMAND_DELAY", v, sizeof v) ? std::atof(v) : 0.0;
+    }();
+    if (xdk::LevelSeconds() < delay) return;
+    char test[200];
+    DWORD n = GetEnvironmentVariableA("FCI_TEST_COMMAND", test, sizeof test);
+    static const uint32_t text = mem::Contiguous().Alloc(0x1000);
+    const uint32_t game = g_delayed_game;
+    g_delayed_game = 0;
+    if (!n || n >= sizeof test || !text) return;
+    std::memcpy(rt::Host(text), test, n + 1);
+    const rt::Cpu saved = c;
+    c.edx = text;
+    rt::GuestCall(c, SYM(Game_PushCommand), {game});
+    c = saved;
+    rt::Log("start level: test command '%s' after %.1f s of the level", test, xdk::LevelSeconds());
+}
 
 // 0x00012000: push a game command (edx = text, [esp+4] = game), ret 4
 HLE_STDCALL(Game_PushCommand, 1) {
@@ -162,6 +208,12 @@ HLE_STDCALL(Game_PushCommand, 1) {
         if (cmd.rfind("StartLevel level=", 0) == 0) {
             done = true;
             EnsureProfile(c);
+            // FCI_TEST_COMMAND_REPEAT=1 (tests): FCI_TEST_COMMAND in every relaunched process too, a chain of level
+            // starts (FadeOutRestartStartLevel into the same level: one start every ~15 s without the menus)
+            uint32_t r;
+            if (GetEnvironmentVariableA("FCI_TEST_COMMAND_REPEAT", nullptr, 0) > 0 &&
+                QueueTestCommand(c, &r, " (relaunched)"))
+                return r;
         }
     }
     if (!done && kernel::StartLevelSetting(&level, &mission, &players)) {
@@ -186,17 +238,9 @@ HLE_STDCALL(Game_PushCommand, 1) {
             rt::Log("start level: game command '%s'", cmd.c_str());
             // FCI_TEST_COMMAND=<game command>: queued right after the level start (test of the game's own
             // reboot paths, e.g. "FadeOutRestartStartLevel level=02_Native" = the reboot between levels)
-            char test[200];
-            DWORD n = GetEnvironmentVariableA("FCI_TEST_COMMAND", test, sizeof test);
-            if (n && n < sizeof test && GetEnvironmentVariableA("FCI_TEST_COMMAND_ON", nullptr, 0) == 0) {
-                uint32_t text = c.edx;
-                uint32_t r = xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));
-                std::memcpy(rt::Host(text), test, n + 1);
-                c.edx = text;
-                rt::Log("start level: test command '%s'", test);
-                xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));
+            uint32_t r;
+            if (GetEnvironmentVariableA("FCI_TEST_COMMAND_ON", nullptr, 0) == 0 && QueueTestCommand(c, &r, ""))
                 return r;
-            }
         }
     }
     return xdk::CallOriginal(c, GUEST_ORIG(Game_PushCommand));

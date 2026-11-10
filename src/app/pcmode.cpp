@@ -14,6 +14,32 @@
 #include "xdk/xdk.h"
 
 namespace pcmode {
+// ---- frame rate cap ----
+namespace {
+// unsupported_uncapped_fps = 1 in the ini (or FCI_UNSUPPORTED_UNCAPPED_FPS=1; the line may also be written with the
+// variable's name, FCI_UNSUPPORTED_UNCAPPED_FPS = 1; FCI_UNCAPPED_FPS=1 is the developers' earlier name): fps_limit 0
+// (no limit) and above kMaxFps. Not supported: parts of the game logic are tied to the frame rate
+// (README, frame rate and game logic) and everything above kMaxFps is unverified.
+bool Uncapped() {
+    static const bool on = [] {
+        const char* v = std::getenv("FCI_UNCAPPED_FPS");
+        bool b = settings::Bool("unsupported_uncapped_fps", false) ||
+                 settings::Bool("fci_unsupported_uncapped_fps", false) || (v && *v && *v != '0');
+        if (b)
+            rt::Log("pcmode: unsupported_uncapped_fps: frame rates above %d allowed (UNSUPPORTED: the game logic is "
+                    "only verified up to %d fps)", kMaxFps, kMaxFps);
+        return b;
+    }();
+    return on;
+}
+int CapFps(int n) {
+    if (n == kFpsAuto) return n;
+    if (Uncapped()) return n <= 0 ? 0 : std::clamp(n, 10, 1000);
+    return n <= 0 || n > kMaxFps ? kMaxFps : std::max(n, 10);
+}
+}  // namespace
+bool UncappedAllowed() { return Uncapped(); }
+// ---- end frame rate cap ----
 
 namespace {
 
@@ -54,13 +80,15 @@ const Mode& Get() {
         if (m.aspect < kConsole * 1.01f) m.aspect = kConsole;  // narrower than 4:3 stays 4:3 (letterboxed)
         m.fov = std::clamp(settings::Float("fov", 1.0f), 0.5f, 2.0f);
         // fps_limit = auto (the default): the display's refresh rate (60 on the Steam Deck LCD, 90 on the OLED, 120
-        // on the ROG Ally X, 144 on many PC monitors), a number: that, 0: no limit
+        // on the ROG Ally X), at most kMaxFps; a number: that, at most kMaxFps (0, the earlier "unlimited", too)
         const std::string fps = settings::String("fps_limit", "auto");
         if (fps.empty() || fps == "auto") {
             m.fps = kFpsAuto;
         } else {
-            m.fps = std::clamp(std::atoi(fps.c_str()), 0, 1000);
-            if (m.fps > 0 && m.fps < 10) m.fps = 10;
+            m.fps = CapFps(std::atoi(fps.c_str()));
+            if (m.fps != std::atoi(fps.c_str()))
+                rt::Log("pcmode: fps_limit = %s taken as %d (the game logic is verified up to %d fps)", fps.c_str(),
+                        m.fps, kMaxFps);
         }
         m.vsync = settings::Int("vsync", 0) != 0;
         m.shadow_distance = std::clamp(settings::Float("shadow_distance", 1.0f), 1.0f, 8.0f);  // PC shadows
@@ -107,7 +135,8 @@ int FpsLimit() {
     if (n < 0 && n != kFpsAuto) n = Get().fps;
     if (n != kFpsAuto) return n;
     int hz = g_refresh.load(std::memory_order_relaxed);
-    return hz ? hz : Sensible(output::Get().desktop_hz);  // before the first present: the chosen monitor's
+    hz = hz ? hz : Sensible(output::Get().desktop_hz);  // before the first present: the chosen monitor's
+    return Uncapped() ? hz : std::min(hz, kMaxFps);
 }
 void SetFovScale(float scale) {
     if (!xdk::HleGraphics()) return;
@@ -116,10 +145,7 @@ void SetFovScale(float scale) {
 }
 void SetFpsLimit(int limit) {
     if (!xdk::HleGraphics()) return;
-    if (limit != kFpsAuto) {
-        limit = std::clamp(limit, 0, 1000);
-        if (limit > 0 && limit < 10) limit = 10;
-    }
+    limit = CapFps(limit);
     g_fps = limit;
     rt::Log("pcmode: fps limit %s (settings menu)", limit == kFpsAuto ? "auto" : std::to_string(limit).c_str());
 }

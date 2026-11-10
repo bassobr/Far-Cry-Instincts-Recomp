@@ -91,12 +91,22 @@ D3DDevice_PersistDisplay
 D3DDevice_UpdateOverlay
 # ---- end graphics HLE ----
 # ---- PC features (src/xdk/game.cpp) ----
+Game_BoatStep
 Game_CameraUpdate
 Game_FirstPersonProjection
 Game_FrameTimeSource
+Game_LivingAction
+Game_LivingMove
+Game_LivingStep
+Game_PathFollow
 Game_PhysicsStep
 Game_PlayerAngles
 Game_VehicleImpulses
+Game_PlayerIsUnderWater
+Game_ContactPolygon
+Game_PlayerLand
+Game_ScriptGlobals
+Game_EntityTimer
 # ---- end PC features ----
 # ---- PC shadows (src/xdk/shadows.cpp) ----
 Game_ShadowPass

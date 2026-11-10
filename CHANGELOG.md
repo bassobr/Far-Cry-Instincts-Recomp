@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.8 (2026-11-10)
+
+- **Save games** (#29):
+  - Saves are no longer left broken. A save could be cut off when the game was closed or relaunched between levels; all pending writes now finish first.
+  - Saves are backed up. On start, a damaged save is repaired from the backup, or moved aside so it no longer blocks the profile.
+  - The game resumes from the save it last wrote. On Windows, reading a file also updates its access time, which the Xbox never does, so the game could pick an older save after a restart. One result was losing the last checkpoint and starting the chapter over (#35).
+  - Tested on Windows and on the Steam Deck.
+- **Black Forest no longer gets stuck at the start** (#22). An AI attached to the scripted scene was below the water line for a few milliseconds. At higher frame rates the game caught that moment and decided the character had drowned, so the sequence never went on. The opening now plays through at every frame rate.
+- **Clicking into the window to focus it no longer fires your weapon** (#28). This includes grabbing the title bar to move the window, and a window that was started in the background.
+- **Frame rate and game logic.** The game was written for the Xbox's ~30 fps, and at higher frame rates several parts of its logic behaved differently. These now behave as at 30 fps:
+  - boats, the Zodiac and the jet ski (#26), which were up to 40 % slower at 120 fps;
+  - swimming: Jack could stay under the surface and drown at 120 fps, and currents were weaker;
+  - how characters step off edges and down stairs, and when they land;
+  - fall damage: a 9 m fall was lethal at 120 fps;
+  - drowning, which took nearly three times as long at 120 fps;
+  - AI paths around corners: an enemy in Mines stayed on a landing instead of coming down.
+
+  Each fix can be switched off for comparison. The README's new chapter "Frame rate and game logic" lists them all, together with what is still open.
+- **The frame rate is capped at 120 fps.** The game logic is verified up to 120 fps; `fps_limit` and the menu go no higher. For more, set `unsupported_uncapped_fps = 1` in `FarCryInstincts.ini`. This is unsupported, and bugs above 120 fps won't be fixed.
+- **Shadow cascades no longer flicker** (#16). Measured on NVIDIA, AMD (ROG Ally X) and the Steam Deck, at the reporter's spot and around the levels, standing, turning and walking. Large rock and wall shadows near the player are back. The cost is about 0.1–0.4 ms per frame. Cascades stay off by default; turn them on with Shadow Cascades in the F10 menu.
+- **No more seams in the terrain with MSAA** (#19). They showed as fine lines, for example on Cliffs. The fix keeps a copy of what the previous terrain pass drew, so it costs almost no performance: the Steam Deck holds 90 fps with it.
+- **Widescreen HUD and masks:**
+  - The HUD stays in the 4:3 centre while swimming (#17). In some water areas it used to stretch across the whole screen.
+  - Binoculars and scopes keep their round shape on widescreen, and their dark border reaches the screen edges.
+- **A crash at the start of Cliffs is fixed.** It was a bug in the original game's collision code: rare contact shapes overflowed a buffer and overwrote a physics object.
+- **Akimbo controls are documented** (#34). Each trigger fires its own gun; on keyboard and mouse that is the left and right mouse button.
+- **First start after updating:**
+  - The game code is rebuilt once, with a new PGO profile.
+  - The shader cache is rebuilt once, because a shader interface fix changed the shaders. They had passed one value in mismatched registers; drivers coped, but it was undefined behaviour.
+
 ## 0.1.7 (2026-11-07)
 
 - Water no longer looks blocky or choppy (#14): the game's small wave-distortion texture holds signed values, which

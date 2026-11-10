@@ -16,9 +16,38 @@ namespace {
 using namespace kelvin;
 
 int g_shadow_filter = 0;  // PC shadows (SetShadowFilter)
+// GitHub #19: FCI_TARGET_MS_DEBUG (diagnostics) colours what reads the multisampled target being drawn (kTargetMS):
+// 1 green where a pixel reads its own position (its covered samples), red where it filters the average;
+// 2 rg = the coordinates' offset from the pixel centre (0.5 + offset / 2, in host pixels), b = own position;
+// 3 r = a partly covered pixel, g = the share of the samples read, blue where it filters the average;
+// 4 such draws dimmed, red = how much the value read differs from the resolved copy's (x 8), blue = filtered
+const int g_target_ms_debug = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("FCI_TARGET_MS_DEBUG", v, sizeof v) ? atoi(v) : 0;
+}();
 const int g_shadow_debug = [] {  // PC shadows: FCI_SHADOW_DEBUG (diagnostics)
     char v[8] = {};
     return GetEnvironmentVariableA("FCI_SHADOW_DEBUG", v, sizeof v) ? atoi(v) : 0;
+}();
+
+// PC shadows, diagnostics: FCI_CASCADE_TAPS=0 maps each shadow stage's coordinates into the other cascade on its own,
+// as 0.1.7 did (A/B for the tap correction, see "cascades" in Generate)
+const bool g_cascade_taps = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("FCI_CASCADE_TAPS", v, sizeof v) && v[0] == '0');
+}();
+// PC shadows, diagnostics: FCI_SOLIDS_SOFT=1 reads the cascades' map of solid casters with the soft filter, as the
+// first version of that map did (A/B for the cheaper lookup)
+const bool g_solids_soft = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("FCI_SOLIDS_SOFT", v, sizeof v) && v[0] == '1';
+}();
+// PC shadows, diagnostics (issue 16 analysis): FCI_CASCADE_FORCE=near|far: receivers with cascades read only that map
+// (near: also outside the near map's square), to tell which lookup changes between near and far frames
+const int g_cascade_force = [] {
+    char v[8] = {};
+    if (!GetEnvironmentVariableA("FCI_CASCADE_FORCE", v, sizeof v)) return 0;
+    return v[0] == 'n' ? 1 : v[0] == 'f' ? 2 : 0;
 }();
 
 const char* const kPrelude = R"(
@@ -161,37 +190,91 @@ uint64_t Key(const State& s, const Config& config) {
         const Sampler k = config.sampler[i];
         mix(uint32_t(k));
         shadow |= k == Sampler::kShadow || k == Sampler::kSceneDepth || k == Sampler::kSceneDepthMS;
-        if (k == Sampler::kSceneDepth || k == Sampler::kSceneDepthMS)  // point or linear (one texel or four)
+        if (k == Sampler::kSceneDepth || k == Sampler::kSceneDepthMS || k == Sampler::kTargetMS)  // point or linear
             mix((s.Reg(SET_TEXTURE_FILTER + 0x40 * i) >> 24) & 0xF);
     }
     if (shadow) mix(s.Reg(SET_SHADOW_COMPARE_FUNC));
-    if (shadow && config.cascade) mix(0xCA5CADE5);  // PC shadows: cascades
+    if (shadow && config.cascade) mix(0xCA5CADE0u | config.cascade);  // PC shadows: cascades (the stages)
     // signed textures (GitHub #14)
     const uint32_t signs = config.signs[0] | config.signs[1] << 4 | config.signs[2] << 8 | config.signs[3] << 12;
     if (signs) mix(0x5167u << 16 | signs);
+    bool target_ms = false;  // GitHub #19
+    for (int i = 0; i < 4; i++) target_ms |= config.sampler[i] == Sampler::kTargetMS;
+    static const bool plain = GetEnvironmentVariableA("FCI_TARGET_MS_PLAIN", nullptr, 0) > 0;
+    if (target_ms) mix(0x19u << 8 | config.target_ms_depth | (plain ? 0x80u : 0u));
+    if (config.mirror_write || config.mirror_read)  // GitHub #19: the target's mirror
+        mix(0x1919u << 16 | uint32_t(config.mirror_write) << 8 | uint32_t(config.mirror_resolved) << 12 |
+            config.mirror_read);
     return h;
 }
+
+// ---- GitHub #19, the target's mirror ----
+bool StageAlphaUsed(const State& s, int stage) {
+    if (stage == 0) return true;  // (r0's alpha starts as t0's)
+    const uint32_t reg = 8 + uint32_t(stage);
+    auto alpha_of = [&](uint32_t byte) { return (byte & 0xF) == reg && (byte & 0x10); };  // .aaa / .a
+    const uint32_t control = s.Reg(SET_COMBINER_CONTROL), stages = control & 0xFF;
+    for (uint32_t i = 0; i < stages && i < 8; i++) {
+        const uint32_t c = s.Reg(SET_COMBINER_COLOR_ICW + 4 * i), a = s.Reg(SET_COMBINER_ALPHA_ICW + 4 * i);
+        for (int k = 0; k < 32; k += 8)
+            if (alpha_of(c >> k) || alpha_of(a >> k)) return true;
+    }
+    const uint32_t cw0 = s.Reg(SET_COMBINER_SPECULAR_FOG_CW0), cw1 = s.Reg(SET_COMBINER_SPECULAR_FOG_CW1);
+    for (int k = 0; k < 32; k += 8)
+        if (alpha_of(cw0 >> k)) return true;
+    if (alpha_of(cw1 >> 24) || alpha_of(cw1 >> 16) || alpha_of(cw1 >> 8)) return true;
+    if (s.Reg(SET_TEXTURE_CONTROL0 + 0x40 * stage) & kTextureAlphaKill) return true;
+    // a later stage that reads this one (dependent lookups): only those through blue and green leave the alpha alone
+    const uint32_t programs = s.Reg(SET_SHADER_STAGE_PROGRAM), other = s.Reg(SET_SHADER_OTHER_STAGE_INPUT);
+    for (int j = stage + 1; j < 4; j++) {
+        const uint32_t program = (programs >> (5 * j)) & 0x1F;
+        const int prev = j == 1 ? 0 : j == 2 ? int((other >> 16) & 0xF) : int((other >> 20) & 0xF);
+        if (program >= 6 && prev == stage && program != 6 && program != 7 && program != 16) return true;
+    }
+    return false;
+}
+// ---- end GitHub #19 ----
 
 std::string Generate(const State& s, const Config& config) {
     std::string out = kPrelude;
     static const char* const kTextureType[] = {"Texture2D",        "Texture2D", "TextureCube", "Texture3D",
-                                               "Texture2D",        "Texture2D<float>", "Texture2DMS<float>"};
+                                               "Texture2D",        "Texture2D<float>", "Texture2DMS<float>",
+                                               "Texture2DMS<float4>"};
     for (int i = 0; i < 4; i++) {
         char line[128];
         snprintf(line, sizeof line, "%s tex%d : register(t%d);\nSamplerState smp%d : register(s%d);\n",
                  kTextureType[int(config.sampler[i])], i, i, i, i);
         out += line;
     }
-    bool cascade = false;  // PC shadows: cascades
-    for (int i = 0; i < 4; i++) cascade |= config.cascade && config.sampler[i] == Sampler::kShadow;
+    // PC shadows: cascades, the stages that compare against the sun's map (projective stages on it)
+    const uint32_t stage_programs = s.Reg(SET_SHADER_STAGE_PROGRAM);
+    auto cascade_stage = [&](int i) {
+        const uint32_t program = (stage_programs >> (5 * i)) & 0x1F;
+        return ((config.cascade >> i) & 1) && config.sampler[i] == Sampler::kShadow && (program == 1 || program == 2);
+    };
+    bool cascade = false;
+    for (int i = 0; i < 4; i++) cascade |= cascade_stage(i);
+    bool target_ms_depth = false;  // GitHub #19: the depth target, for kTargetMS stages
+    for (int i = 0; i < 4; i++) target_ms_depth |= config.target_ms_depth && config.sampler[i] == Sampler::kTargetMS;
+    if (target_ms_depth) out += "Texture2DMS<float> target_depth : register(t7);\n";
+    if (config.mirror_write || config.mirror_read)  // GitHub #19: the target's mirror (renderer.cpp)
+        out += "cbuffer TargetMirror : register(b6) {\n"
+               "    float4 mirror_id;  // x: the marker this draw writes into the mirror, y: the one its stages read\n"
+               "};\n";
+    if (config.mirror_read && config.mirror_resolved)  // the target's resolved copy for the filter (renderer.cpp)
+        out += "Texture2D<float4> target_resolved : register(t6);\n";
+    if (config.mirror_read && (g_target_ms_debug == 6 || g_target_ms_debug == 7))  // (diagnostics: the copy as well)
+        out += "Texture2DMS<float4> target_copy_dbg : register(t8);\n";
     if (cascade)
         // the near cascade: a second map over part of the shadow map's square (renderer.cpp, "shadow cascades")
         out += "Texture2D tex_near : register(t4);\n"
                "Texture2D tex_far : register(t5);\n"
+               "Texture2D tex_solid : register(t6);\n"
                "cbuffer Cascade : register(b5) {\n"
                "    float4 cascade_n[3];  // near map (u, v, depth) = cascade_n x the receiver's (u, v, depth, 1)\n"
                "    float4 cascade_f[3];  // far map's\n"
-               "    float4 cascade_fade;  // x: 1 / the fading edge in near map coordinates\n"
+               "    float4 cascade_fade;  // x: 1 / the fading edge in near map coordinates, y: 1 with tex_solid\n"
+               "    float4 cascade_s;     // tex_solid (the far pass's solid casters) at (far map uv - xy) * zw\n"
                "};\n";
 
     // the vertex shader's outputs, with flat colors when the shade mode asks for them
@@ -204,7 +287,7 @@ std::string Generate(const State& s, const Config& config) {
     }
     // the centroid copy of the W-buffer depth (below): as an interpolation mode, not EvaluateAttributeCentroid, which
     // Wine's / Proton's builtin HLSL compiler (vkd3d-shader) lacks
-    input.insert(input.find("float wdepth_c"), "centroid ");
+    input.insert(input.find("float4 wdepth_c"), "centroid ");
     out += input;
     // W-buffering: the depth is w (scaled to the depth range by D3D's projection), linear in eye space, which
     // keeps far geometry apart (z/w in 24 bits cannot: water and shore fought at a distance). w / zmax is tiny
@@ -219,26 +302,34 @@ std::string Generate(const State& s, const Config& config) {
     char c_text[32];
     snprintf(c_text, sizeof c_text, "%.9g", kReversedDepth);
     const std::string c_value = c_text;
+    // GitHub #19: a stage on the multisampled target being drawn reads the samples the fragment covers (the
+    // rasterizer's coverage, an input: the shader still runs once per pixel)
+    bool target_ms = false;
+    for (int i = 0; i < 4; i++) target_ms |= config.sampler[i] == Sampler::kTargetMS;
+    const std::string head = std::string("\nfloat4 main(VSOut input, bool front : SV_IsFrontFace") +
+                             (target_ms ? ", uint coverage : SV_Coverage" : "") +
+                             (config.mirror_write ? ", out float4 mirror_out : SV_Target1" : "");  // the mirror
     switch (config.depth) {
     case Depth::kW:
-        out += "\nfloat4 main(VSOut input, bool front : SV_IsFrontFace, out float depth : SV_Depth) : SV_Target {\n"
-               "    depth = saturate(input.wdepth_c + depth_bias.x + depth_bias.y * "
+        out += head + ", out float depth : SV_Depth) : SV_Target {\n"
+               "    depth = saturate(input.wdepth_c.x + depth_bias.x + depth_bias.y * "
                "max(abs(ddx(input.wdepth)), abs(ddy(input.wdepth))));\n";
         break;
     case Depth::kReversedW:
-        out += "\nfloat4 main(VSOut input, bool front : SV_IsFrontFace, out float depth : SV_Depth) : SV_Target {\n"
-               "    depth = " + c_value + " / max(input.wdepth_c + depth_bias.x + depth_bias.y * "
+        out += head + ", out float depth : SV_Depth) : SV_Target {\n"
+               "    depth = " + c_value + " / max(input.wdepth_c.x + depth_bias.x + depth_bias.y * "
                "max(abs(ddx(input.wdepth)), abs(ddy(input.wdepth))), " + c_value + ");\n";
         break;
     case Depth::kReversedZ:
-        out += "\nfloat4 main(VSOut input, bool front : SV_IsFrontFace, out float depth : SV_Depth) : SV_Target {\n"
+        out += head + ", out float depth : SV_Depth) : SV_Target {\n"
                "    depth = " + c_value + " / max(input.pos.z + depth_bias.x + depth_bias.y * "
                "max(abs(ddx(input.pos.z)), abs(ddy(input.pos.z))), " + c_value + ");\n";
         break;
     default:
-        out += "\nfloat4 main(VSOut input, bool front : SV_IsFrontFace) : SV_Target {\n";
+        out += head + ") : SV_Target {\n";
         break;
     }
+    if (g_target_ms_debug) out += "    float4 target_ms_dbg = -1;\n";  // GitHub #19: FCI_TARGET_MS_DEBUG
     out += "    float4 T[4] = {input.t0, input.t1, input.t2, input.t3};\n";
     if (s.Reg(SET_TWO_SIDE_LIGHT_EN))
         out += "    float4 v0 = saturate(front ? input.d0 : input.b0), v1 = saturate(front ? input.d1 : input.b1);\n";
@@ -267,7 +358,37 @@ std::string Generate(const State& s, const Config& config) {
     uint32_t other = s.Reg(SET_SHADER_OTHER_STAGE_INPUT);
     uint32_t clip_mode = s.Reg(SET_SHADER_CLIP_PLANE_MODE);
     out += "    float4 t0 = 0, t1 = 0, t2 = 0, t3 = 0;\n";
-    if (g_shadow_debug) out += "    float shadow_dbg = 1, shadow_in = -1, shadow_ref = 0, shadow_near = 0;\n";  // PC shadows
+    // ---- PC shadows: cascades, the taps (GitHub #16, flicker after 0.1.7). A receiver may compare against the sun's
+    // map in several stages: the terrain does in two (the game's matrices for stage 0 and 3 differ only by +-0.35
+    // guest texels in u and v about the pixel centre: a two tap filter in texels of the map). Each stage's
+    // coordinates are the sun camera's for the point plus an offset of its own in the game's texels; in the other
+    // cascade the same stage must read the same point with the same offset in that map's texels. Mapping every
+    // stage's coordinates through the cameras' affine map (as 0.1.7 did) scales the offsets by the ratio of the
+    // squares (k in the near map, 1/k in the far one): in every other frame the taps read other texels, the terrain's
+    // pattern of leaf shadows changed from frame to frame at a low sun (stretched along the ground by 1 / sin of its
+    // height). So the centroid of the stages' coordinates is mapped as the point, and each stage keeps its own offset
+    // from it, taken from its own coordinates (no assumption about how many stages or how far apart). The renderer's
+    // map takes the receivers' coordinates as the camera's plus the pixel centre (renderer.cpp), so this is exact
+    // where the stages' offsets are centred on it: the game's single stage receivers (objects) address the map at
+    // the pixel centre, the terrain's two taps symmetrically about it. One stage: the same as mapping it directly.
+    // FCI_CASCADE_TAPS=0 (diagnostics) maps every stage on its own as before ----
+    if (cascade && g_cascade_taps) {
+        int taps = 0;
+        out += "    float2 cascade_base = 0;\n";
+        for (int i = 0; i < 4; i++) {
+            if (!cascade_stage(i)) continue;
+            char line[192];
+            snprintf(line, sizeof line, "    cascade_base += T[%d].xy / (T[%d].w == 0 ? 1 : T[%d].w) * tex_scale[%d].xy;\n",
+                     i, i, i, i);
+            out += line;
+            taps++;
+        }
+        if (taps > 1) out += "    cascade_base /= " + std::to_string(taps) + ";\n";
+    }
+    // ---- end PC shadows ----
+    if (g_shadow_debug)  // PC shadows
+        out += "    float shadow_dbg = 1, shadow_in = -1, shadow_ref = 0, shadow_near = 0; float3 shadow_uvn = -1, "
+               "shadow_uvf = -1;\n";
     for (int i = 0; i < 4; i++) {
         uint32_t program = (programs >> (5 * i)) & 0x1F;
         if (!program) continue;
@@ -341,6 +462,218 @@ std::string Generate(const State& s, const Config& config) {
             out += depth;
             continue;
         }
+        std::string target_ms_code;  // GitHub #19: the projective stage's lookup (below)
+        if (sampler == Sampler::kTargetMS) {
+            // ---- GitHub #19: a pass that reads the multisampled target it draws into (the terrain's colour pass reads
+            // its lighting pass back at the same pixel: renderer.cpp, TargetSnapshot). Where the coordinates are the
+            // pixel's own position and the fragment covers only part of it (or something drawn before hides part of
+            // it), the average of the samples it covers and its surface is visible at: exactly the samples its
+            // output goes to. The average of all samples (the resolved copy) mixed in whatever covers the rest of an
+            // edge pixel (the sky): bright dashed lines along the terrain's pieces. Everywhere else as the resolved
+            // copy, filtered: a fragment that covers and sees the whole pixel (inside a surface, a full screen pass
+            // such as the feral vision's tint) reads exactly what it read before, the sub-pixel offset of its
+            // coordinates included (the bilinear filter blends a few percent of the neighbours in; read without it,
+            // the feral tint changed along every edge). renderer.cpp passes only projective stages with clamped
+            // addressing ----
+            const bool point = ((s.Reg(SET_TEXTURE_FILTER + 0x40 * i) >> 24) & 0xF) == 1;
+            // with the depth: the fragment's depth at each sample (the rasterizer's z on its plane, or the depth the
+            // shader writes for the whole pixel) against the stored one; a covered sample whose stored depth is
+            // nearer by more than about a pixel's depth step belongs to something in front (an object drawn before
+            // the terrain) and fails the draw's depth test: not one the fragment writes
+            std::string depth_head, depth_pick;
+            if (config.target_ms_depth) {
+                const bool written = config.depth != Depth::kNone;  // SV_Depth: one value for the pixel
+                depth_head = std::string("        float e0 = ") + (written ? "depth" : "input.pos.z") + ";\n" +
+                             (written ? "        float2 de = 0;\n" : "        float2 de = float2(ddx(e0), ddy(e0));\n") +
+                             "        float tol = 1e-5 * abs(e0) + abs(de.x) + abs(de.y);\n";
+                depth_pick = std::string(
+                                 "            uint seen = 0;\n"
+                                 "            [loop] for (uint m = 0; m < min(n, 8u); m++) {\n"
+                                 "                if (((cv >> m) & 1) == 0) continue;\n"
+                                 "                float e = e0 + dot(de, tex") + std::to_string(i) + ".GetSamplePosition(m));\n"
+                                 "                float d = target_depth.Load(px, m);\n" +
+                             (config.target_ms_depth == 2 ? "                if (d <= e + tol) seen |= 1u << m;\n"
+                                                          : "                if (d >= e - tol) seen |= 1u << m;\n") +
+                             "            }\n"
+                             "            if (seen != 0) cv = seen;\n";  // none: all covered ones (as without depth)
+            }
+            const std::string dbg4 = "        float3 dv = abs(t" + std::to_string(i) + " - res).rgb;\n"
+                                     "        target_ms_dbg = float4(own ? max(dv.r, max(dv.g, dv.b)) : 0, 0, own ? 0 : 1, 1);\n";
+            // FCI_TARGET_MS_PLAIN=1 (diagnostics): a fragment that covers and sees the whole pixel reads the plain
+            // average of its samples too (no bilinear filter: cheaper, but a few percent sharper than before)
+            static const bool full_filter = GetEnvironmentVariableA("FCI_TARGET_MS_PLAIN", nullptr, 0) == 0;
+            // the four texels of the filter, each the average of its samples as the resolve stores it
+            const std::string tx = "tex" + std::to_string(i);
+            std::string mirror_head, mirror_pick, tap_head, tap_end;
+            std::string tap_code = "                float4 sum = 0;\n"
+                                   "                [loop] for (uint m = 0; m < n; m++) sum += " + tx + ".Load(at, m);\n"
+                                   "                float4 texel = round(sum / max(n, 1u) * 255) / 255;\n"
+                                   "                res += texel * (((k & 1) != 0 ? f.x : 1 - f.x) * ((k >> 1) != 0 ? f.y : 1 - f.y));\n";
+            if (config.mirror_read & (1u << i)) {
+                // ---- GitHub #19, the target's mirror (renderer.cpp): the texture is the mirror the pass before wrote
+                // (its colour, alpha its marker), not a copy of the frame. A sample with this draw's marker (mirror_id.y)
+                // holds what the frame holds there: the pass before wrote both and nothing has drawn since. The own
+                // pixel reads, of the samples the fragment covers and sees, those with the marker (the samples the
+                // pass before wrote, which this draw writes; a sample within the depth tolerance that another surface
+                // wrote is not one of them). The filter's texels (inside a surface, a few percent of the neighbours
+                // for the coordinates' sub-pixel offset) come from the target's resolved copy (mirror_resolved: the
+                // copy's exactly; the neighbours may hold what other surfaces drew, which the mirror lacks), or else
+                // from the mirror's samples with the marker, a texel without any giving its weight to the others ----
+                mirror_head = std::string("        uint mark = uint(mirror_id.y + 0.5);\n") +
+                              (g_target_ms_debug == 7 ? "        uint cv_seen = 0;\n" : "");
+                mirror_pick = std::string(g_target_ms_debug == 7 ? "            cv_seen = cv;\n" : "") +
+                              "            uint mine = 0;\n"
+                              "            [loop] for (uint mm = 0; mm < min(n, 8u); mm++)\n"
+                              "                if (((cv >> mm) & 1) != 0 && uint(round(" + tx + ".Load(px, mm).a * 255)) == mark) "
+                              "mine |= 1u << mm;\n" +
+                              std::string(g_target_ms_debug == 5 ? "            target_ms_dbg = float4((cv & ~mine) != 0 ? 1 : 0, 0, "
+                                                                   "mine == 0 ? 1 : 0, 1);\n" : "") +
+                              std::string(g_target_ms_debug == 6
+                                              ? "            float dmax = 0;\n"
+                                                "            [loop] for (uint md = 0; md < min(n, 8u); md++)\n"
+                                                "                if (((mine >> md) & 1) != 0) { float3 dv = abs(" + tx +
+                                                    ".Load(px, md).rgb - target_copy_dbg.Load(px, md).rgb); "
+                                                    "dmax = max(dmax, max(dv.r, max(dv.g, dv.b))); }\n"
+                                                "            target_ms_dbg = float4(saturate(dmax * 16), 0, 0, 1);\n"
+                                              : "") +
+                              "            if (mine != 0) cv = mine;\n";
+                tap_head = "            float4 raw = 0;\n"
+                           "            float wsum = 0;\n"
+                           "            uint partial = 0;\n" +
+                           std::string(g_target_ms_debug == 6 ? "            float dtap = 0;\n" : "");
+                tap_code = "                float4 sum = 0, every = 0;\n"
+                           "                uint cnt = 0;\n"
+                           "                [loop] for (uint m = 0; m < n; m++) {\n"
+                           "                    float4 v = " + tx + ".Load(at, m);\n"
+                           "                    every += v;\n"
+                           "                    if (uint(round(v.a * 255)) == mark) sum += v, cnt++;\n" +
+                           std::string(g_target_ms_debug == 6
+                                           ? "                    if (uint(round(v.a * 255)) == mark) { float3 dv = "
+                                             "abs(v.rgb - target_copy_dbg.Load(at, m).rgb); dtap = max(dtap, max(dv.r, "
+                                             "max(dv.g, dv.b))); }\n"
+                                           : "") +
+                           "                }\n"
+                           "                float wk = ((k & 1) != 0 ? f.x : 1 - f.x) * ((k >> 1) != 0 ? f.y : 1 - f.y);\n"
+                           "                if (cnt != n && wk > 0) partial++;\n"
+                           "                if (cnt != 0) res += round(sum / cnt * 255) / 255 * wk, wsum += wk;\n"
+                           "                raw += round(every / max(n, 1u) * 255) / 255 * wk;\n";
+                // (all texels whole: res as from the copy, unscaled; none with the marker: the mirror as it is)
+                tap_end = std::string("            if (partial != 0) res = wsum > 0 ? res / wsum : raw;\n") +
+                          (g_target_ms_debug == 5 ? "            if (partial != 0) target_ms_dbg = float4(max(target_ms_dbg.r, 0), 1, "
+                                                    "max(target_ms_dbg.b, 0), 1);\n" : "") +
+                          (g_target_ms_debug == 6 ? "            target_ms_dbg = float4(max(target_ms_dbg.r, 0), "
+                                                    "saturate(dtap * 16), partial != 0 ? 1 : 0, 1);\n" : "");
+                if (config.mirror_resolved) {
+                    // the own pixel's texel (a fragment that covers and sees it all: all its samples have the marker,
+                    // the frame's bytes) averaged from the mirror's samples as the copy's is; the neighbours' from the
+                    // resolved copy. (The resolve may round halves otherwise than that average: under DXVK the own
+                    // pixel's texel from the resolve, ~96 % of the value, moved 0.5 % of the pixels; at the neighbours'
+                    // few percent it is nothing)
+                    tap_head.clear(), tap_end.clear();
+                    tap_code = "                float4 texel;\n"
+                               "                [branch] if (own && all(at == px)) {\n"
+                               "                    float4 sum = 0;\n"
+                               "                    [loop] for (uint m = 0; m < n; m++) sum += " + tx + ".Load(at, m);\n"
+                               "                    texel = round(sum / max(n, 1u) * 255) / 255;\n"
+                               "                } else {\n"
+                               "                    texel = target_resolved.Load(int3(at, 0));\n"
+                               "                }\n"
+                               "                res += texel * (((k & 1) != 0 ? f.x : 1 - f.x) * ((k >> 1) != 0 ? f.y : 1 - f.y));\n";
+                }
+                // ---- end the target's mirror ----
+            }
+            char ms[8192];
+            snprintf(ms, sizeof ms,
+                     "    {\n"
+                     "        float2 hp = (T[%d].xy / (T[%d].w == 0 ? 1 : T[%d].w)) * tex_scale[%d].xy + float2(0, tex_scale[%d].z);\n"
+                     "        uint w, h, n;\n"
+                     "        tex%d.GetDimensions(w, h, n);\n"
+                     "        int2 lo = int2(0, int(tex_scale[%d].z)), hi = int2(int(w), int(tex_scale[%d].w)) - 1;\n"
+                     "        bool own = all(abs(hp - input.pos.xy) < 0.5);\n"
+                     "%s"
+                     // the samples read at the own position: those covered (none cannot happen for a shaded pixel:
+                     // then all), maybe less those behind something nearer
+                     "        uint all_samples = (1u << min(n, 8u)) - 1, cv = all_samples;\n"
+                     "        int2 px = clamp(int2(floor(hp)), lo, hi);\n"
+                     "        [branch] if (own) {\n"
+                     "            cv = coverage & all_samples;\n"
+                     "%s"
+                     "            if (cv == 0) cv = all_samples;\n"
+                     "%s"
+                     "        }\n"
+                     "        float4 res = 0;\n"  // as the resolved copy, filtered
+                     "        [branch] if (!own || %s) {\n"
+                     "            float2 q = hp - %s, base = floor(q), f = %s;\n"
+                     "%s"
+                     "            [unroll] for (int k = 0; k < %d; k++) {\n"
+                     "                int2 at = clamp(int2(base) + int2(k & 1, k >> 1), lo, hi);\n"
+                     "%s"
+                     "            }\n"
+                     "%s"
+                     "        }\n"
+                     "        [branch] if (own && !(%s)) {\n"
+                     // their average, stored as the resolve stores it
+                     "            float4 sum = 0;\n"
+                     "            uint cnt = 0;\n"
+                     "            [loop] for (uint m = 0; m < min(n, 8u); m++)\n"
+                     "                if (((cv >> m) & 1) != 0) sum += tex%d.Load(px, m), cnt++;\n"
+                     "            t%d = round(sum / max(cnt, 1u) * 255) / 255;\n"
+                     "%s"
+                     "        } else {\n"
+                     "            t%d = res;\n"
+                     "        }\n"
+                     "%s"
+                     "    }\n",
+                     i, i, i, i, i, i, i, i, (depth_head + mirror_head).c_str(),
+                     g_target_ms_debug == 3 ? "            target_ms_dbg.r = cv != all_samples ? 1 : 0;\n" : "",
+                     (depth_pick + mirror_pick).c_str(),
+                     g_target_ms_debug == 4 ? "true" : full_filter ? "cv == all_samples" : "false",
+                     point ? "0" : "0.5", point ? "0" : "q - base", tap_head.c_str(), point ? 1 : 4, tap_code.c_str(),
+                     tap_end.c_str(), full_filter ? "cv == all_samples" : "false", i, i,
+                     g_target_ms_debug == 3
+                         ? "            target_ms_dbg = float4(target_ms_dbg.r, float(cnt) / max(n, 1u), 0, 1);\n"
+                         : "",
+                     i,
+                     g_target_ms_debug == 1   ? "        target_ms_dbg = own ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);\n"
+                     : g_target_ms_debug == 2 ? "        target_ms_dbg = float4(saturate((hp - input.pos.xy) * 0.5 + 0.5), own ? 1 : 0, 1);\n"
+                     : g_target_ms_debug == 3 ? "        if (!own) target_ms_dbg = float4(0, 0, 1, 1);\n"
+                     : g_target_ms_debug == 4 ? dbg4.c_str()
+                                              : "");
+            target_ms_code = ms;
+            // test of the fallback: FCI_TEST_TARGET_MS_FAILURE=1 makes these shaders fail to compile (renderer.cpp
+            // then reads the resolved copy)
+            static const bool fail = GetEnvironmentVariableA("FCI_TEST_TARGET_MS_FAILURE", nullptr, 0) > 0;
+            if (fail) target_ms_code += "    target_ms_test_failure();\n";
+            if (g_target_ms_debug == 7 && (config.mirror_read & (1u << i))) {
+                // the target's mirror, diagnostics: the value the copy would have given (t6, renderer.cpp) against
+                // the mirror's: red = the difference (16 levels: full), green = seen samples without the marker
+                const std::string t = "t" + std::to_string(i);
+                target_ms_code.insert(target_ms_code.size() - 6,
+                    "        {\n"
+                    "            float4 tc = 0;\n"
+                    "            uint cvc = own ? cv_seen : all_samples;\n"
+                    "            if (own && cvc != all_samples) {\n"
+                    "                float4 s7 = 0; uint c7 = 0;\n"
+                    "                [loop] for (uint q7 = 0; q7 < min(n, 8u); q7++)\n"
+                    "                    if (((cvc >> q7) & 1) != 0) s7 += target_copy_dbg.Load(px, q7), c7++;\n"
+                    "                tc = round(s7 / max(c7, 1u) * 255) / 255;\n"
+                    "            } else {\n"
+                    "                float2 q2 = hp - 0.5, b2 = floor(q2), f2 = q2 - b2;\n"
+                    "                [unroll] for (int k2 = 0; k2 < 4; k2++) {\n"
+                    "                    int2 at2 = clamp(int2(b2) + int2(k2 & 1, k2 >> 1), lo, hi);\n"
+                    "                    float4 s7 = 0;\n"
+                    "                    [loop] for (uint q7 = 0; q7 < n; q7++) s7 += target_copy_dbg.Load(at2, q7);\n"
+                    "                    tc += round(s7 / max(n, 1u) * 255) / 255 * (((k2 & 1) != 0 ? f2.x : 1 - f2.x) * "
+                    "((k2 >> 1) != 0 ? f2.y : 1 - f2.y));\n"
+                    "                }\n"
+                    "            }\n"
+                    "            float3 dt = abs(" + t + ".rgb - tc.rgb);\n"
+                    "            target_ms_dbg = float4(saturate(max(dt.r, max(dt.g, dt.b)) * 255 / 16), "
+                    "(own && cv_seen != cv) ? 1 : 0, 0, 1);\n"
+                    "        }\n");
+            }
+            // ---- end GitHub #19 ----
+        }
         if (sampler == Sampler::kShadow && (program == 1 || program == 2)) {
             // shadow map: the share of the four nearest texels that pass the comparison, weighted as bilinear
             // filtering would (percentage closer filtering, as the NV2A does with a linear filter)
@@ -359,11 +692,11 @@ std::string Generate(const State& s, const Config& config) {
             }
             char shadow[2048];
             // the lookup of one map (tex) at uv into result (a float declared before)
-            auto lookup = [&](const char* tex, const char* uv, const char* result, const char* ref) {
+            auto lookup = [&](const char* tex, const char* uv, const char* result, const char* ref, bool soft = true) {
                 std::string compare = op;  // its reference: ref, or the near map's
                 for (size_t at = compare.find("ref"); at != std::string::npos; at = compare.find("ref", at + 1))
                     compare.replace(at, 3, ref), at += std::strlen(ref) - 1;
-                if (g_shadow_filter == 1) {
+                if (g_shadow_filter == 1 && soft) {
                     // ---- PC shadows: soft, the average of 3x3 bilinear lookups one texel apart (a tent over the
                     // 4x4 texels base - 1 .. base + 2 around the point, weights (1 - f, 1, 1, f) per axis), from four
                     // gathers of 2x2 texels (gather order: x left bottom, y right bottom, z right top, w left top) ----
@@ -384,16 +717,20 @@ std::string Generate(const State& s, const Config& config) {
                              tex, uv, tex, i, compare.c_str(), result);
                     // ---- end PC shadows ----
                 } else {
+                    // the 2x2 texels around the point and their weights from the same floor (the gather at the middle
+                    // of that footprint): gathered at the point itself, the sampler's rounded choice of the footprint and
+                    // frac() could disagree right at its edges, and a point the cascades map from the other camera (the same
+                    // point in the last bits only) then read the neighbouring footprint in every other frame (GitHub #16)
                     snprintf(shadow, sizeof shadow,
                              "        {\n"
                              "            float w, h;\n"
                              "            %s.GetDimensions(w, h);\n"
-                             "            float2 f = frac(%s * float2(w, h) - 0.5);\n"
-                             "            float4 d = %s.Gather(smp%d, %s);\n"
+                             "            float2 q = %s * float2(w, h) - 0.5, base = floor(q), f = q - base;\n"
+                             "            float4 d = %s.Gather(smp%d, (base + 1) / float2(w, h));\n"
                              "            float4 lit = (%s) ? 1 : 0;\n"
                              "            %s = dot(lit, float4((1 - f.x) * f.y, f.x * f.y, f.x * (1 - f.y), (1 - f.x) * (1 - f.y)));\n"
                              "        }\n",
-                             tex, uv, tex, i, uv, compare.c_str(), result);
+                             tex, uv, tex, i, compare.c_str(), result);
                 }
                 return std::string(shadow);
             };
@@ -406,25 +743,45 @@ std::string Generate(const State& s, const Config& config) {
                      i, i, i, i, i);
             const std::string tex = "tex" + std::to_string(i);
             out += head;
-            if (cascade) {
+            if (cascade_stage(i)) {
                 // ---- PC shadows: cascades. Each map's coordinates and depth from the receiver's (affine maps: the
-                // game's sun cameras are orthographic along the sun; the game's own map this frame is either one);
+                // game's sun cameras are orthographic along the sun; the game's own map this frame is either one),
+                // the point at the stages' centroid, this stage's tap at its own offset from it (above);
                 // where the near map covers the point it is used, fading into the far map over its outer edge (no
                 // seam); either map is read only where its weight is above 0 ----
-                out += "        float4 pr = float4(uv, ref, 1);\n"
-                       "        float2 uv_near = float2(dot(cascade_n[0], pr), dot(cascade_n[1], pr));\n"
-                       "        float ref_near = dot(cascade_n[2], pr);\n"
-                       "        float2 uv_far = float2(dot(cascade_f[0], pr), dot(cascade_f[1], pr));\n"
-                       "        float ref_far = dot(cascade_f[2], pr);\n"
+                if (g_cascade_taps)
+                    out += "        float4 pr = float4(cascade_base, ref, 1);\n"
+                           "        float2 tap = uv - cascade_base;\n"
+                           "        float2 uv_near = float2(dot(cascade_n[0], pr), dot(cascade_n[1], pr)) + tap;\n"
+                           "        float ref_near = dot(cascade_n[2], pr);\n"
+                           "        float2 uv_far = float2(dot(cascade_f[0], pr), dot(cascade_f[1], pr)) + tap;\n";
+                else
+                    out += "        float4 pr = float4(uv, ref, 1);\n"
+                           "        float2 uv_near = float2(dot(cascade_n[0], pr), dot(cascade_n[1], pr));\n"
+                           "        float ref_near = dot(cascade_n[2], pr);\n"
+                           "        float2 uv_far = float2(dot(cascade_f[0], pr), dot(cascade_f[1], pr));\n";
+                out += "        float ref_far = dot(cascade_f[2], pr);\n"
                        "        float2 e = min(uv_near, 1 - uv_near);\n"
                        "        float near_w = saturate(min(e.x, e.y) * cascade_fade.x);\n"
-                       "        [branch] if (near_w > 0)\n";
+                       + std::string(g_cascade_force == 1 ? "        near_w = 1;\n" : g_cascade_force == 2 ? "        near_w = 0;\n" : "") +
+                       "        [branch] if (near_w > 0) {\n";
                 out += lookup("tex_near", "uv_near", "lit_near", "ref_near");
+                // the far pass's solid casters the near pass may lack (renderer.cpp, kSolidsMargin), in the far
+                // camera's depth: the darker of both; only where the near map leaves light, with one bilinear gather (its
+                // texels are about as fine as the soft filter's footprint in the near map; the soft filter's four gathers
+                // cost the Steam Deck ~0.7 ms a frame)
+                out += "        float2 uv_s = (uv_far - cascade_s.xy) * cascade_s.zw;\n"
+                       "        [branch] if (cascade_fade.y > 0 && lit_near > 0 && all(uv_s > 0) && all(uv_s < 1)) {\n"
+                       "        float lit_solid = 1;\n";
+                out += lookup("tex_solid", "uv_s", "lit_solid", "ref_far", g_solids_soft);
+                out += "        lit_near = min(lit_near, lit_solid);\n"
+                       "        }\n"
+                       "        }\n";
                 out += "        [branch] if (near_w < 1)\n";
                 out += lookup("tex_far", "uv_far", "lit_far", "ref_far");
                 snprintf(shadow, sizeof shadow, "        t%d = lerp(lit_far, lit_near, near_w).xxxx;\n", i);
                 out += shadow;
-                if (g_shadow_debug) out += "        shadow_near = near_w;\n";
+                if (g_shadow_debug) out += "        shadow_near = near_w; shadow_uvn = float3(uv_near, ref_near); shadow_uvf = float3(uv_far, ref_far);\n";
                 // ---- end PC shadows ----
             } else {
                 out += lookup(tex.c_str(), "uv", "lit_far", "ref");
@@ -444,6 +801,10 @@ std::string Generate(const State& s, const Config& config) {
         switch (program) {
         case 1:  // 2D projective
         case 2:  // 3D projective
+            if (!target_ms_code.empty()) {  // GitHub #19
+                out += target_ms_code;
+                break;
+            }
             snprintf(coords, sizeof coords, "T[%d] / (T[%d].w == 0 ? 1 : T[%d].w)", i, i, i);
             if (sampler == Sampler::kCube) snprintf(coords, sizeof coords, "T[%d]", i);
             sample(coords);
@@ -600,6 +961,38 @@ std::string Generate(const State& s, const Config& config) {
     if (g_shadow_debug == 1)
         out += "    if (shadow_in >= 0) color.rgb = lerp(lerp(color.rgb, float3(0, 0.6, 0), 0.25 * shadow_in), float3(1, 0, 0), "
                "0.7 * (1 - shadow_dbg));\n";
+    if (g_target_ms_debug == 1) out += "    if (target_ms_dbg.a >= 0) color.rgb = lerp(color.rgb, target_ms_dbg.rgb, 0.6);\n";
+    if (g_target_ms_debug == 2 || g_target_ms_debug == 3) out += "    if (target_ms_dbg.a >= 0) color = target_ms_dbg;\n";
+    if (g_target_ms_debug == 4)
+        out += "    if (target_ms_dbg.a >= 0) color.rgb = float3(max(color.r * 0.3, saturate(target_ms_dbg.r * 8)), "
+               "color.g * 0.3, max(color.b * 0.3, target_ms_dbg.b));\n";
+    if (g_target_ms_debug == 5)  // the target's mirror: red = seen samples without the marker, green = a filter texel
+        // without all, blue = none with the marker; the rest of such draws dimmed
+        out += "    if (target_ms_dbg.a >= 0 && any(target_ms_dbg.rgb > 0)) color.rgb = target_ms_dbg.rgb; "
+               "else if (target_ms_dbg.a >= 0) color.rgb *= 0.3;\n";
+    if (g_target_ms_debug == 7)  // the target's mirror against the copy, the value read (above)
+        out += "    if (target_ms_dbg.a >= 0 && any(target_ms_dbg.rg > 0)) color.rgb = target_ms_dbg.rgb; "
+               "else if (target_ms_dbg.a >= 0) color.rgb *= 0.3;\n";
+    if (g_target_ms_debug == 6)  // the target's mirror against the copy: red = own samples (x16), green = the filter's
+        // texels, blue = a texel without all samples; the rest of such draws dimmed
+        out += "    if (target_ms_dbg.a >= 0 && any(target_ms_dbg.rgb > 0)) color.rgb = target_ms_dbg.rgb; "
+               "else if (target_ms_dbg.a >= 0) color.rgb *= 0.3;\n";
+    // 3: the near map's coordinates of a cascade receiver (fractions of 1/256 of the map in red and green, of 1/256 of
+    // its depth range in blue): equal in near and far frames when both address the same texel (issue 16 analysis)
+    if (g_shadow_debug == 3)
+        out += "    if (shadow_uvn.x > -1) color.rgb = frac(shadow_uvn * 256);\n";
+    // 4, 5: the near (4) or far (5) map's coordinates in fractions of 1/64 of the map
+    if (g_shadow_debug == 4)
+        out += "    if (shadow_uvn.x > -1) color.rgb = frac(shadow_uvn * 64);\n";
+    if (g_shadow_debug == 5)
+        out += "    if (shadow_uvf.x > -1) color.rgb = frac(shadow_uvf * 64);\n";
+    // GitHub #19, the target's mirror: the colour as the frame gets it (the same float to the same format: the same
+    // bytes), alpha the marker of this draw
+    if (config.mirror_write) {
+        out += "    mirror_out = float4(color.rgb, mirror_id.x);\n";
+        static const bool fail = GetEnvironmentVariableA("FCI_TEST_TARGET_MIRROR_FAILURE", nullptr, 0) > 0;
+        if (fail) out += "    target_mirror_test_failure();\n";  // test of the fallback (renderer.cpp)
+    }
     out += "    return color;\n}\n";
     return out;
 }

@@ -1,4 +1,4 @@
-// Display output options (FarCryInstincts.ini / FCI_<KEY>, see README "Configuration"):
+// Display output options (FarCryInstincts.ini / FCI_<KEY>, see the README display settings):
 //   display_mode    = windowed | borderless | fullscreen   (fullscreen = exclusive through DXGI, HLE graphics only)
 //   monitor         = 0 (the primary) | 1, 2, ... (the n-th display in \\.\DISPLAYn order) | \\.\DISPLAYn
 //   resolution      = <width>x<height>   windowed: client size; fullscreen: the display mode; default: as before
