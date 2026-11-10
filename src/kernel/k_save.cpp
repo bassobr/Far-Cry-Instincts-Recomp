@@ -297,7 +297,27 @@ bool OtherInstanceRunning() {
         if (!p) continue;
         wchar_t path[MAX_PATH];
         DWORD n = MAX_PATH;
-        if (QueryFullProcessImageNameW(p, 0, path, &n) && _wcsicmp(path, own) == 0) other = true;
+        if (QueryFullProcessImageNameW(p, 0, path, &n) && _wcsicmp(path, own) == 0) {
+            // one that never ran cannot save: still its first thread only, no time in its own code, for more than
+            // 30 s (a start has its loader threads within milliseconds). Such a process was left suspended by builds
+            // before 0.1.9 when the previous one ended in the middle of a level change
+            FILETIME created, exited, kernel_time, user_time;
+            ULARGE_INTEGER c{}, u{}, now{};
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            now.LowPart = ft.dwLowDateTime, now.HighPart = ft.dwHighDateTime;
+            const bool times = GetProcessTimes(p, &created, &exited, &kernel_time, &user_time) != 0;
+            if (times) {
+                c.LowPart = created.dwLowDateTime, c.HighPart = created.dwHighDateTime;
+                u.LowPart = user_time.dwLowDateTime, u.HighPart = user_time.dwHighDateTime;
+            }
+            const uint64_t age_s = times && now.QuadPart > c.QuadPart ? (now.QuadPart - c.QuadPart) / 10000000 : 0;
+            if (times && pe.cntThreads == 1 && u.QuadPart == 0 && age_s > 30)
+                rt::Log("save: process %lu of this executable never ran (one thread, no time, %llu s old): not counted",
+                        pe.th32ProcessID, (unsigned long long)age_s);
+            else
+                other = true;
+        }
         CloseHandle(p);
     }
     CloseHandle(snap);

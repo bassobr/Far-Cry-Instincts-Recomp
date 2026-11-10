@@ -323,6 +323,14 @@ const Setting kSettings[] = {
      When::Restart,
      "The game's text and voice language, as the Xbox dashboard's language. The NTSC disc has English, French, "
      "Italian and Spanish (German shows English there; a PAL disc may have it). Auto = the Windows display language."},
+    {"speech_volume", "SPEECH VOLUME", "0",
+     [] {
+         // up to +6 here: above that the output limiter works hard in loud scenes (the ini takes up to +12)
+         return Choices{{"0", "0 dB (CONSOLE)"}, {"3", "+3 dB"}, {"6", "+6 dB"}};
+     },
+     When::Live,
+     "Dialogue louder than the game mixes it: the player, the radio, other characters and cutscenes. Music and "
+     "effects stay as they are. 0 dB is the Xbox mix."},
     {"pause_on_focus_loss", "PAUSE ON FOCUS LOSS", "0", OnOff, When::Live,
      "Hold the game while the window is in the background."},
     {"button_prompts", "BUTTON PROMPTS", "auto",
@@ -479,6 +487,7 @@ void ApplyLive(const Setting& s) {
     }
     else if (key == "fps_counter") gpu::fps::SetEnabled(settings::Bool("fps_counter", false));
     else if (key == "frame_queue") xdk::SetFrameQueue(settings::Int("frame_queue", 1));  // performance
+    else if (key == "speech_volume") xdk::SetSpeechVolume(settings::Float("speech_volume", 0));  // GitHub #25
     else if (key == "smaa") gpu::present::SetSmaa(settings::Int("smaa", 1) != 0);
     else if (key == "lod_distance") pcmode::SetLodDistance(settings::Float("lod_distance", pcmode::kDefaultLodDistance));  // PC level of detail
     else if (key == "view_distance") pcmode::SetViewDistance(settings::Float("view_distance", pcmode::kDefaultViewDistance));

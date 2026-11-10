@@ -81,6 +81,11 @@ void SetDevicePaths(const std::filesystem::path& dvd, const std::filesystem::pat
 // a whole title file by its guest path (drive letters, symbolic links), from the host folder or the mounted disc
 // image (kernel/disc.h), for host code that reads title files
 bool ReadTitleFile(const std::string& guest, std::vector<uint8_t>* bytes);
+// ---- speech volume (GitHub #25) ----
+// the guest memory at va was last filled by a read from a language sound bank (sounds_xb\<language>\*.LS2, every
+// line of speech the game plays) and by no other read since
+bool IsSpeechData(uint32_t va);
+// ---- end speech volume ----
 uint32_t DataAddress(uint32_t ordinal);
 // performance: QueryPerformanceCounter ticks the calling thread spent in kernel calls (blocking waits included),
 // total since start
@@ -88,8 +93,17 @@ int64_t KernelTicks();
 // launch data (k_launch.cpp): FCI_START_LEVEL / relaunch page at boot, relaunch on HalReturnToFirmware
 void InitLaunchData();
 bool Relaunch(uint32_t routine);
-// the event a relaunched instance sets once its window shows its first frames (named after its process id)
-inline std::wstring HandoverEvent(unsigned long process) { return L"Local\\FCIHandover-" + std::to_wstring(process); }
+// The relaunched instance finds the previous one's events by the name in FCI_HANDOVER_EVENT (made before the new
+// process is created, so it never has to wait suspended for them):
+//   <name>-ready  it sets this one once its window shows its first frames (only made with a handover);
+//   <name>-close  the previous one sets it when its window was closed during the relaunch: the new one ends too.
+// Either may be gone (the previous instance has ended): the new one then starts as any other.
+inline std::wstring HandoverReadyEvent(const std::wstring& name) { return name + L"-ready"; }
+inline std::wstring HandoverCloseEvent(const std::wstring& name) { return name + L"-close"; }
+// window closed / session ends (display.cpp), before anything else of the exit: no relaunch starts any more; one
+// creating its process is waited for (at most 2 s), and a new process already made is told to end (it ends as on
+// WM_CLOSE: a save is finished first) and waited for (at most 5 s), so the game does not come back in it
+void CancelRelaunch(const char* why);
 // FCI_START_LEVEL=<level>[:<mission>[:<players>]], false when unset (or this process is a relaunch)
 bool StartLevelSetting(std::string* level, std::string* mission, int* players);
 

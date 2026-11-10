@@ -52,6 +52,9 @@ void RenderPost(std::function<void()> fn);
 void RenderMark(std::function<void()> fn);
 // performance: frames the guest may finish ahead of the screen (frame_queue, 1-3)
 void SetFrameQueue(int frames);
+// speech volume (GitHub #25): the language sound banks' voices this many dB above the game's mix (-12 to +12, 0 = the
+// console's mix), live; the DirectSound HLE only (FCI_LLE_AUDIO plays the console's mix)
+void SetSpeechVolume(float db);
 inline uint32_t CallGuest(rt::Cpu& c, uint32_t fn, std::initializer_list<uint32_t> args) {
     return rt::GuestCall(c, fn, args);
 }

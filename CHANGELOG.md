@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.9 (2026-11-10)
+
+- Speech volume (#25): new setting **SPEECH VOLUME** in the F10 menu (0 dB = console, +3, +6) and `speech_volume` in
+  `FarCryInstincts.ini` (−12 to +12 dB). It raises everything spoken (player, radio, other characters, cutscenes) and
+  leaves music and effects as they are. The quiet dialogue itself is the Xbox's own mix, reproduced as on the console.
+- Weapons no longer look see-through and bright lights no longer leave copies of themselves (#27, #30): the game's
+  glare (bloom) and eye adaptation build their glow from small downscaled copies of the frame, blurred for the Xbox's
+  640x480. We rendered those at the render scale, so the glow kept sharp, offset copies of bright surfaces (over dark
+  weapons, around lamps at night). They now run at the console's size and read a properly averaged copy of the frame;
+  the glow is smooth again, the rest of the picture stays at full resolution. `FCI_SCALED_POST=1` restores the old way.
+- Light shafts in the Mines caves no longer show dark lines (#24): our SSAO/GTAO mistook the additive shafts for the
+  game's per-object light passes and was sometimes applied after them. It now goes in before such effects.
+- Split screen on widescreen: the lower player's sky (and sun) is no longer cut to the 4:3 middle with black beside
+  it (the lower view draws its sky before its first 3D object, and that sky was still taken for the upper view's
+  HUD), and with 3 or 4 players each quarter's HUD and crosshair are centred in that quarter instead of being pulled
+  towards the middle of the screen. `FCI_NO_SPLIT_VIEW_START=1` / `FCI_NO_VIEW_HUD_CENTRE=1` restore the old way.
+- The game code is rebuilt once on the first start after updating (about 45 s on a desktop PC, about 5.5 min on the Steam
+  Deck); saves from 0.1.8 carry over.
+- Level changes no longer leave a hidden, frozen copy of the game behind when the game ends at the wrong moment
+  (window closed, crash, killed from outside) during the restart between levels: the new process now runs from its
+  start instead of waiting suspended for the old one. Such a leftover also stopped the next start from repairing a
+  damaged profile (#29); one left by an older version is now ignored. Closing the window during a level change also
+  ends the new process instead of letting the game come back in it.
+
 ## 0.1.8 (2026-11-10)
 
 - **Save games** (#29):

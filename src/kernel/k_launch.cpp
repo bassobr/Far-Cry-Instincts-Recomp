@@ -17,14 +17,20 @@
 // XLaunchNewImage("D:\default.xbe", state block) -> HalReturnToFirmware(ReturnFirmwareQuickReboot)).
 // Here that starts the executable again with the page in FCI_LAUNCH_DATA (hex) and ends this process, so the
 // next level loads as on the console. Without that the process just quit at the end of a level.
+// The new process runs from its start (no CREATE_SUSPENDED); the window handover and a close of the window during
+// the relaunch go through two named events made before it (FCI_HANDOVER_EVENT, kernel.h).
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "app/settings.h"
@@ -41,6 +47,15 @@ constexpr uint32_t kPageSize = 0x1000;
 constexpr uint32_t kDataOffset = 0x400, kDataSize = 0xC00;
 constexpr uint32_t kTypeTitle = 0, kTypeDebuggerCmdline = 3;
 constexpr uint32_t kOrdLaunchDataPage = 164;
+
+// a relaunch in progress (Relaunch on the guest thread, CancelRelaunch on the display thread)
+std::timed_mutex g_relaunch;           // held while the new process is made
+std::atomic<bool> g_cancelled{false};  // the window was closed: no relaunch, the new process ends
+HANDLE g_child = nullptr;              // the new process (set under g_relaunch)
+DWORD g_child_id = 0;
+HANDLE g_close = nullptr;              // its <name>-close event
+unsigned g_counter = 0;                // for the event names
+bool g_started_relaunched = false;     // this process is a relaunch (FCI_LAUNCH_DATA at boot)
 
 std::string Env(const char* name) {
     char buf[16384];
@@ -122,6 +137,7 @@ void InitLaunchData() {
     std::string level, mission;
     int players = 0;
     if (!relaunch.empty()) {
+        g_started_relaunched = true;
         std::vector<uint8_t> bytes = FromHex(relaunch);
         uint32_t page = AllocPage();
         if (!page) return;
@@ -180,15 +196,6 @@ bool Relaunch(uint32_t routine) {
     SetEnvironmentVariableA("FCI_WINDOW_STATE", window.empty() ? nullptr : window.c_str());
     rt::Log("kernel: window for the new process: %s", window.empty() ? "from the settings" : window.c_str());
 
-    wchar_t exe[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring cmd = GetCommandLineW();
-    STARTUPINFOW si{sizeof si};
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-        rt::Log("kernel: relaunch failed (%lu)", GetLastError());
-        return false;
-    }
     // Handover (as in SCDA-XBERecomp, MIT): this window stays on screen with its last picture until the new instance
     // has presented its first frames (it opens its window hidden and shows it then, video/display.cpp), so no gap
     // and no desktop show in between. Not with exclusive fullscreen: two swap chains cannot hold the output.
@@ -200,11 +207,64 @@ bool Relaunch(uint32_t routine) {
     const int used = gpu::present::VideoMemoryUsage(&budget);
     if (std::string test = Env("FCI_TEST_GPU_BUDGET"); !test.empty()) budget = std::atoi(test.c_str());  // test: a small GPU
     const bool fits = used < 0 || budget <= 0 || 2 * used <= budget * 9 / 10;
-    HANDLE ready = display::WantExclusive() || !fits
-                       ? nullptr
-                       : CreateEventW(nullptr, TRUE, FALSE, HandoverEvent(pi.dwProcessId).c_str());
+    const bool handover = !display::WantExclusive() && fits;
+
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring cmd = GetCommandLineW();
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    HANDLE ready = nullptr;
+    {
+        // the window was closed meanwhile (CancelRelaunch, display thread): no new process. Held while the process
+        // is made, so a close in between waits for it and then tells it to end
+        std::lock_guard lock(g_relaunch);
+        if (g_cancelled) {
+            rt::Log("kernel: the window was closed: no relaunch");
+            return false;
+        }
+        // The events exist before the new process, which runs at once (never suspended: a process left suspended by
+        // an end of this one in between stayed for good, without a window or a log, and held off the save repair of
+        // the next start, GitHub #29). Named after this process and a counter; a name still held by an earlier
+        // instance (its process id used again) is skipped.
+        std::wstring name;
+        for (int tries = 0; tries < 16 && !g_close; tries++) {
+            name = L"Local\\FCIHandover-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++g_counter);
+            g_close = CreateEventW(nullptr, TRUE, FALSE, HandoverCloseEvent(name).c_str());
+            if (g_close && GetLastError() == ERROR_ALREADY_EXISTS) {
+                CloseHandle(g_close), g_close = nullptr;
+            } else if (g_close && handover) {
+                ready = CreateEventW(nullptr, TRUE, FALSE, HandoverReadyEvent(name).c_str());
+                if (!ready || GetLastError() == ERROR_ALREADY_EXISTS) {
+                    if (ready) CloseHandle(ready), ready = nullptr;
+                    CloseHandle(g_close), g_close = nullptr;
+                }
+            }
+        }
+        if (!g_close) rt::Log("kernel: no handover events (%lu): the new process starts as any other", GetLastError());
+        SetEnvironmentVariableW(L"FCI_HANDOVER_EVENT", g_close ? name.c_str() : nullptr);
+        if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            rt::Log("kernel: relaunch failed (%lu)", GetLastError());
+            if (ready) CloseHandle(ready);
+            if (g_close) CloseHandle(g_close), g_close = nullptr;
+            return false;
+        }
+        g_child = pi.hProcess;
+        g_child_id = pi.dwProcessId;
+    }
+    CloseHandle(pi.hThread);
     AllowSetForegroundWindow(pi.dwProcessId);
-    ResumeThread(pi.hThread);
+    // FCI_TEST_CLOSE_RELAUNCH=<ms> (tests): in a relaunched process, the window gets WM_CLOSE <ms> after this relaunch
+    // made its new process (the player closes the window during the level change; the first process of a chain
+    // hands over normally)
+    if (std::string t = Env("FCI_TEST_CLOSE_RELAUNCH"); !t.empty() && g_started_relaunched) {
+        const int ms = std::atoi(t.c_str());
+        std::thread([ms] {
+            Sleep(DWORD(std::max(ms, 0)));
+            rt::Log("kernel: FCI_TEST_CLOSE_RELAUNCH: window closed %d ms after the new process was made", ms);
+            PostMessageW(static_cast<HWND>(display::Window()), WM_CLOSE, 0, 0);
+        }).detach();
+    }
     rt::Log("kernel: relaunched the title as process %lu%s (GPU memory of this process %d MB, budget %d MB)",
             pi.dwProcessId,
             ready ? ", keeping this window until its first frames"
@@ -213,11 +273,15 @@ bool Relaunch(uint32_t routine) {
     if (ready) {
         HANDLE wait[] = {ready, pi.hProcess};
         DWORD r = WaitForMultipleObjects(2, wait, FALSE, 15000);
-        rt::Log("kernel: handover %s", r == WAIT_OBJECT_0 ? "done" : r == WAIT_OBJECT_0 + 1 ? "failed (new instance ended)"
-                                                                                           : "timed out");
+        // the window was closed meanwhile: the new process ends because it was told to (CancelRelaunch)
+        const bool closed = g_cancelled;
+        rt::Log("kernel: handover %s", closed                   ? "ended: the window was closed"
+                                       : r == WAIT_OBJECT_0     ? "done"
+                                       : r == WAIT_OBJECT_0 + 1 ? "failed (new instance ended)"
+                                                                : "timed out");
         CloseHandle(ready);
-        if (r == WAIT_OBJECT_0) ForegroundToNewWindow(pi.dwProcessId);
-        if (r == WAIT_OBJECT_0 + 1) {  // the next level's process ended before its first frames: say so, not just quit
+        if (r == WAIT_OBJECT_0 && !closed) ForegroundToNewWindow(pi.dwProcessId);
+        if (r == WAIT_OBJECT_0 + 1 && !closed) {  // the next level's process ended before its first frames: say so
             DWORD code = 0;
             GetExitCodeProcess(pi.hProcess, &code);
             rt::Log("kernel: the relaunched process %lu ended with %08lX before its first frames", pi.dwProcessId, code);
@@ -230,9 +294,27 @@ bool Relaunch(uint32_t routine) {
             MessageBoxW(nullptr, text, L"Far Cry Instincts", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
         }
     }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    // the process and its close event stay open (this process ends now): a close of the window until then still
+    // reaches the new one
     return true;
+}
+
+void CancelRelaunch(const char* why) {
+    g_cancelled = true;  // a relaunch not yet begun does not begin
+    std::unique_lock lock(g_relaunch, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(2000))) {
+        rt::Log("kernel: %s: the relaunch still makes its process after 2 s, ending anyway", why);
+        return;
+    }
+    if (!g_child) return;
+    rt::Log("kernel: %s during the relaunch: the new process %lu is told to end", why, g_child_id);
+    if (g_close) SetEvent(g_close);
+    // until it has ended: the event lives as long as this process, and a new process that opens it only now must
+    // still find it set
+    const uint64_t start = GetTickCount64();
+    const DWORD r = WaitForSingleObject(g_child, 5000);
+    rt::Log("kernel: the new process %s after %llu ms", r == WAIT_OBJECT_0 ? "ended" : "STILL RUNS",
+            (unsigned long long)(GetTickCount64() - start));
 }
 
 }  // namespace kernel

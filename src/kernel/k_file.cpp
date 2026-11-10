@@ -38,6 +38,33 @@ struct Device {
 
 const bool g_trace_reads = GetEnvironmentVariableA("FCI_TRACE_FILES", nullptr, 0) > 0;
 
+// ---- speech volume (GitHub #25): the guest memory the language sound banks were last read into, start -> end.
+// Every read takes its range out (the game reuses its stream buffers for music and effects), a bank's read puts it
+// back in; DirectSound asks per packet (IsSpeechData) ----
+std::mutex g_speech_lock;
+std::map<uint32_t, uint32_t> g_speech;
+
+bool IsSpeechFile(const std::string& guest) {
+    return guest.size() > 4 && Lower(guest.substr(guest.size() - 4)) == ".ls2";
+}
+
+void NoteRead(const std::string& guest, uint32_t va, uint32_t n) {
+    if (!n) return;
+    uint32_t end = va + n;
+    std::lock_guard lock(g_speech_lock);
+    // the ranges that overlap [va, end): cut to what lies outside it
+    auto it = g_speech.upper_bound(va);
+    if (it != g_speech.begin() && std::prev(it)->second > va) --it;
+    while (it != g_speech.end() && it->first < end) {
+        uint32_t start = it->first, stop = it->second;
+        it = g_speech.erase(it);
+        if (start < va) g_speech[start] = va;
+        if (stop > end) g_speech[end] = stop;
+    }
+    if (IsSpeechFile(guest)) g_speech[va] = end;
+}
+// ---- end speech volume ----
+
 // FCI_TEST_PATCH=<old>|<new>[;<old>|<new>...] (tests): every file read replaces the text <old> by <new> of the same
 // length, e.g. an entity's Pos="..." in a level's data, to place a vehicle or a gun where a test starts
 void TestPatch(void* data, uint32_t size) {
@@ -632,6 +659,7 @@ KERNEL_EXPORT(219, NtReadFile) {
         if (g_trace_reads)
             rt::Log("file: read %s %X at %llX -> %08X: %X bytes, event %X apc %08X", f->guest.c_str(), a[6],
                     (unsigned long long)pos, a[5], n, a[1], a[2]);
+        NoteRead(f->guest, a[5], n);  // speech volume
         SetIoStatus(a[4], status, n);
         Complete(c, a[1], a[2], a[3], a[4]);
         return status;
@@ -655,6 +683,7 @@ KERNEL_EXPORT(219, NtReadFile) {
     if (g_trace_reads)
         rt::Log("file: read %s %X at %llX -> %08X: %X bytes, event %X apc %08X", f->guest.c_str(), a[6],
                 a[7] ? (unsigned long long)rt::R64(a[7]) : ~0ull, a[5], n, a[1], a[2]);
+    if (ok) NoteRead(f->guest, a[5], n);  // speech volume
     SetIoStatus(a[4], status, n);
     Complete(c, a[1], a[2], a[3], a[4]);
     return status;
@@ -1129,5 +1158,13 @@ KERNEL_EXPORT(65, IoCreateDevice) {
 
 KERNEL_EXPORT(35, FscGetCacheSize) { return 64; }
 KERNEL_EXPORT(37, FscSetCacheSize) { return X_STATUS_SUCCESS; }
+
+// ---- speech volume ----
+bool IsSpeechData(uint32_t va) {
+    std::lock_guard lock(g_speech_lock);
+    auto it = g_speech.upper_bound(va);
+    return it != g_speech.begin() && std::prev(it)->second > va;
+}
+// ---- end speech volume ----
 
 }  // namespace kernel

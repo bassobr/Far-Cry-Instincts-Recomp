@@ -305,6 +305,10 @@ bool g_frame_3d = false;  // a W-buffered (3D) draw went into a widened target s
 // the widened camera) and must not be narrowed or clipped to the 4:3 middle
 bool g_post_3d = false;
 float g_view_3d[4] = {};  // viewport (scale x, y, offset x, y) of the last 3D draw into a widened target
+// split screen: the views of this frame narrower than the screen (3 and 4 players: quarters), as g_view_3d; the HUD
+// of each is narrowed about its own centre (DrawOne, "the HUD of a quarter view")
+float g_quarter_views[4][4] = {};
+int g_quarter_count = 0;
 // the HUD without post processing (DrawOne): this frame drew into a smaller target after its 3D view; whether the
 // last frame was a 3D frame without that
 bool g_frame_post = false, g_last_no_post = false;
@@ -361,6 +365,8 @@ struct HudTrace {
     // into a smaller target after the 3D view), for comparison: post processing begun, the first draw classified
     // otherwise
     bool old_post = false;
+    // a split screen's next view began with its own 2D (DrawOne): as before, the next 3D draw ends old_post
+    bool old_view_pending = false;
     char change[200] = {};
     char first[160] = {};  // the first 2D draw left wide
     char restart[320] = {};  // the first 3D draw after the post processing
@@ -418,7 +424,7 @@ struct HudTrace {
             restarts = kept = wide_2d = narrowed = changed = masks = fills = before_post = counted = 0;
             first[0] = restart[0] = change[0] = 0;
         }
-        old_post = false;
+        old_post = old_view_pending = false;
         if (frame == 1) frame = 0, rt::Log("render: hud trace: present (aspect %.3f)", aspect);
         else if (frame == -1) frame = 1, rt::Log("render: hud trace: frame start");
         for (int i = 0; i < times && frame == 0; i++)
@@ -480,6 +486,12 @@ struct Target {
         uint64_t version = ~0ull;
     };
     std::map<std::pair<uint32_t, uint32_t>, Rows> rows;  // first row, row count
+    // GitHub #27: a copy at guest size (each guest pixel the average of its host pixels) for the post processing
+    // targets, which stay at the console's size and read the scaled frame as the console reads its own
+    ComPtr<ID3D11Texture2D> guest_copy;
+    ComPtr<ID3D11RenderTargetView> guest_copy_rtv;
+    ComPtr<ID3D11ShaderResourceView> guest_copy_srv;
+    uint64_t guest_copy_version = ~0ull;
 
     uint32_t HostWidth() const { return HostWidthOf(width, scale, wide); }
     uint32_t HostHeight() const { return HostHeightOf(height, scale); }
@@ -1038,6 +1050,29 @@ struct Surfaces {
     float zmax = 16777215.0f;
 };
 
+// ---- GitHub #27: post processing at the console's size ----
+// After its 3D view FCI blurs a glare (bloom) out of the frame: a threshold pass from the frame into the left 320x240
+// of a 484x240 target, three halvings beside it (160x120, 80x60, 40x30), a 4-tap blur across and down (taps 2 texels
+// apart, each a bilinear pair: 8 texels in a row), the levels added up, and that "screen"-blended over the frame (dst
+// + glare x (1 - dst)). The eye adaptation halves the frame down to 4x2 the same way. Each of these steps averages 2x2
+// or 8 neighbouring texels only at the console's size. With these targets scaled like the frame (scale 2-4) every
+// bilinear tap took 2 of the 3-4 host texels per guest texel: the halvings and the blur sampled a comb, the glare kept
+// the frame's fine detail, and where something bright lay behind the dark first-person weapon (a sunlit grating, a
+// glowing monitor) the composite laid a sharp, offset copy of it over the weapon: "guns look see-through" (GitHub #27).
+// So linear colour targets narrower than the frame (rows < 640; not the swizzled reflection maps, not the 16 bit
+// shadow passes) keep the guest's size, and a draw into one that reads a scaled target reads it at guest size, each
+// guest pixel the average of its host pixels, as the console's frame holds it. The glare that goes over the frame is
+// then the console's, bilinearly enlarged as on the console. FCI_SCALED_POST=1: scaled as before 0.1.9 (comparison).
+const bool g_scaled_post = GetEnvironmentVariableA("FCI_SCALED_POST", nullptr, 0) > 0;
+bool PostTarget(const State& s) {
+    if (!g_hle || g_scaled_post) return false;
+    const uint32_t format = s.Reg(SET_SURFACE_FORMAT);
+    const uint32_t color = format & 0xF, zeta = (format >> 4) & 0xF, type = (format >> 8) & 0xF;
+    if (!color || zeta == 1 || type == 2) return false;
+    return (s.Reg(SET_SURFACE_PITCH) & 0xFFFF) / std::max(ColorBytes(color), 1u) < 640;
+}
+// ---- end post processing at the console's size ----
+
 Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool refresh_color = true) {
     Surfaces out;
     uint32_t format = s.Reg(SET_SURFACE_FORMAT);
@@ -1067,6 +1102,10 @@ Surfaces BindSurfaces(const State& s, bool want_color, bool want_depth, bool ref
                              : (s.Reg(SET_SURFACE_PITCH) >> 16) / (zeta == 1 ? 2 : 4);
         if (!shadow && !swizzled && row >= 640) out.samples = g_q.msaa;
         if (!shadow && !swizzled && row >= 640) out.wide = g_q.wide;  // PC features: widescreen
+        // GitHub #27: at the console's size; only with the colour target bound: a depth-only clear of the water
+        // reflection's depth (01_Beach, 00E4C000 512x256) comes while the glare's target is still the colour target
+        // and made a second, unscaled depth target that the reflection never drew into (GitHub #30, its agent)
+        if (want_color && PostTarget(s)) out.scale = std::min(out.scale, 1.0f);
     }
     uint32_t pitch = s.Reg(SET_SURFACE_PITCH);
     // PC shadows: the game's sun shadow passes draw into the view's near or far map (see "shadow cascades"), their
@@ -1690,6 +1729,7 @@ bool DirtyOverlap(uint32_t address, uint32_t size) {
 // a linear texture that is exactly a render target's surface: sample a GPU-side snapshot of the host copy
 // instead of a round trip through guest memory
 ID3D11ShaderResourceView* Resolved(Target& t);
+ID3D11ShaderResourceView* GuestCopy(Target& t);  // GitHub #27
 
 // ---- GitHub #19: a draw that reads the multisampled target it draws into ----
 // FCI draws its terrain and rocks twice over the same strips: a lighting pass, then a colour pass whose stage 3 reads
@@ -1878,6 +1918,27 @@ ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[4],
                     scale[2] = float(row0), scale[3] = float(row1);
                     return copy;
                 }
+            // GitHub #27: a post processing draw reads those rows at guest size (split screen's lower view)
+            if (PostTarget(s) && (t->HostWidth() != t->width || t->HostHeight() != t->height)) {
+                auto& g = t->rows[{first | 0x80000000u, d.height}];
+                if (!g.texture) {
+                    D3D11_TEXTURE2D_DESC desc{t->width, d.height, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+                                              D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+                    if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &g.texture))) return nullptr;
+                    g_device->CreateShaderResourceView(g.texture.Get(), nullptr, &g.srv);
+                }
+                if (g.version != t->version) {
+                    ID3D11ShaderResourceView* whole = GuestCopy(*t);
+                    if (!whole) return nullptr;
+                    ComPtr<ID3D11Resource> src;
+                    whole->GetResource(&src);
+                    D3D11_BOX box{0, first, 0, t->width, first + d.height, 1};
+                    g_context->CopySubresourceRegion(g.texture.Get(), 0, 0, 0, 0, src.Get(), 0, &box);
+                    g.version = t->version;
+                }
+                scale[0] = 1.0f / t->width, scale[1] = 1.0f / d.height;
+                return g.srv.Get();
+            }
             auto& r = t->rows[{first, d.height}];
             if (!r.texture) {
                 D3D11_TEXTURE2D_DESC desc{t->HostWidth(), row1 - row0, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
@@ -1906,6 +1967,12 @@ ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[4],
             return copy;
         }
     }
+    // GitHub #27: a post processing draw reads a scaled target at guest size, as the console reads its frame
+    if (Target* t = found; t && PostTarget(s) && (t->HostWidth() != t->width || t->HostHeight() != t->height))
+        if (ID3D11ShaderResourceView* g = GuestCopy(*t)) {
+            if (linear) scale[0] = 1.0f / t->width, scale[1] = 1.0f / t->height;
+            return g;
+        }
     if (Target* t = found; t && t->samples > 1) {  // performance: one resolve serves snapshots and the present
         ID3D11ShaderResourceView* r = Resolved(*t);
         if (r && linear) scale[0] = 1.0f / t->width, scale[1] = 1.0f / t->height;
@@ -2730,6 +2797,7 @@ D3D11_PRIMITIVE_TOPOLOGY Topology(uint32_t primitive, uint32_t count, std::vecto
 }
 
 int g_dumped = 0;  // draw_NNNN.bmp files written; the draw trace names the file of each draw
+DepthTarget* g_probe_depth = nullptr;  // GitHub #27: FCI_DUMP_DRAWS_PROBE also reads this draw's depth target
 
 // FCI_DUMP_DRAWS=<seconds>: from then on, the render target after each of the next 400 draws, shrunk to
 // 160x120 (FCI_DUMP_DRAWS_FULL=1: full size), as draw_NNNN.bmp
@@ -2748,6 +2816,47 @@ void DumpDrawStep(Target* t) {
     }();
     int& dumped = g_dumped;
     if (!t || dumped >= limit || GetTickCount64() < from) return;
+    // GitHub #27: FCI_DUMP_DRAWS_TARGET=<hex address>: pictures only of the draws into that target
+    static const uint32_t only = [] {
+        char value[32] = {};
+        return GetEnvironmentVariableA("FCI_DUMP_DRAWS_TARGET", value, sizeof value)
+                   ? uint32_t(std::strtoul(value, nullptr, 16)) : ~0u;
+    }();
+    if (only != ~0u && t->address != only) return;
+    // GitHub #27: FCI_DUMP_DRAWS_FULL=2: pictures at the host's size (resolved), not shrunk to the guest's
+    static const bool host = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("FCI_DUMP_DRAWS_FULL", value, sizeof value) && std::atoi(value) == 2 &&
+               !GetEnvironmentVariableA("FCI_DUMP_DRAWS_PROBE", nullptr, 0);
+    }();
+    if (host) {
+        ID3D11ShaderResourceView* view = Resolved(*t);
+        if (!view) return;
+        ComPtr<ID3D11Resource> res;
+        view->GetResource(&res);
+        D3D11_TEXTURE2D_DESC desc{t->HostWidth(), t->HostHeight(), 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+                                  D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+        ComPtr<ID3D11Texture2D> staging;
+        if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &staging))) return;
+        g_context->CopyResource(staging.Get(), res.Get());
+        D3D11_MAPPED_SUBRESOURCE map;
+        if (FAILED(g_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map))) return;
+        char name[32];
+        snprintf(name, sizeof name, "draw_%04d.bmp", g_dumped++);
+        if (FILE* f = std::fopen(name, "wb")) {
+            BITMAPFILEHEADER fh{};
+            BITMAPINFOHEADER ih{};
+            const int w = int(desc.Width), h = int(desc.Height);
+            ih.biSize = sizeof ih, ih.biWidth = w, ih.biHeight = -h, ih.biPlanes = 1, ih.biBitCount = 32;
+            fh.bfType = 0x4D42, fh.bfOffBits = sizeof fh + sizeof ih, fh.bfSize = fh.bfOffBits + w * h * 4;
+            std::fwrite(&fh, sizeof fh, 1, f);
+            std::fwrite(&ih, sizeof ih, 1, f);
+            for (int y = 0; y < h; y++) std::fwrite(static_cast<const uint8_t*>(map.pData) + size_t(y) * map.RowPitch, 4, w, f);
+            std::fclose(f);
+        }
+        g_context->Unmap(staging.Get(), 0);
+        return;
+    }
     ToStaging(*t);
     D3D11_MAPPED_SUBRESOURCE map;
     if (FAILED(g_context->Map(t->staging.Get(), 0, D3D11_MAP_READ, 0, &map))) return;
@@ -2788,6 +2897,38 @@ void DumpDrawStep(Target* t) {
             last[i / 2] = c;
         }
         g_context->Unmap(t->staging.Get(), 0);
+        // GitHub #27: with a 24 bit depth target without multisampling (msaa = 1), also the depth at these pixels as the
+        // guest's w (W-buffering: w / zmax stored, reversed or not), logged when it changes
+        if (DepthTarget* z = g_probe_depth; z && !z->z16 && z->samples == 1) {
+            static ComPtr<ID3D11Texture2D> staging;
+            D3D11_TEXTURE2D_DESC zd, have{};
+            z->texture->GetDesc(&zd);
+            if (staging) staging->GetDesc(&have);
+            if (!staging || have.Width != zd.Width || have.Height != zd.Height || have.Format != zd.Format) {
+                staging.Reset();
+                zd.Usage = D3D11_USAGE_STAGING, zd.BindFlags = 0, zd.CPUAccessFlags = D3D11_CPU_ACCESS_READ, zd.MiscFlags = 0;
+                g_device->CreateTexture2D(&zd, nullptr, &staging);
+                staging->GetDesc(&have);
+            }
+            if (staging) {
+                g_context->CopyResource(staging.Get(), z->texture.Get());
+                if (SUCCEEDED(g_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map))) {
+                    static std::vector<float> last_z(probe.size() / 2, -1.0f);
+                    const uint32_t texel = z->stencil ? 8 : 4;
+                    for (size_t i = 0; i + 1 < probe.size(); i += 2) {
+                        uint32_t x = std::min(uint32_t(probe[i] * have.Width), have.Width - 1);
+                        uint32_t y = std::min(uint32_t(probe[i + 1] * have.Height), have.Height - 1);
+                        float v;
+                        std::memcpy(&v, static_cast<const uint8_t*>(map.pData) + size_t(y) * map.RowPitch + x * texel, 4);
+                        const float w = (g_reversed_depth ? (v > 0 ? psh::kReversedDepth / v : 0.0f) : v) * 16777215.0f;
+                        if (v != last_z[i / 2])
+                            rt::Log("probe: draw %d depth %08X pixel %u,%u = %g (w %g)", dumped, z->address, x, y, v, w);
+                        last_z[i / 2] = v;
+                    }
+                    g_context->Unmap(staging.Get(), 0);
+                }
+            }
+        }
         dumped++;
         return;
     }
@@ -2929,6 +3070,27 @@ void ToStagingTexture(Target& t, ID3D11Texture2D* staging) {
     g_context->CopyResource(staging, t.shrunk.Get());
 }
 
+// GitHub #27: the target at guest size for a post processing draw that reads it (see "post processing at the
+// console's size"), each guest pixel the average of its host pixels (and samples); once per version of the target
+ID3D11ShaderResourceView* GuestCopy(Target& t) {
+    if (!t.guest_copy) {
+        D3D11_TEXTURE2D_DESC desc{t.width, t.height, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                                  D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &t.guest_copy))) return nullptr;
+        g_device->CreateRenderTargetView(t.guest_copy.Get(), nullptr, &t.guest_copy_rtv);
+        g_device->CreateShaderResourceView(t.guest_copy.Get(), nullptr, &t.guest_copy_srv);
+    }
+    if (t.guest_copy_version != t.version) {
+        ID3D11ShaderResourceView* src = Resolved(t);
+        if (!src) return nullptr;
+        g_context->OMSetRenderTargets(0, nullptr, nullptr);
+        ScaleDraw(t.guest_copy_rtv.Get(), t.width, t.height, src, Scaler().shrink.Get(),
+                  float(t.HostHeight()) / float(t.height), float(t.HostWidth()) / float(t.width));
+        t.guest_copy_version = t.version;
+    }
+    return t.guest_copy_srv.Get();
+}
+
 // a CPU read that does not wait for the GPU: the newest copy the GPU has finished goes to guest memory (a frame or
 // two old, as on the console, whose GPU runs behind), and a copy of the current contents is started for later.
 // The target stays the newer side: its state is left alone.
@@ -2967,6 +3129,8 @@ void Grow(Target& t) {
 // colour), the water and other alpha blended or additive 3D draws, then 2D (bloom, HUD) and other targets. The
 // occlusion goes in once per view, before the first draw that is neither of the first kind nor a light pass: the
 // first alpha blended or 2D draw into that target, another target, another view (split screen) or a clear of it.
+// A light pass is additive and draws one of the view's opaque meshes again; other additive 3D draws (light shafts,
+// glow sprites) are effects over the scene and get the occlusion before them (GitHub #24).
 struct AoView {
     Target* color = nullptr;
     DepthTarget* depth = nullptr;
@@ -2974,8 +3138,42 @@ struct AoView {
     bool pending = false;
     std::vector<D3D11_RECT> done;  // views that got their occlusion this frame
     float fog[3] = {};             // the latest fog of a 3D draw at stored depth d: saturate(fog[0] * d + fog[1])
+    // GitHub #24: the geometry (AoMeshKey) of the pending view's opaque meshes. A light pass draws one of them again;
+    // an additive draw of other geometry (the light shafts of 05_Mines, glows) is a transparent effect and must come
+    // after the occlusion, or the occlusion darkens it (the creases of the rock behind a shaft as dark lines in it)
+    std::vector<uint64_t> meshes;
 };
 AoView g_ao;
+// GitHub #24: FCI_AO_ANY_ADDITIVE=1 = every additive W-buffered draw counts as a light pass (the order before the fix)
+const bool g_ao_any_additive = GetEnvironmentVariableA("FCI_AO_ANY_ADDITIVE", nullptr, 0) > 0;
+const bool g_trace_ao = GetEnvironmentVariableA("FCI_TRACE_AO", nullptr, 0) > 0;
+
+// GitHub #24: a mesh by its positions only (vertex attribute 0): a light pass draws the same vertices with more
+// attributes enabled than the opaque pass (normals, tangents), so GeometryKey differs between them
+uint64_t AoMeshKey(const kelvin::Draw& d) {
+    uint64_t h = Mix(d.primitive, d.count);
+    if (d.raw) {
+        h = Mix(h, Mix(d.first, d.span));
+        h = Mix(h, d.ids.size());
+        if (!d.ids.empty()) h = Mix(h, Mix(d.ids.front(), Mix(d.ids[d.ids.size() / 2], d.ids.back())));
+        if ((d.enabled & 1) && d.data[0]) {
+            const uint32_t bytes = std::min<uint32_t>(kelvin::RawBytes(d.format[0]), 8);
+            uint64_t a = 0, b = 0;
+            std::memcpy(&a, d.data[0], bytes);
+            std::memcpy(&b, d.data[0] + size_t(d.span ? d.span - 1 : 0) * d.data_stride[0], bytes);
+            h = Mix(h, Mix(a, b));
+        }
+    } else if (!d.vertices.empty() && d.stride && (d.enabled & 1)) {
+        const std::vector<float>& v = d.vertices;  // float4 per enabled attribute, the position first
+        const size_t n = v.size() / d.stride;
+        for (size_t k : {size_t(0), n / 2, n - 1}) {
+            uint64_t x = 0;
+            std::memcpy(&x, &v[k * d.stride], 8);
+            h = Mix(h, x);
+        }
+    }
+    return h;
+}
 
 bool SameRect(const D3D11_RECT& a, const D3D11_RECT& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
@@ -3027,7 +3225,7 @@ void AoFlush() {
 }
 
 // before a draw into surf; true when the occlusion went in and surf's targets must be bound again
-bool AoBeforeDraw(const State& s, const Surfaces& surf, bool depth_write, UINT8 mask) {
+bool AoBeforeDraw(const State& s, const kelvin::Draw& d, const Surfaces& surf, bool depth_write, UINT8 mask) {
     if (!g_hle || !ao::Mode()) return false;
     const bool w_buffer = s.Reg(SET_CONTROL0) & kControl0WBuffer;
     const bool blend = s.Reg(SET_BLEND_ENABLE) != 0;
@@ -3056,13 +3254,31 @@ bool AoBeforeDraw(const State& s, const Surfaces& surf, bool depth_write, UINT8 
         rect.bottom = std::min<LONG>(LONG(std::lround(y1 * sy)), surf.clip.bottom);
     }
     bool flushed = false;
+    const uint64_t mesh = AoMeshKey(d);  // GitHub #24
     if (g_ao.pending) {
         const bool same = surf.color == g_ao.color && surf.depth == g_ao.depth;
-        const bool light = w_buffer && blend && s.Reg(SET_BLEND_FUNC_SFACTOR) == 1 &&
-                           s.Reg(SET_BLEND_FUNC_DFACTOR) == 1 && !depth_write;
+        const bool additive = w_buffer && blend && s.Reg(SET_BLEND_FUNC_SFACTOR) == 1 &&
+                              s.Reg(SET_BLEND_FUNC_DFACTOR) == 1 && !depth_write;
+        // GitHub #24: a light pass draws a mesh of the view again (see AoView::meshes; from the latest: a light pass
+        // follows its mesh closely)
+        const bool again =
+            additive && std::find(g_ao.meshes.rbegin(), g_ao.meshes.rend(), mesh) != g_ao.meshes.rend();
+        const bool light = g_ao_any_additive ? additive : again;
         const bool query = mask == 0 && !depth_write;  // occlusion tests draw nothing
         const bool overdraw = w_buffer && program && !blend;  // second unblended passes over opaque meshes
         bool keep = same && (opaque ? SameRect(rect, g_ao.rect) : (light || query || overdraw));
+        if (g_trace_ao && same && additive && !again) {  // FCI_TRACE_AO: each kind at most every half second
+            static std::vector<std::pair<uint64_t, uint64_t>> traced;  // (kind, tick)
+            const uint64_t kind = Mix(vsh::Key(s, d.enabled), Mix(d.count, d.primitive)), now = GetTickCount64();
+            auto it = std::find_if(traced.begin(), traced.end(), [&](const auto& t) { return t.first == kind; });
+            if (it == traced.end() && traced.size() < 400) it = traced.insert(traced.end(), {kind, 0});
+            if (it != traced.end() && now - it->second >= 500)
+                it->second = now,
+                rt::Log("render: ao: additive draw of other geometry (%u vertices, prim %u, vs %016llX) after %zu meshes: "
+                        "the occlusion goes in %s",
+                        d.count, d.primitive, (unsigned long long)vsh::Key(s, d.enabled), g_ao.meshes.size(),
+                        light ? "after it (FCI_AO_ANY_ADDITIVE)" : "before it");
+        }
         if (!keep) {
             AoFlush();
             flushed = true;
@@ -3074,8 +3290,13 @@ bool AoBeforeDraw(const State& s, const Surfaces& surf, bool depth_write, UINT8 
         if (!done) {
             g_ao.pending = true;
             g_ao.color = surf.color, g_ao.depth = surf.depth, g_ao.rect = rect;
+            g_ao.meshes.clear();
         }
     }
+    // the meshes a light pass may draw again: opaque ones and the second unblended passes over them
+    if (g_ao.pending && surf.color == g_ao.color && w_buffer && program && !blend && mask &&
+        (g_ao.meshes.empty() || g_ao.meshes.back() != mesh))
+        g_ao.meshes.push_back(mesh);
     return flushed;
 }
 
@@ -3461,6 +3682,12 @@ const bool g_no_screen_mask = GetEnvironmentVariableA("FCI_NO_SCREEN_MASK", null
 // FCI_NO_HUD_START=1: the HUD begins only after post processing, as before (diagnostics; DrawOne, "the HUD without
 // post processing")
 const bool g_no_hud_start = GetEnvironmentVariableA("FCI_NO_HUD_START", nullptr, 0) > 0;
+// FCI_NO_SPLIT_VIEW_START=1: a split screen's next view begins only with its first 3D draw, as before (diagnostics;
+// DrawOne, "the next view's own 2D")
+const bool g_no_split_view_start = GetEnvironmentVariableA("FCI_NO_SPLIT_VIEW_START", nullptr, 0) > 0;
+// FCI_NO_VIEW_HUD_CENTRE=1: the HUD of a quarter view (split screen, 3 and 4 players) is narrowed about the screen's
+// centre, as before (diagnostics; DrawOne, "the HUD of a quarter view")
+const bool g_no_view_hud_centre = GetEnvironmentVariableA("FCI_NO_VIEW_HUD_CENTRE", nullptr, 0) > 0;
 
 struct ScreenMasks {
     struct Span {
@@ -3734,7 +3961,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         else if (!depth_read_only) depth_read_only = ReadOnlyDsv(*surf.depth);
     }
     // ---- ambient occlusion ----
-    if (AoBeforeDraw(s, surf, surf.depth && depth_test && s.Reg(SET_DEPTH_MASK),
+    if (AoBeforeDraw(s, d, surf, surf.depth && depth_test && s.Reg(SET_DEPTH_MASK),
                      surf.color ? WriteMask(s.Reg(SET_COLOR_MASK)) : UINT8(0)))
         Rebind(surf);
     // ---- end ambient occlusion ----
@@ -3862,6 +4089,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     // hud: x' = x * hud[0] + hud[1], y' = y * hud[2] + hud[3] for vertices with w = 1 (identity: as drawn)
     vc.hud[0] = 1.0f, vc.hud[1] = 0.0f, vc.hud[2] = 1.0f, vc.hud[3] = 0.0f;
     bool narrowed = false;
+    const float* hud_view = nullptr;  // the HUD of a quarter view: narrowed about that view's centre (its viewport)
     bool screen_mask = false;  // screen masks (binoculars, scopes): narrowed, not cut to the 4:3 middle
     int mask_sides = 0;  // and its sides to fill (bit 0 left, 1 right): where the mask ends, the slice of it to show
     float mask_fill[2][2] = {};
@@ -3870,6 +4098,51 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     // fmv_scale: frames of a video (a video texture drawn, or the overlay showing one) are shown wide too
     const bool video_frame = fmv::Fill() && (g_frame_video || g_last_video || gpu::OverlayActive());
     if (surf.color && surf.color->wide != 1.0f) {
+        // ---- the next view's own 2D (split screen) ----
+        // A split screen's next view does not begin with a 3D draw: first comes its sky (10-11 draws of a vertex
+        // program, VS 654693C82F9056F6, no depth test, not W-buffered) and its sun sprite (VS 44594C36B7E9D092), in
+        // that view's viewport. Only its first 3D draw began the view, so they came while the HUD rule of the view
+        // above still held (its post processing had begun): narrowed and cut to the 4:3 middle, the lower view's sky
+        // was black beside the 4:3 middle wherever one looked up (M01_MercyCreek, M11_Temple; through the menus as
+        // through FCI_START_LEVEL). A draw of a vertex program in a viewport that is a split screen's view (smaller
+        // than the target, inside it) other than the last view's, which was one as well, begins the next view as its
+        // first 3D draw would. The HUD is drawn in the whole screen's viewport (c58 320/-240, c59 320.5/240.5) and
+        // single player has no split view: neither begins anything.
+        auto split_view = [&](const float* v) {
+            const float hw = std::fabs(v[0]), hh = std::fabs(v[1]), x = v[2] - 0.53125f, y = v[3] - 0.53125f;
+            const float w = float(surf.width), h = float(surf.height);
+            return hw >= 16.0f && hh >= 16.0f && x - hw >= -1.0f && y - hh >= -1.0f && x + hw <= w + 1.0f &&
+                   y + hh <= h + 1.0f && (hw < w * 0.5f - 1.0f || hh < h * 0.5f - 1.0f);
+        };
+        // (the HUD of a quarter view, below: this frame's views narrower than the screen)
+        auto note_quarter = [&](const float* v) {
+            if (g_quarter_count >= 4 || !split_view(v) || std::fabs(v[0]) >= float(surf.width) * 0.5f - 1.0f) return;
+            for (int i = 0; i < g_quarter_count; i++)
+                if (std::memcmp(g_quarter_views[i], v, sizeof g_quarter_views[i]) == 0) return;
+            std::memcpy(g_quarter_views[g_quarter_count++], v, sizeof g_quarter_views[0]);
+        };
+        if (vc.screen[3] == 0 && g_frame_3d && g_post_3d && !g_no_split_view_start &&
+            (s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3) == 2) {
+            const float view[4] = {s.constants[58][0], s.constants[58][1], s.constants[59][0], s.constants[59][1]};
+            if (std::memcmp(view, g_view_3d, sizeof view) != 0 && split_view(view) && split_view(g_view_3d)) {
+                if (g_hud_trace.watch)  // diagnostics: FCI_TRACE_HUD (a new view, as at a 3D draw)
+                    g_hud_trace.Restart(false, d.count, s.Reg(SET_BLEND_ENABLE), vsh::Key(s, d.enabled),
+                                        psh::Key(s, config), view, g_view_3d);
+                static bool logged = false;
+                if (!logged)
+                    logged = true, rt::Log("render: split screen: the next view (viewport %g %g %g %g) began with 2D "
+                                           "of its own (vs %016llX)",
+                                           view[0], view[1], view[2], view[3],
+                                           (unsigned long long)vsh::Key(s, d.enabled));
+                // (diagnostics: old_post, the classification before, holds until the view's first 3D draw, so that
+                // FCI_TRACE_HUD=watch counts these draws as classified otherwise)
+                g_post_3d = false;
+                g_hud_trace.old_view_pending = g_hud_trace.old_post;
+                std::memcpy(g_view_3d, view, sizeof view);
+                note_quarter(view);
+            }
+        }
+        // ---- end the next view's own 2D ----
         if (vc.screen[3] != 0) {
             // A 3D draw after the post processing begins another 3D view (split screen: the next player's) only if
             // it goes to another part of the screen; in the same view it is part of the post processing, and the
@@ -3887,8 +4160,9 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                 g_hud_trace.Restart(same_view, d.count, s.Reg(SET_BLEND_ENABLE), vsh::Key(s, d.enabled),
                                     psh::Key(s, config), view, g_view_3d);
             if (!same_view) g_post_3d = g_hud_trace.old_post = false;
+            if (g_hud_trace.old_view_pending) g_hud_trace.old_post = g_hud_trace.old_view_pending = false;
             g_frame_3d = true;
-            if (program) std::memcpy(g_view_3d, view, sizeof view);
+            if (program) std::memcpy(g_view_3d, view, sizeof view), note_quarter(view);
         } else if ((g_frame_3d || fmv::Fill()) && (d.enabled & 1) && d.stride >= 4 && !g_counting &&
                    s.Reg(SET_COLOR_MASK) != 0) {
             // (visibility tests are no HUD: FCI decides per water patch from a pre-transformed test polygon whether to
@@ -4000,6 +4274,33 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                 // too (the main menu draws a still of its video's band under the video)
                 vc.hud[0] = 1.0f / surf.color->wide, vc.hud[1] = surf.width * 0.5f * (1.0f - vc.hud[0]);
                 narrowed = true;
+                // ---- the HUD of a quarter view (split screen, 3 and 4 players) ----
+                // With 3 or 4 players the lower views (all four with 4) are quarters of the screen, side by side.
+                // FCI draws every view's HUD at the end of the frame in the whole screen's viewport, each part inside
+                // its view's rectangle. Narrowed about the screen's centre, a quarter's HUD moved towards the middle of
+                // the screen, its crosshair off the centre of its view (left quarter right of it, right quarter left
+                // of it, by a quarter of the width beyond 4:3). A 2D draw of the HUD whose box has its centre in one
+                // of this frame's views narrower than the screen is narrowed about that view's centre (and cut to its
+                // 4:3 middle, see the scissor). Parts reach a little beyond their quarter (4 players: the radar of a
+                // right quarter starts at x 318.4, that of an upper quarter ends at y 248.1), so the box's centre,
+                // not the whole box, decides. Views across the whole width (1 and 2 players) keep the screen's centre:
+                // unchanged.
+                if (g_frame_3d && !screen_mask && !g_no_view_hud_centre)
+                    for (int i = 0; i < g_quarter_count && !hud_view; i++) {
+                        const float* v = g_quarter_views[i];
+                        const float hw = std::fabs(v[0]), hh = std::fabs(v[1]), x = v[2] - 0.53125f, y = v[3] - 0.53125f;
+                        const float cx = (lo + hi) * 0.5f, cy = (top + bottom) * 0.5f;
+                        if (cx >= x - hw && cx < x + hw && cy >= y - hh && cy < y + hh) {
+                            hud_view = v;
+                            vc.hud[1] = x * (1.0f - vc.hud[0]);
+                            static bool logged = false;
+                            if (!logged)
+                                logged = true, rt::Log("render: split screen: HUD of a quarter view narrowed about its "
+                                                       "centre x %.1f (box %.1f,%.1f..%.1f,%.1f)",
+                                                       x, lo, top, hi, bottom);
+                        }
+                    }
+                // ---- end the HUD of a quarter view ----
                 // before this frame's video: 2D beside where the video went last frame is drawn again after it.
                 // Per triangle of a list (one draw may hold a glyph above and one below the video), else the box
                 if (video_frame && !g_frame_video && !g_replaying && !across && g_before_video.size() < 64) {
@@ -4275,6 +4576,14 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         // PC features: a narrowed 2D draw stays inside the 4:3 middle, as it stayed inside the console's screen
         // (HUD parts the game slides off screen must not show up beside it; screen masks reach beyond it)
         float center = HostWidthOf(surf.width, surf.scale, surf.wide) * 0.5f;
+        if (hud_view) {  // the HUD of a quarter view: inside the 4:3 middle of that view (and 16 guest pixels beyond
+            // its edges, which its parts reach: see DrawOne, "the HUD of a quarter view")
+            const float to_host = float(HostWidthOf(surf.width, surf.scale, surf.wide)) / float(surf.width);
+            const float hw = std::fabs(hud_view[0]) + 16.0f, x = hud_view[2] - 0.53125f;
+            center = x * to_host;
+            scissor.left = std::max(scissor.left, LONG(std::floor((x - hw) * to_host)));
+            scissor.right = std::min(scissor.right, LONG(std::ceil((x + hw) * to_host)));
+        }
         scissor.left = LONG(center + (scissor.left - center) * vc.hud[0] + 0.5f);
         scissor.right = LONG(center + (scissor.right - center) * vc.hud[0] + 0.5f);
     }
@@ -4568,7 +4877,9 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     g_draws++;
     if (surf.depth && depth_test && s.Reg(SET_DEPTH_MASK)) surf.depth->last_write = ++g_write_sequence;
     DrainMessages();
+    g_probe_depth = surf.depth;  // GitHub #27
     DumpDrawStep(surf.color);
+    g_probe_depth = nullptr;
     if (g_trace_draws > 0 && GetTickCount64() >= std::min(g_trace_from, g_dump_from) &&
         (!g_trace_ps || psh::Key(s, config) == g_trace_ps)) {
         g_trace_draws--;
@@ -4607,8 +4918,9 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                 s.Reg(SET_COMBINER_FACTOR0 + 16), s.Reg(SET_COMBINER_FACTOR0 + 20), s.Reg(SET_COMBINER_FACTOR0 + 24),
                 s.Reg(SET_COMBINER_FACTOR0 + 28), s.Reg(SET_COMBINER_FACTOR1 + 16), s.Reg(SET_COMBINER_FACTOR1 + 20),
                 s.Reg(SET_COMBINER_FACTOR1 + 24), s.Reg(SET_COMBINER_FACTOR1 + 28));
-        rt::Log("    alpha test %u func %X ref %u", s.Reg(SET_ALPHA_TEST_ENABLE), s.Reg(SET_ALPHA_FUNC),
-                s.Reg(SET_ALPHA_REF) & 0xFF);
+        rt::Log("    alpha test %u func %X ref %u, polygon offset %u bias %g scale %g", s.Reg(SET_ALPHA_TEST_ENABLE),
+                s.Reg(SET_ALPHA_FUNC), s.Reg(SET_ALPHA_REF) & 0xFF, s.Reg(SET_POLY_OFFSET_FILL_ENABLE),
+                s.RegF(SET_POLYGON_OFFSET_BIAS), s.RegF(SET_POLYGON_OFFSET_SCALE_FACTOR));
         rt::Log("    surface clip %08X %08X window clip type %X %08X %08X", s.Reg(SET_SURFACE_CLIP_HORIZONTAL),
                 s.Reg(SET_SURFACE_CLIP_VERTICAL), s.Reg(SET_WINDOW_CLIP_TYPE), s.Reg(SET_WINDOW_CLIP_HORIZONTAL),
                 s.Reg(SET_WINDOW_CLIP_VERTICAL));
@@ -4626,7 +4938,11 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             at = comma == std::string::npos ? trace_consts.size() : comma + 1;
         }
         const std::vector<float>& vertices = kelvin::Vertices(d);  // performance: raw draws convert here
-        for (uint32_t v = 0; v < std::min(d.count, 4u); v++) {
+        static const uint32_t trace_vertices = [] {  // FCI_TRACE_VERTICES=<n>: vertices per draw (default 4)
+            char value[16] = {};
+            return GetEnvironmentVariableA("FCI_TRACE_VERTICES", value, sizeof value) ? uint32_t(std::atoi(value)) : 4u;
+        }();
+        for (uint32_t v = 0; v < std::min(d.count, trace_vertices); v++) {
             std::string line = "    ";
             for (int k = 0; k < d.stride; k += 4) {
                 char item[96];
@@ -4978,6 +5294,7 @@ void Present(uint32_t front) {
     g_frame_3d = false;
     g_frame_video = false;
     g_post_3d = false;
+    g_quarter_count = 0;  // the HUD of a quarter view (DrawOne)
     g_masks.Frame();  // PC features: screen masks
     AoPresent();  // ambient occlusion
     g_water_presents++;  // PC water

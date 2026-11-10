@@ -597,6 +597,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CLOSE:
         rt::Log("window closed");
+        // during a level change: no new process starts, one already started ends too (it would bring the game back)
+        kernel::CancelRelaunch("window closed");
         hle::host::StopRumble();
         // a save in progress (checkpoint, level end) is finished first and no new one starts (GitHub #29)
         kernel::FinishSaves("window closed", 5000, 400);
@@ -606,6 +608,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ENDSESSION:  // Windows shuts down or the user logs off: the process ends after this message
         if (wp) {
             rt::Log("Windows ends the session");
+            kernel::CancelRelaunch("Windows ends the session");
             kernel::FinishSaves("Windows ends the session", 4000, 400);
             rt::FlushLog();
         }
@@ -749,17 +752,45 @@ bool CreateCarriedWindow(const output::Options& o, const wchar_t* cls, HINSTANCE
     return true;
 }
 
-void DisplayThread() {
-    g_handover = OpenEventW(EVENT_MODIFY_STATE, FALSE, kernel::HandoverEvent(GetCurrentProcessId()).c_str());
-    g_handing = g_handover != nullptr;
-    if (g_handing) {
-        rt::Log("display: relaunched, the window opens with the first frames (handover)");
-        // fallback: shown after 10 s whatever happens (no frames from the presenter, LLE graphics)
-        std::thread([] {
-            Sleep(10000);
-            FinishHandover();
-        }).detach();
+// the previous instance's events (kernel::Relaunch): the window shown with the first frames, at the latest after 10 s
+// (no frames from the presenter, LLE graphics); and the end of this process when the previous one's window was
+// closed during the relaunch (kernel::CancelRelaunch), as if this one's had been closed
+void HandoverWatch(HANDLE close) {
+    DWORD r = WAIT_TIMEOUT;
+    if (close) r = WaitForSingleObject(close, g_handing ? 10000 : INFINITE);
+    else Sleep(10000);
+    if (r == WAIT_TIMEOUT) {
+        FinishHandover();
+        if (!close) return;
+        r = WaitForSingleObject(close, INFINITE);
     }
+    if (r != WAIT_OBJECT_0) return;
+    const bool hidden = g_handing.exchange(false);  // not shown any more, the previous one does not wait for it
+    rt::Log("display: the previous instance's window was closed during the relaunch: this one ends too%s",
+            hidden ? " (its window never shown)" : "");
+    WaitForSingleObject(g_window_ready, 10000);
+    if (HWND w = g_window.load()) {
+        PostMessageW(w, WM_CLOSE, 0, 0);  // the same end as a close of this window (a save is finished first)
+        return;
+    }
+    kernel::FinishSaves("previous window closed", 5000, 400);
+    rt::FlushLog();
+    ExitProcess(0);
+}
+
+void DisplayThread() {
+    // relaunch: the previous instance named its events (gone if it has ended meanwhile: then a start as any other)
+    HANDLE close = nullptr;
+    wchar_t name[128] = {};
+    const DWORD n = GetEnvironmentVariableW(L"FCI_HANDOVER_EVENT", name, 128);
+    if (n > 0 && n < 128 && GetEnvironmentVariableA("FCI_RELAUNCHED", nullptr, 0) > 0) {
+        g_handover = OpenEventW(EVENT_MODIFY_STATE, FALSE, kernel::HandoverReadyEvent(name).c_str());
+        close = OpenEventW(SYNCHRONIZE, FALSE, kernel::HandoverCloseEvent(name).c_str());
+        if (!close) rt::Log("display: relaunched, the previous instance has already ended");
+    }
+    g_handing = g_handover != nullptr;
+    if (g_handing) rt::Log("display: relaunched, the window opens with the first frames (handover)");
+    if (g_handing || close) std::thread(HandoverWatch, close).detach();
     const DWORD visible = g_handing ? 0 : WS_VISIBLE;
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;

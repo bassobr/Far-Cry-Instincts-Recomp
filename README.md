@@ -236,6 +236,7 @@ there.
 | `fps_counter` | `0` | `1` = show frame rate and frame times |
 | `skip_intro` | `0` | `1` = skip the three logo videos at start (Ubisoft, Crytek, Far Cry Instincts) and the trailer after "Quit to main menu" (any button ends it otherwise); not the story's cutscenes |
 | `language` | `english` | Text and voice language: `english`, `french`, `italian`, `spanish`, `german`, `auto` (the Windows display language). The NTSC disc has English, French, Italian and Spanish; `german` shows English there. Takes effect after a restart |
+| `speech_volume` | `0` | Dialogue louder (or quieter) than the game mixes it, in dB from −12 to +12; `0` = as on the Xbox. Raises everything spoken (player, radio, other characters, cutscenes), music and effects stay as they are. F10 menu *SPEECH VOLUME*: 0, +3, +6, applied at once; above +6 only here, where the output limiter has to work hard in loud scenes |
 | `pause_on_focus_loss` | `0` | `1` = pause game, sound and rumble while the window is in the background |
 | `mouse_mode` | `direct` | `direct` = every mouse count turns the view by the same angle, at once, with no ramp, speed cap, smoothing or dead zone; `stick` = the old way through the right stick (the game's stick handling) |
 | `mouse_sensitivity` | `1` | 1 = 0.1 degrees per mouse count (900 counts = 90°), 0.01–100; `mouse_sensitivity_x` / `_y` per axis |

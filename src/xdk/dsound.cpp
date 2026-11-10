@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include "app/settings.h"  // speech volume
 #include "audio/hle_output.h"
 #include "runtime/memory.h"
 #include "runtime/scheduler.h"
@@ -67,6 +68,8 @@ constexpr uint32_t kFilterMulti = 3;
 const bool g_trace = GetEnvironmentVariableA("FCI_TRACE_VOICES", nullptr, 0) > 0;
 const bool g_no_reverb = GetEnvironmentVariableA("FCI_NO_REVERB", nullptr, 0) > 0;
 const bool g_no_cross_feed = GetEnvironmentVariableA("FCI_NO_CROSSFEED", nullptr, 0) > 0;
+// FCI_TRACE_VOICE_LEVELS=1: every second, each voice heard with its settings and the level it adds to the stereo fold
+const bool g_trace_levels = GetEnvironmentVariableA("FCI_TRACE_VOICE_LEVELS", nullptr, 0) > 0;
 // FCI_TEST_SOLO=1: the 3D voices alone in the mix, the loudest one's Doppler shift logged every 0.25 s; "first":
 // the first 3D stream alone (in FCI the opening cutscene's helicopter). Measurements only.
 const int g_test_solo = [] {
@@ -76,9 +79,17 @@ const int g_test_solo = [] {
 }();
 uint32_t g_solo = 0;  // FCI_TEST_SOLO=first: that stream
 
+// ---- speech volume (GitHub #25): speech_volume (dB, -12 to +12, 0 = the console's mix) raises every voice whose data
+// the game read from a language sound bank (sounds_xb\<language>\*.LS2: the player, the radio, characters, cutscenes)
+// as a volume would, direct path and reverb send alike; music and effects (*.SS2) stay. The limiter catches the peaks.
+std::atomic<float> g_speech_gain{1.0f};
+float SpeechGain(float db) { return std::pow(10.0f, std::clamp(db, -12.0f, 12.0f) / 20.0f); }
+// ---- end speech volume ----
+
 struct Packet {
     uint32_t data, size, completed_ptr, status_ptr, context;
     uint32_t used = 0;
+    bool speech = false;  // speech volume: its data came from a language sound bank (kernel::IsSpeechData)
 };
 
 struct Voice {
@@ -103,6 +114,7 @@ struct Voice {
     uint8_t nbins = 0, bin[8] = {};
     int32_t bin_mb[32] = {};  // by mix bin
     bool is3d = false;
+    bool speech = false;  // speech volume: a buffer's data, or a stream's last packet, came from a language bank
     uint32_t flags = 0;  // DSBUFFERDESC / DSSTREAMDESC dwFlags
     // 3D settings as the title sets them; a commit (CommitDeferredSettings, or the call itself with DS3D_IMMEDIATE)
     // applies them, as the library's settings and its 3D pass do
@@ -129,6 +141,9 @@ struct Voice {
     float itd = 0;
     float ear[kEarLength] = {};
     uint32_t ear_pos = 0;
+    // FCI_TRACE_VOICE_LEVELS: energy this voice added to the stereo fold since the last report
+    double fold_energy = 0;
+    uint32_t fold_frames = 0;
     // ADPCM block cache
     int64_t block = -1;
     int16_t decoded[65 * 8];
@@ -655,6 +670,7 @@ struct Cursor {
     uint32_t f;
     uint32_t next_data;
     uint32_t next_f;
+    bool speech = false;  // speech volume: the frame is speech
 };
 
 // FCI: guest memory below 64 KB is the null page, which the fault handler does not commit
@@ -677,7 +693,7 @@ std::optional<Cursor> StreamFrame(Voice& v) {
         return std::nullopt;
     }
     Packet& pk = v.packets.front();
-    Cursor at = {pk.data, f, pk.data, f};
+    Cursor at = {pk.data, f, pk.data, f, pk.speech};
     if (f + 1 < FramesOf(v, pk.size)) {
         at.next_f = f + 1;
     } else if (v.packets.size() > 1 && Readable(v.packets[1].data)) {
@@ -705,7 +721,7 @@ std::optional<Cursor> BufferFrame(Voice& v) {
         f = uint32_t(v.pos);
     }
     if (!Readable(v.data)) return std::nullopt;
-    Cursor at = {v.data, f, v.data, f};
+    Cursor at = {v.data, f, v.data, f, v.speech};
     if (f + 1 < end) {
         at.next_f = f + 1;
     } else if (v.looping && end) {
@@ -791,6 +807,7 @@ void MixVoice(Voice& v, float* out, float* send, uint32_t frames) {
     float dg[2][kLanes];
     UpdateRamp(v, g, frames, dg);
     double rate = Rate(v);
+    const float speech = g_speech_gain.load(std::memory_order_relaxed);
     for (uint32_t i = 0; i < frames; i++) {
         std::optional<Cursor> cursor = v.stream ? StreamFrame(v) : BufferFrame(v);
         if (!cursor) break;
@@ -799,6 +816,7 @@ void MixVoice(Voice& v, float* out, float* send, uint32_t frames) {
                       cursor->data, cursor->f, v.stream ? v.packets.front().size : v.bytes);
         float x[2], d[2], r[2];
         ReadFrame(v, *cursor, x);
+        if (cursor->speech) x[0] *= speech, x[1] *= speech;  // speech volume
         VoiceFilter(v, x, d, r);
         send[i] += r[0] * w[0] + r[1] * w[1];  // the send leaves before the HRTF
         float ear[kLanes];
@@ -807,11 +825,19 @@ void MixVoice(Voice& v, float* out, float* send, uint32_t frames) {
             EarFrame(v, d[0], ear);
         }
         float* o = out + i * kLanes;
+        float added[kLanes];
         for (uint32_t k = 0; k < kLanes; k++) {
             v.gain[0][k] += dg[0][k];
             v.gain[1][k] += dg[1][k];
-            if (ears) o[k] += ear[k] * v.gain[0][k];
-            else o[k] += d[0] * v.gain[0][k] + d[1] * v.gain[1][k];
+            added[k] = ears ? ear[k] * v.gain[0][k] : d[0] * v.gain[0][k] + d[1] * v.gain[1][k];
+            o[k] += added[k];
+        }
+        if (g_trace_levels) {
+            // the stereo fold of hle_output.cpp, the crosstalk bins on their speakers
+            float left = added[0] + added[6] + 0.707f * (added[2] + added[4] + added[8]);
+            float right = added[1] + added[7] + 0.707f * (added[2] + added[5] + added[9]);
+            v.fold_energy += double(left) * left + double(right) * right;
+            v.fold_frames++;
         }
         v.pos += rate;
     }
@@ -916,6 +942,33 @@ void TraceMix(uint32_t frames, const float* send, double wet) {
     send_energy = 0;
 }
 
+std::string Bins(const Voice& v);
+
+// FCI_TRACE_VOICE_LEVELS: every second the voices heard, their volume, headroom, bins (mB), distance gain and I3DL2
+// direct level, and the rms they added to the stereo fold (dBFS over the frames they played), loudest first
+void TraceLevels(uint32_t frames) {
+    static uint64_t mixed = 0;
+    mixed += frames;
+    if (mixed < audio::kRate) return;
+    mixed = 0;
+    std::vector<std::pair<double, const Voice*>> heard;
+    for (auto& [obj, v] : g_voices)
+        if (v.fold_frames) heard.push_back({v.fold_energy / (2.0 * v.fold_frames), &v});
+    std::sort(heard.begin(), heard.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    for (auto& [ms, vp] : heard) {
+        const Voice& v = *vp;
+        Place at = Locate(v);
+        uint32_t data = v.stream ? (v.packets.empty() ? 0 : v.packets.front().data) : v.data;
+        auto db = [](float x) { return 20 * std::log10(std::max(x, 1e-6f)); };
+        rt::Log("dsound: level %08X %s %u ch %u Hz %s%s: %.1f dBFS over %.2f s, volume %.1f dB headroom %.1f dB, bins%s, "
+                "distance %.1f dB lf %.1f dB, data %08X",
+                v.obj, v.stream ? "stream" : "buffer", v.channels, v.freq ? v.freq : v.rate, v.is3d ? "3D" : "2D",
+                v.speech ? " speech" : "", 10 * std::log10(std::max(ms, 1e-12)), v.fold_frames / double(audio::kRate), db(v.volume), db(v.headroom),
+                Bins(v).c_str(), db(at.att), db(v.lf), data);
+    }
+    for (auto& [obj, v] : g_voices) v.fold_energy = 0, v.fold_frames = 0;
+}
+
 // the device clips once, after the fold to stereo sums the speakers
 void Render(float* out, uint32_t frames) {
     // the output thread alone renders
@@ -953,6 +1006,7 @@ void Render(float* out, uint32_t frames) {
         if (loudest && blocks++ % 25 == 0)
             rt::Log("dsound: loudest 3D voice %08X level %.3f, pitch x%.4f", loudest->obj, most, loudest->doppler);
     }
+    if (g_trace_levels) TraceLevels(frames);
     double wet_before = g_reverb.wet;
     if (!g_no_reverb) g_reverb.Run(send.data(), lanes.data(), frames);
     if (g_trace) TraceMix(frames, send.data(), g_reverb.wet - wet_before);
@@ -966,6 +1020,7 @@ void Run(rt::Cpu& c, const std::vector<Done>& done) {
 void Start() {
     if (g_started) return;
     g_started = true;
+    xdk::SetSpeechVolume(settings::Float("speech_volume", 0));  // speech volume
     audio::StartOutput(Render);
     // for a title that does not call DirectSoundDoWork for a while (loading): its callbacks come from here instead,
     // on a guest context of their own that takes the CPU like any guest thread
@@ -1350,6 +1405,14 @@ bool HasCrossTalk(const std::vector<uint8_t>& img) {
 
 }  // namespace
 
+// ---- speech volume ----
+void xdk::SetSpeechVolume(float db) {
+    float clamped = std::isfinite(db) ? std::clamp(db, -12.0f, 12.0f) : 0.0f;
+    g_speech_gain = SpeechGain(clamped);
+    rt::Log("dsound: speech volume %+.1f dB%s", clamped, clamped == 0 ? " (the console's mix)" : "");
+}
+// ---- end speech volume ----
+
 // device
 
 HLE_STDCALL(DirectSoundCreate, 3) {
@@ -1395,7 +1458,7 @@ HLE_STDCALL(IDirectSound_EnableHeadphones, 2) {
 }
 HLE_STDCALL(IDirectSound_SetMixBinHeadroom, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    LOG_FIRST(40, "dsound: mix bin %u headroom %u", a[1], a[2]);
+    LOG_FIRST(40, "dsound: mix bin %u headroom %u (from %08X)", a[1], a[2], R32(c.esp));
     if (a[1] < 32) g_bin_headroom[a[1]] = a[2] & 7;
     return 0;
 }
@@ -1556,6 +1619,7 @@ BUFFER(SetBufferData, IDirectSoundBuffer_SetBufferData, 3) {
 }
 BUFFER(Play, IDirectSoundBuffer_Play, 4) {
     v.playing = true;
+    v.speech = kernel::IsSpeechData(v.data);  // speech volume
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     TraceVoice(v.looping ? "play looping" : "play", v);
@@ -1612,6 +1676,7 @@ BUFFER(SetFilter, IDirectSoundBuffer_SetFilter, 2) {
     return 0;
 }
 BUFFER(SetHeadroom, IDirectSoundBuffer_SetHeadroom, 2) {
+    if (g_trace_levels) LOG_FIRST(60, "dsound: buffer %08X headroom %u from %08X", v.obj, a[1], R32(a.c.esp));
     v.headroom = Db(-int32_t(a[1]));
     return 0;
 }
@@ -1748,6 +1813,7 @@ STREAM(Process) {
     uint32_t in = a[1];
     if (!in) return 0;
     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
+    pk.speech = v.speech = kernel::IsSpeechData(pk.data);  // speech volume
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
     bool was_active = v.active;
@@ -1789,6 +1855,7 @@ STREAM(SetFilter) {
     return 0;
 }
 STREAM(SetHeadroom) {
+    if (g_trace_levels) LOG_FIRST(60, "dsound: stream %08X headroom %u from %08X", v.obj, a[1], R32(a.c.esp));
     v.headroom = Db(-int32_t(a[1]));
     return 0;
 }
