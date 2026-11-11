@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>  // diagnostics: FCI_TRACE_HUD=catalog
 #include <vector>
 
 #include "gpu/ao.h"
@@ -37,6 +38,7 @@
 #include "app/settings.h"
 #include "gpu/vsh.h"
 #include "gpu/water.h"  // PC water
+#include "kernel/kernel.h"  // PC features, widescreen HUD: StoryLevel (GitHub #20)
 #include "runtime/hitch.h"  // performance: FCI_TRACE_HITCHES
 #include "runtime/log.h"
 
@@ -347,8 +349,13 @@ uint8_t g_stage_signs[4] = {};  // per stage of the current draw: channels decod
 // scopes) and the sides they filled, 2D draws over the view left wide before its post processing and while pixels
 // were counted. A widescreen 3D frame that narrowed nothing but had 8 or more such draws (its HUD stayed wide) has
 // the next frame traced draw by draw (three times per run).
+// FCI_TRACE_HUD=catalog (also with watch and times): each kind of 2D draw over a widescreen 3D view after its post
+// processing once (shaders, texture, vertex count, box to 8 pixels, anchor, after a cover; at most 6000 lines): box, primitive, texture,
+// blending, the first vertex's colour and the draw's pieces side by side (its primitives merged where less than 24
+// guest pixels apart in x): what an element of the HUD is drawn with (GitHub #20, widescreen HUD).
 struct HudTrace {
-    bool init = false, watch = false;
+    bool init = false, watch = false, catalog = false;
+    int catalogued = 0;
     int times = 0;
     double at[8] = {};
     ULONGLONG start = 0;
@@ -358,8 +365,11 @@ struct HudTrace {
     // 2D draws over the 3D view left wide because the post processing had not begun (the sun's sprite; the whole HUD
     // when a frame has no post processing), and 2D draws while pixels were counted (never classified)
     uint32_t before_post = 0, counted = 0;
+    // widescreen HUD (GitHub #20): narrowed draws anchored at the left/right edge of the HUD's box, draws after a dark
+    // cover of the screen (a menu's dimming: as before)
+    uint32_t left = 0, right = 0, covered = 0;
     int automatic = 3;  // frames traced draw by draw on their own: after a frame whose HUD stayed wide
-    uint32_t last[9] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+    uint32_t last[12] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
     uint64_t frames = 0, since = 0;
     // the classification as before the HUD under water was fixed (the HUD begins only with post processing: a draw
     // into a smaller target after the 3D view), for comparison: post processing begun, the first draw classified
@@ -387,6 +397,7 @@ struct HudTrace {
         if (!GetEnvironmentVariableA("FCI_TRACE_HUD", v, sizeof v)) return;
         for (char* p = v; *p && times < 8;) {
             if (!std::strncmp(p, "watch", 5)) watch = true;
+            else if (!std::strncmp(p, "catalog", 7)) catalog = true;
             else at[times++] = std::atof(p);
             p = std::strchr(p, ',');
             if (!p) break;
@@ -394,22 +405,25 @@ struct HudTrace {
         }
         if (watch) rt::Log("render: hud trace: watching the classification frame by frame");
     }
-    bool On() const { return watch || times; }
+    bool On() const { return watch || catalog || times; }
     // Present: the frame ends
     void Frame(float aspect) {
+        if (!watch) frames++;  // (catalog)
         if (watch) {
             frames++;
             // (2D before the post processing and counted 2D: whether there were many, the sun's sprite comes and goes)
-            const uint32_t now[9] = {restarts, kept, wide_2d ? 1u : 0u, narrowed ? 1u : 0u, changed ? 1u : 0u, masks,
-                                     fills, before_post >= 8 ? 1u : 0u, counted >= 8 ? 1u : 0u};
+            const uint32_t now[12] = {restarts, kept, wide_2d ? 1u : 0u, narrowed ? 1u : 0u, changed ? 1u : 0u, masks,
+                                      fills, before_post >= 8 ? 1u : 0u, counted >= 8 ? 1u : 0u, left ? 1u : 0u,
+                                      right ? 1u : 0u, covered ? 1u : 0u};
             if (std::memcmp(now, last, sizeof now)) {
                 rt::Log("render: hud trace: frame %llu (%.1f s): 3D after the post processing: %u new views, %u in "
                         "the same view%s%s; 2D left wide over a new view %u%s%s; narrowed %u; classified otherwise "
                         "than with post processing alone %u%s%s; screen masks %u, sides filled %u; 2D left wide "
-                        "before the post processing %u, while counting pixels %u; aspect %.3f (before: %llu frames)",
+                        "before the post processing %u, while counting pixels %u; anchored left %u, right %u, after a "
+                        "cover %u; aspect %.3f (before: %llu frames)",
                         (unsigned long long)frames, (GetTickCount64() - start) / 1000.0, restarts, kept,
                         restart[0] ? ", first: " : "", restart, wide_2d, wide_2d ? ", first: " : "", first, narrowed,
-                        changed, changed ? ", first: " : "", change, masks, fills, before_post, counted, aspect,
+                        changed, changed ? ", first: " : "", change, masks, fills, before_post, counted, left, right, covered, aspect,
                         (unsigned long long)(frames - since));
                 std::memcpy(last, now, sizeof last);
                 since = frames;
@@ -422,6 +436,7 @@ struct HudTrace {
                         (unsigned long long)frames, before_post, counted);
             }
             restarts = kept = wide_2d = narrowed = changed = masks = fills = before_post = counted = 0;
+            left = right = covered = 0;
             first[0] = restart[0] = change[0] = 0;
         }
         old_post = old_view_pending = false;
@@ -3812,6 +3827,72 @@ bool IsScreenMask(const State& s, const Draw& d, const std::vector<float>& verti
 }
 // ---- end screen masks ----
 
+// ---- PC features: widescreen HUD (GitHub #20, experimental; hud_aspect, app/pcmode.h) ----
+// The HUD is narrowed into the 4:3 middle (DrawOne). With hud_aspect wider than 4:3 the elements the game places at
+// the edges of its 4:3 picture move to the edges of a wider box (16:9, or the screen): each narrowed draw of the
+// HUD gets an anchor and is moved by the difference between the box's edge and the 4:3 middle's (its shape and size
+// stay those of the narrowed draw). Measured in single player (FCI_TRACE_HUD=catalog; guest pixels of 640x480, x):
+// - left: radar 54..182, health/armour panel 44..300 with its digits and icons, stance 132..178, breath and feral
+//   bars under it (58..160, y 432..442); the message column at the top left (hints, objectives, "You picked up",
+//   "Saving..."): text from x 46, wrapped near x 300, drawn in pieces (a draw per font page: button glyphs and
+//   weapon icons in a line are draws of their own, the text after them another one);
+// - right: ammunition panel 470..596 (both lines with akimbo), the icon at the top right 560..592;
+// - centre: compass 228..408 and its marker, crosshair, damage indicator (one draw 156..486), the pickup icons at the
+//   bottom (214..404), dialogue boxes and menus.
+// Rule (per draw, its box): wholly inside the message column's area (x 36..330, y 70..200; the catalog has nothing
+// centred there): left; symmetric about x 320 (within 16): centre; wholly left of x 330 with its centre left of
+// x 213: left; wholly right of x 310 with its centre right of x 427: right; else centre. A draw that starts the
+// message column (x 40..56, in the upper half) marks its rows; the other pieces of those rows (their middle in such a
+// row, starting left of x 320) keep its anchor, also where their own box would say centre ("Use the [<] to" at
+// 198..298 and its glyph at 256..280), and in the next frame (a block drawn in another order). No draw of the HUD
+// holds parts of different anchors (the damage indicator is one symmetric draw). A text line never jumps: the
+// message column's lines start at x 46 and wrap before the middle; the centred texts are those of dialogue boxes and
+// menus, after their dark cover. Left as before (centre): the whole frame while a screen mask is up
+// (binoculars, scopes; this frame or the last), everything after a dark cover of the screen in the HUD (the pause
+// menu's and dialogue boxes' dimming, the fade from black), split screen (a view narrower than the screen) and any
+// level that is not one of the story's (multiplayer maps, the map editor: kernel::StoryLevel).
+enum class HudAnchor : uint8_t { kCentre, kLeft, kRight };
+struct HudLayout {
+    struct Row {
+        float top, bottom;
+    };
+    Row now[16] = {}, last[16] = {};
+    int n_now = 0, n_last = 0;
+    bool menu = false;  // a dark cover of the screen this frame: from there on as before
+    void Frame() {  // Present
+        std::copy(now, now + n_now, last);
+        n_last = n_now, n_now = 0;
+        menu = false;
+    }
+    // (button glyphs and weapon icons are taller than the text around them: their middle lies in the row)
+    bool InRow(float top, float bottom) const {
+        const float middle = (top + bottom) * 0.5f;
+        auto in = [&](const Row& r) {
+            return middle >= r.top - 2.0f && middle <= r.bottom + 2.0f && bottom - top <= 40.0f;
+        };
+        for (int i = 0; i < n_now; i++)
+            if (in(now[i])) return true;
+        for (int i = 0; i < n_last; i++)
+            if (in(last[i])) return true;
+        return false;
+    }
+    HudAnchor Of(float lo, float top, float hi, float bottom) {
+        const float cx = (lo + hi) * 0.5f;
+        // the message column: its area (nothing centred lies wholly inside it), and the rows of its lines
+        if (lo >= 36.0f && hi <= 330.0f && top >= 70.0f && bottom <= 200.0f) return HudAnchor::kLeft;
+        if (lo < 320.0f && lo >= 36.0f && InRow(top, bottom)) return HudAnchor::kLeft;
+        if (std::fabs(cx - 320.0f) <= 16.0f) return HudAnchor::kCentre;
+        if (hi <= 330.0f && cx < 213.0f) {
+            if (lo >= 40.0f && lo <= 56.0f && bottom <= 240.0f && n_now < 16) now[n_now++] = {top, bottom};
+            return HudAnchor::kLeft;
+        }
+        if (lo >= 310.0f && cx > 427.0f) return HudAnchor::kRight;
+        return HudAnchor::kCentre;
+    }
+};
+HudLayout g_hud_layout;
+// ---- end widescreen HUD ----
+
 }  // namespace
 
 // performance: the draw's shaders, constant buffers and samplers through the state cache (the textures always: binding
@@ -4090,6 +4171,8 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     vc.hud[0] = 1.0f, vc.hud[1] = 0.0f, vc.hud[2] = 1.0f, vc.hud[3] = 0.0f;
     bool narrowed = false;
     const float* hud_view = nullptr;  // the HUD of a quarter view: narrowed about that view's centre (its viewport)
+    HudAnchor anchor = HudAnchor::kCentre;  // widescreen HUD (GitHub #20): where a narrowed draw of the HUD sits
+    float hud_shift = 0.0f;                 // and by how much it moved from the 4:3 middle (guest pixels of the target)
     bool screen_mask = false;  // screen masks (binoculars, scopes): narrowed, not cut to the 4:3 middle
     int mask_sides = 0;  // and its sides to fill (bit 0 left, 1 right): where the mask ends, the slice of it to show
     float mask_fill[2][2] = {};
@@ -4184,6 +4267,16 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             auto clip_full = [](float a, float b) { return a <= -0.99f && b >= 0.99f && b - a <= 2.5f; };
             if (d.count <= 6 && clip_full(lo, hi) && clip_full(top, bottom)) across = covers = true;
             const bool hud_like = !(covers || (across && d.count <= 6));
+            // ---- widescreen HUD (GitHub #20): a dark cover of the screen in the HUD (the dimming under the pause menu
+            // and dialogue boxes, the fade from black): what follows in this frame is left as before ----
+            if (covers && g_frame_3d && g_post_3d && !g_hud_layout.menu && (d.enabled & (1u << 3)) &&
+                s.Reg(SET_BLEND_ENABLE) && s.Reg(SET_BLEND_FUNC_SFACTOR) == 0x302 &&
+                s.Reg(SET_BLEND_FUNC_DFACTOR) == 0x303 && pcmode::HudWiden() > 1.0001f) {
+                const size_t diffuse = 4 * std::popcount(d.enabled & ((1u << 3) - 1));
+                if (vertices.size() >= diffuse + 3 && vertices[diffuse] <= 0.15f && vertices[diffuse + 1] <= 0.15f &&
+                    vertices[diffuse + 2] <= 0.15f)
+                    g_hud_layout.menu = true;
+            }
             old_narrowed = (g_frame_3d && g_hud_trace.old_post && hud_like) ||
                            (video_frame && !g_frame_3d && !covers);  // diagnostics: FCI_TRACE_HUD=watch
             // ---- the HUD without post processing (GitHub #17, swimming) ----
@@ -4301,6 +4394,19 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                         }
                     }
                 // ---- end the HUD of a quarter view ----
+                // ---- widescreen HUD (GitHub #20, above HudLayout): the edge elements at the edges of a wider box ----
+                const float hud_k = std::min(pcmode::HudWiden(), surf.color->wide);
+                if (hud_k > 1.0001f && g_frame_3d && !screen_mask && !hud_view && !video_frame && !g_hud_layout.menu &&
+                    g_masks.n_now == 0 && g_masks.n_last == 0 && g_quarter_count == 0 && !split_view(g_view_3d) &&
+                    kernel::StoryLevel() == 1) {
+                    anchor = g_hud_layout.Of(lo, top, hi, bottom);
+                    if (anchor != HudAnchor::kCentre) {
+                        hud_shift = surf.width * 0.5f * (hud_k - 1.0f) / surf.color->wide;
+                        if (anchor == HudAnchor::kLeft) hud_shift = -hud_shift;
+                        vc.hud[1] += hud_shift;
+                    }
+                }
+                // ---- end widescreen HUD ----
                 // before this frame's video: 2D beside where the video went last frame is drawn again after it.
                 // Per triangle of a list (one draw may hold a glyph above and one below the video), else the box
                 if (video_frame && !g_frame_video && !g_replaying && !across && g_before_video.size() < 64) {
@@ -4337,6 +4443,9 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         const bool traced = g_hud_trace.frame == 1;
         const bool left_wide = g_hud_trace.watch && two_d && !narrowed && !g_post_3d && g_hud_trace.restarts;
         if (g_hud_trace.watch && narrowed) g_hud_trace.narrowed++;
+        if (g_hud_trace.watch && anchor == HudAnchor::kLeft) g_hud_trace.left++;  // widescreen HUD (GitHub #20)
+        if (g_hud_trace.watch && anchor == HudAnchor::kRight) g_hud_trace.right++;
+        if (g_hud_trace.watch && narrowed && g_hud_layout.menu) g_hud_trace.covered++;
         if (g_hud_trace.watch && two_d && !narrowed && !g_post_3d && !g_hud_trace.restarts) {
             g_hud_trace.before_post++;
             // each kind once (shaders, depth test, vertices at w = 1 or not): the view's own 2D
@@ -4361,6 +4470,70 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                         s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3);
             }
         }
+        if (g_hud_trace.catalog && two_d && g_post_3d && g_hud_trace.catalogued < 6000) {
+            // FCI_TRACE_HUD=catalog: each kind once, with its pieces side by side (GitHub #20)
+            const std::vector<float>& v = kelvin::Vertices(d);
+            float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+            for (size_t i = 0; i + 4 <= v.size(); i += d.stride) {
+                x0 = std::min(x0, v[i]), x1 = std::max(x1, v[i]);
+                y0 = std::min(y0, v[i + 1]), y1 = std::max(y1, v[i + 1]);
+            }
+            const uint32_t tex = mask_texture ? mask_desc.address : 0;
+            const uint64_t kind = Mix(Mix(vsh::Key(s, d.enabled), psh::Key(s, config)),
+                                      Mix(uint64_t(d.count) << 32 ^ tex ^ uint64_t(narrowed) << 63 ^
+                                              uint64_t(anchor) << 60 ^ uint64_t(g_hud_layout.menu) << 59,
+                                          Mix(uint64_t(int64_t(x0) / 8) << 16 ^ uint64_t(int64_t(y0) / 8),
+                                              uint64_t(int64_t(x1) / 8) << 16 ^ uint64_t(int64_t(y1) / 8))));
+            static std::unordered_set<uint64_t> kinds;
+            if (kinds.insert(kind).second) {
+                g_hud_trace.catalogued++;
+                // the pieces: primitives (quads, triangles) by x, merged where less than 24 guest pixels apart
+                const uint32_t per = d.primitive == kQuads ? 4 : d.primitive == kTriangles ? 3 : d.count;
+                std::vector<std::array<float, 4>> prims;
+                for (size_t i = 0; per && i + size_t(per) * d.stride <= v.size(); i += size_t(per) * d.stride) {
+                    std::array<float, 4> b = {1e30f, 1e30f, -1e30f, -1e30f};
+                    for (uint32_t k = 0; k < per; k++) {
+                        const float* p = &v[i + size_t(k) * d.stride];
+                        b[0] = std::min(b[0], p[0]), b[1] = std::min(b[1], p[1]);
+                        b[2] = std::max(b[2], p[0]), b[3] = std::max(b[3], p[1]);
+                    }
+                    prims.push_back(b);
+                }
+                std::sort(prims.begin(), prims.end());
+                std::vector<std::array<float, 4>> pieces;
+                for (const auto& b : prims) {
+                    if (!pieces.empty() && b[0] < pieces.back()[2] + 24.0f) {
+                        auto& q = pieces.back();
+                        q[1] = std::min(q[1], b[1]), q[2] = std::max(q[2], b[2]), q[3] = std::max(q[3], b[3]);
+                    } else pieces.push_back(b);
+                }
+                char text[400] = {};
+                int at = 0;
+                for (size_t i = 0; i < pieces.size() && i < 8 && at < 360; i++)
+                    at += std::snprintf(text + at, sizeof text - at, " [%.0f,%.0f..%.0f,%.0f]", pieces[i][0],
+                                        pieces[i][1], pieces[i][2], pieces[i][3]);
+                if (pieces.size() > 8) std::snprintf(text + at, sizeof text - at, " +%zu", pieces.size() - 8);
+                float colour[4] = {-1, -1, -1, -1};
+                if (d.enabled & (1u << 3)) {
+                    const int diffuse = 4 * std::popcount(d.enabled & ((1u << 3) - 1));
+                    if (v.size() >= size_t(diffuse + 4))
+                        for (int k = 0; k < 4; k++) colour[k] = v[diffuse + k];
+                }
+                rt::Log("render: hud catalog: frame %llu (%.1f s) %s%s box %.1f,%.1f..%.1f,%.1f count %u prim %u "
+                        "tex %08X %ux%u fmt %02X hash %016llX%s blend %u %X/%X colour %.2f %.2f %.2f %.2f vs %016llX "
+                        "ps %016llX anchor %c%s pieces %zu:%s",
+                        (unsigned long long)g_hud_trace.frames, (GetTickCount64() - g_hud_trace.start) / 1000.0,
+                        narrowed ? "narrowed" : "wide", screen_mask ? " mask" : "", x0, y0, x1, y1, d.count,
+                        d.primitive, tex, mask_texture ? mask_desc.width : 0, mask_texture ? mask_desc.height : 0,
+                        mask_texture ? mask_desc.color : 0,
+                        mask_texture ? (unsigned long long)mask_texture->hash : 0ull,
+                        mask_texture && mask_texture->prompt_page ? " prompts" : "", s.Reg(SET_BLEND_ENABLE),
+                        s.Reg(SET_BLEND_FUNC_SFACTOR), s.Reg(SET_BLEND_FUNC_DFACTOR), colour[0], colour[1],
+                        colour[2], colour[3], (unsigned long long)vsh::Key(s, d.enabled),
+                        (unsigned long long)psh::Key(s, config), "CLR"[int(anchor)],
+                        g_hud_layout.menu ? " covered" : "", pieces.size(), text);
+            }
+        }
         if (g_hud_trace.watch && over_3d && g_counting) g_hud_trace.counted++;
         if (g_hud_trace.watch && screen_mask)
             g_hud_trace.masks++, g_hud_trace.fills += std::popcount(unsigned(mask_sides));
@@ -4377,7 +4550,8 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                 rt::Log("render: hud trace: draw %llu target %08X %ux%u wide %.3f w %d f3d %d post %d counting %d "
                         "narrowed %d "
                         "screen mask %d sides %d count %u stride %u box %.1f,%.1f..%.1f,%.1f w0 %g mask %X blend %u "
-                        "depth test %u write %u vs %016llX ps %016llX mode %u c58 %g %g c59 %g %g",
+                        "depth test %u write %u vs %016llX ps %016llX mode %u c58 %g %g c59 %g %g tex %08X %ux%u "
+                        "prim %u anchor %c%s",
                         (unsigned long long)g_draws, surf.color ? surf.color->address : 0, surf.width, surf.height,
                         surf.color ? surf.color->wide : 0.0f, int(vc.screen[3] != 0), g_frame_3d, g_post_3d,
                         g_counting, narrowed, screen_mask, mask_sides, d.count, d.stride, lo, top, hi, bottom,
@@ -4385,7 +4559,9 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
                         s.Reg(SET_BLEND_ENABLE), s.Reg(SET_DEPTH_TEST_ENABLE), s.Reg(SET_DEPTH_MASK),
                         (unsigned long long)vsh::Key(s, d.enabled), (unsigned long long)psh::Key(s, config),
                         s.Reg(SET_TRANSFORM_EXECUTION_MODE) & 3, s.constants[58][0], s.constants[58][1],
-                        s.constants[59][0], s.constants[59][1]);
+                        s.constants[59][0], s.constants[59][1], mask_texture ? mask_desc.address : 0u,
+                        mask_texture ? mask_desc.width : 0u, mask_texture ? mask_desc.height : 0u, d.primitive,
+                        "CLR"[int(anchor)], g_hud_layout.menu ? " covered" : "");
             if (changed && !g_hud_trace.changed++)
                 std::snprintf(g_hud_trace.change, sizeof g_hud_trace.change,
                               "%s, target %08X box %.1f,%.1f..%.1f,%.1f count %u vs %016llX ps %016llX",
@@ -4584,8 +4760,10 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             scissor.left = std::max(scissor.left, LONG(std::floor((x - hw) * to_host)));
             scissor.right = std::min(scissor.right, LONG(std::ceil((x + hw) * to_host)));
         }
-        scissor.left = LONG(center + (scissor.left - center) * vc.hud[0] + 0.5f);
-        scissor.right = LONG(center + (scissor.right - center) * vc.hud[0] + 0.5f);
+        // (widescreen HUD, GitHub #20: an anchored draw's 4:3 middle moves with it, to the box's edge)
+        const float shift = hud_shift * float(HostWidthOf(surf.width, surf.scale, surf.wide)) / float(surf.width);
+        scissor.left = LONG(center + (scissor.left - center) * vc.hud[0] + shift + 0.5f);
+        scissor.right = LONG(center + (scissor.right - center) * vc.hud[0] + shift + 0.5f);
     }
     g_context->RSSetScissorRects(1, &scissor);
 
@@ -5296,6 +5474,7 @@ void Present(uint32_t front) {
     g_post_3d = false;
     g_quarter_count = 0;  // the HUD of a quarter view (DrawOne)
     g_masks.Frame();  // PC features: screen masks
+    g_hud_layout.Frame();  // PC features: widescreen HUD (GitHub #20)
     AoPresent();  // ambient occlusion
     g_water_presents++;  // PC water
     if (g_gpu_timing.enabled) g_gpu_timing.Begin(Pass::kPost);  // performance: FCI_GPU_TIMING

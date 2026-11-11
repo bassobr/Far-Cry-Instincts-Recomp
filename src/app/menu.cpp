@@ -269,6 +269,11 @@ const Setting kSettings[] = {
     {"fmv_scale", "FMV SCALE", "fill",
      [] { return Choices{{"fill", "FILL (DEFAULT)"}, {"4:3", "4:3 (XBOX)"}}; }, When::Restart,
      "Videos (intro, title, menus): fill the wide screen without cropping the picture, or 4:3 as on the Xbox."},
+    // widescreen HUD (GitHub #20)
+    {"hud_aspect", "HUD LAYOUT (EXPERIMENTAL)", "4:3",
+     [] { return Choices{{"4:3", "4:3 (CONSOLE)"}, {"16:9", "16:9"}, {"auto", "AUTO (SCREEN EDGES)"}}; }, When::Live,
+     "Experimental, single player only: radar, health and ammo at the edges of a 16:9 box or of the screen instead of "
+     "the 4:3 middle. The compass, the crosshair, texts and menus stay in the middle."},
     {"colour_blind", "COLOUR BLIND MODE", "0",
      [] { return Choices{{"0", "OFF"}, {"1", "PROTANOPIA"}, {"2", "DEUTERANOPIA"}, {"3", "TRITANOPIA"}}; },
      When::Restart, "Adjusts the colours for red, green or blue colour blindness (SDR and HDR10)."},
@@ -345,7 +350,8 @@ const Setting kSettings[] = {
     {"texture_replace", "TEXTURE REPLACEMENT", "0", OnOff, When::Restart, "Use the images in textures\\replace."},
 };
 const char* const kSections[] = {"DISPLAY", "GRAPHICS", "GENERAL"};
-constexpr int kSectionStart[] = {0, 14, 26};  // first setting of each section in kSettings
+// the first setting of each section (by key: counted indices went stale as rows were added)
+const char* const kSectionFirst[] = {"display_mode", "msaa", "skip_intro"};
 
 // mouse look (hle/pc_input.cpp, hle/mouse_look.cpp)
 Choices OffOr(Choices c, const char* off) {
@@ -488,6 +494,7 @@ void ApplyLive(const Setting& s) {
     else if (key == "fps_counter") gpu::fps::SetEnabled(settings::Bool("fps_counter", false));
     else if (key == "frame_queue") xdk::SetFrameQueue(settings::Int("frame_queue", 1));  // performance
     else if (key == "speech_volume") xdk::SetSpeechVolume(settings::Float("speech_volume", 0));  // GitHub #25
+    else if (key == "hud_aspect") pcmode::SetHudAspect(settings::String("hud_aspect", "4:3").c_str());  // GitHub #20
     else if (key == "smaa") gpu::present::SetSmaa(settings::Int("smaa", 1) != 0);
     else if (key == "lod_distance") pcmode::SetLodDistance(settings::Float("lod_distance", pcmode::kDefaultLodDistance));  // PC level of detail
     else if (key == "view_distance") pcmode::SetViewDistance(settings::Float("view_distance", pcmode::kDefaultViewDistance));
@@ -711,7 +718,7 @@ void SettingRow(const Setting& s) {
 void DrawSettings() {
     for (size_t i = 0; i < std::size(kSettings); i++) {
         for (int k = 0; k < int(std::size(kSections)); k++)
-            if (kSectionStart[k] == int(i)) Section(kSections[k]);
+            if (!std::strcmp(kSectionFirst[k], kSettings[i].key)) Section(kSections[k]);
         FocusFirst();
         SettingRow(kSettings[i]);
     }

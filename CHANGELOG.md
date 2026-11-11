@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.10 (2026-11-11)
+
+- **Widescreen HUD (experimental, #20):** new setting **HUD LAYOUT (EXPERIMENTAL)** in the F10 menu (Display) and
+  `hud_aspect` in `FarCryInstincts.ini` (`4:3` = as before, the default; `16:9`; `auto` = the screen's edges; applied
+  immediately). With `16:9` or `auto` the HUD elements the game places at the edges of its 4:3 picture move out to the
+  edges of a 16:9 box or of the screen: radar, health/armour, stance, breath and feral bars and the messages at the top
+  left (hints, objectives, pickups, "Saving...") to the left, ammunition and the icon at the top right to the right.
+  The compass, crosshair, damage indicator, pickup icons, dialogue boxes and menus stay in the middle, and no element
+  changes its size or shape. Single player only: multiplayer, split screen and map-editor maps keep the 4:3 HUD, and
+  so does the whole HUD while binoculars or a scope are up. On a 21:9 or 32:9 screen `16:9` keeps the elements closer
+  to the middle than `auto`.
+- Keyboard (#38): number keys 1-4 for the D-pad and R for reload are now extra default keys; the old keys and your own
+  ini bindings stay.
+- The game code is rebuilt once on the first start after updating; saves carry over.
+
 ## 0.1.9 (2026-11-10)
 
 - Speech volume (#25): new setting **SPEECH VOLUME** in the F10 menu (0 dB = console, +3, +6) and `speech_volume` in

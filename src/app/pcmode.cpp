@@ -108,6 +108,35 @@ const Mode& Get() {
 
 float Aspect() { return Get().aspect; }
 float Widen() { return Get().aspect / kConsole; }
+// ---- widescreen HUD (GitHub #20) ----
+namespace {
+std::atomic<float> g_hud_widen{0};  // 0: not read yet
+float HudWidenOf(const char* value) {
+    std::string v = value ? value : "";
+    for (char& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    v.erase(0, v.find_first_not_of(" \t"));
+    v.erase(v.find_last_not_of(" \t") + 1);
+    // auto: the screen's shape (the 3D view's); else that shape, never wider than the screen (clamped)
+    float aspect = v == "auto" || v == "screen" ? Aspect() : v.empty() ? kConsole : ParseAspect(v);
+    return std::clamp(aspect / kConsole, 1.0f, Widen());
+}
+}  // namespace
+float HudWiden() {
+    float k = g_hud_widen.load(std::memory_order_relaxed);
+    if (k > 0) return k;
+    const std::string v = settings::String("hud_aspect", "4:3");
+    k = HudWidenOf(v.c_str());
+    rt::Log("pcmode: hud_aspect %s: the HUD's edge elements at x%.3f of the 4:3 width (screen x%.3f)%s", v.c_str(), k,
+            Widen(), k > 1.0f ? " (experimental)" : "");
+    g_hud_widen.store(k, std::memory_order_relaxed);
+    return k;
+}
+void SetHudAspect(const char* value) {
+    const float k = HudWidenOf(value);
+    g_hud_widen.store(k, std::memory_order_relaxed);
+    rt::Log("pcmode: hud_aspect %s: the HUD's edge elements at x%.3f of the 4:3 width (screen x%.3f)", value, k, Widen());
+}
+// ---- end widescreen HUD ----
 // ---- settings menu: fov and fps_limit change while running (SetFovScale, SetFpsLimit) ----
 namespace {
 std::atomic<float> g_fov{0};  // 0: as read at start

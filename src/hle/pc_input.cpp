@@ -112,12 +112,13 @@ struct Target {
     const char* keys;  // the default binding (the fixed map of earlier versions)
 };
 constexpr Target kTargets[] = {
-    {"up", kDpadUp, -1, -1, 0, "up"},           {"down", kDpadDown, -1, -1, 0, "down"},
-    {"left", kDpadLeft, -1, -1, 0, "left"},     {"right", kDpadRight, -1, -1, 0, "right"},
+    // number keys 1-4 for the D-pad and R for X beside the old keys (GitHub #38)
+    {"up", kDpadUp, -1, -1, 0, "up, 4"},        {"down", kDpadDown, -1, -1, 0, "down, 3"},
+    {"left", kDpadLeft, -1, -1, 0, "left, 2"},  {"right", kDpadRight, -1, -1, 0, "right, 1"},
     {"start", kStart, -1, -1, 0, "enter"},      {"back", kBack, -1, -1, 0, "escape"},
     {"lthumb", kLeftThumb, -1, -1, 0, "lshift"}, {"rthumb", kRightThumb, -1, -1, 0, "v"},
     {"a", 0, kA, -1, 0, "space"},               {"b", 0, kB, -1, 0, "c"},
-    {"x", 0, kX, -1, 0, "e"},                   {"y", 0, kY, -1, 0, "q"},
+    {"x", 0, kX, -1, 0, "e, r"},                {"y", 0, kY, -1, 0, "q"},
     {"white", 0, kWhite, -1, 0, "f"},           {"black", 0, kBlack, -1, 0, "g"},
     {"lt", 0, kLeftTrigger, -1, 0, "mouse2"},   {"rt", 0, kRightTrigger, -1, 0, "mouse1"},
     {"lup", 0, -1, 1, 1, "w"},                  {"ldown", 0, -1, 1, -1, "s"},

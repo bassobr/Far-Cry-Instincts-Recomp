@@ -86,6 +86,9 @@ bool ReadTitleFile(const std::string& guest, std::vector<uint8_t>* bytes);
 // line of speech the game plays) and by no other read since
 bool IsSpeechData(uint32_t va);
 // ---- end speech volume ----
+// ---- widescreen HUD (GitHub #20): the level loaded last (levels\<name>\<name>.dat read) is one of the story's
+// (00_Training .. 13_Black_Forest): 1, another (multiplayer map, map editor): 0, none loaded yet: -1 ----
+int StoryLevel();
 uint32_t DataAddress(uint32_t ordinal);
 // performance: QueryPerformanceCounter ticks the calling thread spent in kernel calls (blocking waits included),
 // total since start

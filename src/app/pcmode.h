@@ -32,6 +32,13 @@ constexpr int kFpsAuto = -2;  // SetFpsLimit: follow the display
 void SetFovScale(float scale);
 void SetFpsLimit(int limit);
 // ---- end settings menu ----
+// ---- widescreen HUD (GitHub #20, experimental): hud_aspect = 4:3 (default) | 16:9 | 16:10 | 21:9 | auto | <w>:<h> ----
+// The shape of the box whose left and right edges the HUD's edge elements (radar, health, ammo) sit at, as a
+// multiple of the console's 4:3 width: 1 = the 4:3 middle (as before), at most Widen() (the screen). gpu/renderer.cpp
+float HudWiden();
+// settings menu: takes effect with the next frame (value as in the ini)
+void SetHudAspect(const char* value);
+// ---- end widescreen HUD ----
 bool Vsync();
 // ---- PC shadows (xdk/shadows.cpp, gpu/renderer.cpp) ----
 // the sun's shadow radius as a multiple of the game's (1 = as on the console)

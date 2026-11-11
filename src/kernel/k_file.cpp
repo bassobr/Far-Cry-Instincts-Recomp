@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>  // widescreen HUD (GitHub #20)
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -372,6 +373,27 @@ uint32_t OpenOnDisc(const std::string& guest, const Where& w, uint32_t handle_ou
     return X_STATUS_SUCCESS;
 }
 
+// ---- widescreen HUD (GitHub #20): whether the level loaded is one of the story's ----
+// Every level load reads levels\<name>\<name>.dat, whichever way it was started (menus, a relaunch between levels,
+// FCI_START_LEVEL). The story's levels are 00_Training .. 13_Black_Forest (two digits and '_'); multiplayer maps
+// (M01_MercyCreek ...), the map editor's templates (MET_*) and anything else are not.
+std::atomic<int> g_story_level{-1};  // -1 no level loaded yet, 0 not a story level, 1 a story level
+void NoteLevelFile(const std::string& guest) {
+    std::string g = Lower(guest);
+    const size_t at = g.rfind("\\levels\\");
+    if (at == std::string::npos) return;
+    const std::string rest = g.substr(at + 8);
+    const size_t slash = rest.find('\\');
+    if (slash == std::string::npos || slash == 0) return;
+    const std::string dir = rest.substr(0, slash);
+    if (rest.substr(slash + 1) != dir + ".dat") return;
+    const bool story = dir.size() > 3 && std::isdigit(static_cast<unsigned char>(dir[0])) &&
+                       std::isdigit(static_cast<unsigned char>(dir[1])) && dir[2] == '_';
+    if (g_story_level.exchange(story ? 1 : 0) != (story ? 1 : 0))
+        rt::Log("file: level %s loads (%s)", dir.c_str(), story ? "a story level" : "not a story level");
+}
+// ---- end widescreen HUD ----
+
 uint32_t OpenFile(uint32_t handle_out, uint32_t access, uint32_t attributes, uint32_t iosb, uint32_t disposition,
                   uint32_t options) {
     std::string guest = ObjectName(attributes);
@@ -381,6 +403,7 @@ uint32_t OpenFile(uint32_t handle_out, uint32_t access, uint32_t attributes, uin
         SetIoStatus(iosb, X_STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return X_STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    NoteLevelFile(guest);  // widescreen HUD (GitHub #20)
     fs::path host = w.host;
     bool read_only = w.read_only, device_root = w.device_root;
     // FCI_TEST_VIDEO=<file.bik> (diagnostics, fmv_scale): the first boot video plays this one from Videos instead
@@ -1166,5 +1189,7 @@ bool IsSpeechData(uint32_t va) {
     return it != g_speech.begin() && std::prev(it)->second > va;
 }
 // ---- end speech volume ----
+
+int StoryLevel() { return g_story_level.load(std::memory_order_relaxed); }  // widescreen HUD (GitHub #20)
 
 }  // namespace kernel

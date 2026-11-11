@@ -27,8 +27,8 @@ the other open-source projects listed under [Credits](#credits).
 - Render resolution scaling (default: the output's height), MSAA up to 8x, SMAA 1x, anisotropic filtering up to 16x
 - Higher-resolution shadow maps (up to 8192x8192), longer sun shadow range, soft or console-sharp shadow filtering
 - Screen-space ambient occlusion: SSAO or GTAO, at full or half resolution
-- Widescreen (Hor+) with the HUD kept in the 4:3 centre, adjustable field of view, full-screen videos fitted to the
-  width
+- Widescreen (Hor+) with the HUD kept in the 4:3 centre, or, experimentally, with its edge elements at the edges of
+  the screen (`hud_aspect`), adjustable field of view, full-screen videos fitted to the width
 - Frame rates up to 120 fps (default: the display's refresh rate), with the parts of the game logic that depended
   on the Xbox's 30 fps decoupled (see [Frame rate and game logic](#frame-rate-and-game-logic)), optional vsync,
   frames-ahead setting
@@ -208,7 +208,7 @@ there.
 | `aniso` | `16` | Anisotropic filtering, 1–16 (1 = off) |
 | `shadow_scale` | `2` (Steam Deck `4`) | Shadow map resolution, 1–8 times the console's |
 | `shadow_distance` | `1` | Sun shadow range, 1–8 times the console's (the map grows with it) |
-| `shadow_cascades` | `off` | With `shadow_distance` 2 or more: the shadows near you get their own map, drawn as on the console at `shadow_scale`, and the far ones continue in the large map (the two maps are drawn on alternate frames). Switches at once in the F10 menu |
+| `shadow_cascades` | `off` | With `shadow_distance` 2 or more: the shadows near you get their own map, drawn as on the console at `shadow_scale`, and the far ones continue in the large map (the two maps are drawn on alternate frames, so the shadow of something moving, such as a barrel you kick, can look shifted for a moment). Switches at once in the F10 menu |
 | `shadow_filter` | `soft` | `soft` or `sharp` (as the console) |
 | `ao` | `ssao` (Steam Deck `gtao`) | Ambient occlusion: `off`, `ssao`, `gtao` |
 | `ao_strength` | `1` | 0–4 |
@@ -232,6 +232,7 @@ there.
 | `hdr_peak` | (display) | Peak brightness in nits (100–10000); default: what Windows reports, else 1000 |
 | `hdr_boost` | `0` | 0–1, stretches highlights towards `hdr_peak` |
 | `fmv_scale` | `fill` | Videos on widescreen: `fill` (as large as fits without cropping) or `4:3` |
+| `hud_aspect` | `4:3` | **Experimental** (#20): where the HUD sits on widescreen. `4:3` = in the 4:3 middle, as on the Xbox; `16:9` = the edge elements at the edges of a 16:9 box; `auto` = at the edges of the screen. Radar, health/armour, stance, the breath and feral bars and the messages at the top left move left; ammo and the icon at the top right move right. Compass, crosshair, damage indicator, pickup icons, dialogue boxes and menus stay in the middle; nothing changes size or shape. Story levels only: multiplayer, split screen and map-editor maps keep the 4:3 HUD, and so does the whole HUD while binoculars or a scope are up. F10 menu *HUD LAYOUT (EXPERIMENTAL)*, applied at once. Elements keep the game's own margin from the edge; an element a level draws differently may stay in the middle |
 | `colour_blind` | `0` | `0` off, `1` protanopia, `2` deuteranopia, `3` tritanopia |
 | `fps_counter` | `0` | `1` = show frame rate and frame times |
 | `skip_intro` | `0` | `1` = skip the three logo videos at start (Ubisoft, Crytek, Far Cry Instincts) and the trailer after "Quit to main menu" (any button ends it otherwise); not the story's cutscenes |
@@ -259,7 +260,10 @@ x y white black lt rt start back lthumb rthumb up down left right`; for the keyb
 ldown lleft lright rup rdown rleft rright`. Keys are named like `space`, `lshift`, `f1`, `num0`, `mouse1`–`mouse5`,
 `wheelup`, `wheeldown` or a virtual key code such as `0x41`; controller buttons by their position on an Xbox pad
 (`a b x y lb rb lt rt start back ls rs up down left right guide misc1 touchpad`, paddles `lpaddle1` ...), and
-PlayStation names (`cross circle square triangle l1 r1 ...`) work too. Example:
+PlayStation names (`cross circle square triangle l1 r1 ...`) work too. Default keyboard: `a` = space, `b` = c,
+`x` = e and r, `y` = q, `white` = f, `black` = g, `lt` = right mouse button, `rt` = left mouse button, `start` =
+enter, `back` = escape, `lthumb` = left shift, `rthumb` = v, D-pad = arrow keys and 1 (right), 2 (left), 3 (down),
+4 (up), left stick = WASD, right stick = IJKL (and the mouse). Example:
 
 ```
 # FarCryInstincts.ini
