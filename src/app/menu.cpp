@@ -298,7 +298,7 @@ const Setting kSettings[] = {
     {"shadow_cascades", "SHADOW CASCADES", "off",
      [] { return Choices{{"off", "OFF (DEFAULT)"}, {"on", "ON"}}; }, When::Live,
      "With shadow distance 2x or more (set at start): the console's shadows near you in a map of their own (sharp, "
-     "every caster), the far ones as before; the game draws near and far on alternate frames. Switches at once."},
+     "every caster), the far ones as before; the game draws both in every frame. Switches at once."},
     {"shadow_filter", "SHADOW FILTER", "soft",
      [] { return Choices{{"soft", "SOFT (DEFAULT)"}, {"sharp", "SHARP (CONSOLE)"}}; }, When::Restart,
      "Soft shadow edges, or the NV2A's 2x2 filter."},

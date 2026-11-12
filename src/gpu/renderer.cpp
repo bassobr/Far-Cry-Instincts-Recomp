@@ -860,15 +860,15 @@ DepthTarget* GetDepth(uint32_t address, uint32_t width, uint32_t height, bool z1
 // With shadow_distance k > 1 the sun's one shadow map covers k times the console's square (xdk/shadows.cpp). That
 // is coarser up close, and the game itself draws less into it: it picks its casters and their level of detail by
 // their size in the map, so small ones (ferns) vanish and palm crowns get their low detail meshes, the shadows near
-// the player no longer match what casts them (GitHub #16). With cascades the game's shadow pass alternates
-// (xdk/shadows.cpp; a second pass in the same frame draws nothing, the game marks what it drew this frame): one
-// frame with the console's radius, drawn into a near map of its own (shadow_scale x 1024), the next with k times it
-// into the shadow map as before. Each map is kept until its next pass. The receivers' pixel shaders (psh.cpp) take
-// the near map where it covers them, fading into the far one over its outer tenth (no seam); their coordinates in the
-// other map (the one the game did not draw this frame) come from the matrix of the two sun cameras (both
-// orthographic along the sun: an affine map of texture coordinates and depth). Each map has the game's own camera,
-// snapping (whole texels, no shimmer) and depth range, so the polygon offset is the game's in each; what moves is
-// one frame old in the other map. The game marks its passes and sends the matrix in push buffer order
+// the player no longer match what casts them (GitHub #16). With cascades the game's shadow pass runs twice per frame
+// (xdk/shadows.cpp): first with the console's radius, drawn into a near map of its own (shadow_scale x 1024), then
+// with k times it into the shadow map as before. (Until 0.1.10 the passes alternated, one per frame, and each map was
+// kept until its next pass: what moved was a frame old in the other map - FCI_CASCADE_ALTERNATE=1.) The receivers'
+// pixel shaders (psh.cpp) take the near map where it covers them, fading into the far one over its outer tenth (no
+// seam); their coordinates in the other map (the near one: the receivers' coordinates are the last pass's) come from
+// the matrix of the two sun cameras (both orthographic along the sun: an affine map of texture coordinates and
+// depth). Each map has the game's own camera, snapping (whole texels, no shimmer) and depth range, so the polygon
+// offset is the game's in each. The game marks its passes and sends the matrix in push buffer order
 // (BeginSunShadowPass, EndSunShadowPass).
 // Both maps are the renderer's own, per view (split screen: one pair each): every sun pass draws into a host target at
 // the guest map's address + (1 + 2 view + cascade) x kCascadeTag, never into the guest map's own host target, and the
@@ -5550,7 +5550,7 @@ void SetShadowCascades(bool on) {
         rt::Log("render: shadow cascades %s (no effect: they need shadow_distance 2 or more at the start)", on ? "on" : "off");
     else
         rt::Log("render: shadow cascades %s: near map %ux%u over the console's square (the game's shadow pass "
-                "alternating near and far)", on ? "on" : "off", 1024 * g_q.near_scale, 1024 * g_q.near_scale);
+                "twice per frame: near and far)", on ? "on" : "off", 1024 * g_q.near_scale, 1024 * g_q.near_scale);
 }
 void DropSunShadows() {
     for (std::atomic<int>& u : g_sun_only_passes) u.store(kSunOnlyPasses, std::memory_order_relaxed);

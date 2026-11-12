@@ -152,6 +152,17 @@ void InitLaunchData() {
         rt::Log("kernel: FCI_START_LEVEL '%s' has no usable level name", level.c_str());
         return;
     }
+    // The map editor templates (Levels\MET_*) are no level of their own: the start and respawn points come from
+    // the user map built on them (map editor, ige.xbe). Alone the level start finds none (0x0004D600: list
+    // [level+0x24] empty, 0x000D7BD0 fails, position 0,0,0), and 0x004768A0 reads the sector of a null pointer
+    // (0x00476901, address 0xA1) - the same code on the console. The menus never offer them (the level list skips
+    // "MET_" at 0x0004AA39/0x0004ABDF), so only this switch could get there: the game boots to its menus instead.
+    if (_strnicmp(level.c_str(), "MET_", 4) == 0) {
+        rt::Log("kernel: FCI_START_LEVEL '%s' is a map editor template (no start points without a user map, the "
+                "game would crash at the level start): ignored, normal boot",
+                level.c_str());
+        return;
+    }
     std::string cmdline = "-map " + level;
     if (players >= 2 && players <= 4) cmdline += " -lpc" + std::to_string(players);
     uint32_t page = AllocPage();

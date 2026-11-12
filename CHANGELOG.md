@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.11 (2026-11-12)
+
+- **Shadow cascades: moving objects (#16):** with `shadow_cascades = on`, the shadows on and of things that move (a
+  boat or car you drive, characters, pushed objects) no longer jump between two positions every frame. The game keeps
+  memory for only one shadow map per frame, so the near and the far map were drawn in turns, one per frame, and
+  whatever moved was a frame old in the map that was not redrawn; a driving boat's front cover shaded itself dark every
+  other frame. Both maps are now drawn in every frame. This costs some speed: about 0.5 ms per frame on a desktop GPU,
+  and on the Steam Deck (Shadow Distance 8x) about 1.5 ms while driving and 3 ms standing, so there cascades are best
+  left off. Shadow Cascades stays off by default, and on the Deck the default Shadow Distance doesn't use them.
+- Fixed a rare crash in the sound code when a level is torn down a few seconds after it started (a restart or level
+  change right after loading); seen once on the Steam Deck.
+- The game code is rebuilt once on the first start after updating (about 1 min on a desktop PC, about 5.5 min on the
+  Steam Deck); saves carry over.
+
 ## 0.1.10 (2026-11-11)
 
 - **Widescreen HUD (experimental, #20):** new setting **HUD LAYOUT (EXPERIMENTAL)** in the F10 menu (Display) and

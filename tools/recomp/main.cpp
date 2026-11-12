@@ -57,9 +57,13 @@ bool LoadHooks(const std::filesystem::path& path) {
         std::string name;
         if (!(ls >> name)) continue;
         auto it = recomp::Symbols().find(name);
-        if (it == recomp::Symbols().end() || !it->second.function || !it->second.address) {
+        if (it == recomp::Symbols().end() || !it->second.function) {
             std::fprintf(stderr, "error: hle.txt names %s, which is no known function\n", name.c_str());
             ok = false;
+            continue;
+        }
+        if (!it->second.address) {  // a symbol at 0: not found in this XBE, the replacement is off
+            recomp::OffHooks().insert(name);
             continue;
         }
         recomp::Hooks()[it->second.address] = name;
@@ -73,7 +77,12 @@ bool LoadConfig(const std::filesystem::path& config) {
     if (!LoadSymbols(config / "symbols.txt")) std::fprintf(stderr, "warning: no %s\n", (config / "symbols.txt").string().c_str());
     LoadSymbols(config / "symbols_fci.txt");
     if (std::filesystem::exists(config / "hle.txt") && !LoadHooks(config / "hle.txt")) return false;
-    std::printf("%zu symbols, %zu host replacements\n", recomp::Symbols().size(), recomp::Hooks().size());
+    std::printf("%zu symbols, %zu host replacements", recomp::Symbols().size(), recomp::Hooks().size());
+    if (!recomp::OffHooks().empty()) {
+        std::printf(", %zu off (address 0):", recomp::OffHooks().size());
+        for (const std::string& name : recomp::OffHooks()) std::printf(" %s", name.c_str());
+    }
+    std::printf("\n");
     return true;
 }
 

@@ -35,8 +35,10 @@ $files = [ordered]@{
     "compiler\config\hle.txt"               = Join-Path $compiler "config\hle.txt"
     "compiler\config\symbols.txt"           = Join-Path $compiler "config\symbols.txt"
     "compiler\config\symbols_fci.txt"       = Join-Path $compiler "config\symbols_fci.txt"
-    "compiler\config\game_code.profdata"    = Join-Path $root "config\game_code.profdata"
 }
+# the PGO profile when the repository has one (without it the first start builds without profile, as CMake does)
+$pgoProfile = Join-Path $root "config\game_code.profdata"
+if (Test-Path -LiteralPath $pgoProfile -PathType Leaf) { $files["compiler\config\game_code.profdata"] = $pgoProfile }
 foreach ($h in Get-ChildItem (Join-Path $compiler "include\freestanding") -File) {
     $files["compiler\include\freestanding\$($h.Name)"] = $h.FullName
 }

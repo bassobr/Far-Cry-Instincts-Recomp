@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 
 namespace recomp {
@@ -49,11 +50,20 @@ inline std::map<std::string, Symbol>& Symbols() {
     return symbols;
 }
 
+// replacements that are off: address 0 above or a symbol at address 0 (not found in this XBE). Their host
+// functions are still declared and exported (the executable builds the same), the game code keeps the original.
+inline std::set<std::string>& OffHooks() {
+    static std::set<std::string> off;
+    return off;
+}
+
 // guest functions replaced by host code: the static ones above and the symbols config/hle.txt names
 inline std::map<uint32_t, std::string>& Hooks() {
     static std::map<uint32_t, std::string> hooks = [] {
         std::map<uint32_t, std::string> h;
-        for (const auto& hook : kHooks) h[hook.address] = hook.name;
+        for (const auto& hook : kHooks)
+            if (hook.address) h[hook.address] = hook.name;
+            else OffHooks().insert(hook.name);
         return h;
     }();
     return hooks;

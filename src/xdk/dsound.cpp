@@ -1029,16 +1029,27 @@ void Start() {
         rt::BindServiceContext(t);
         constexpr int64_t kPumpMs = 250;
         for (;;) {
-            std::vector<Done> done;
             {
                 std::unique_lock<std::recursive_mutex> lock(g_lock);
                 g_done_cv.wait_for(lock, std::chrono::milliseconds(50));
                 if (NowMs() - g_pumped < kPumpMs || g_done.empty()) continue;
-                done.assign(g_done.begin(), g_done.end());
-                g_done.clear();
             }
+            // Each callback leaves the queue only while this context holds the CPU, right before it runs. Taken
+            // earlier (the whole queue, then waiting for the CPU) a stream the title released meanwhile - the level
+            // teardown, when DirectSoundDoWork pauses - found none of its callbacks left to run itself
+            // (FlushStream), was freed, and its callbacks ran afterwards on the title's torn down objects (write at
+            // 0x140 in 0x004B3542 from the callback 0x004B3A57, or at 0).
             rt::AcquireCpu();
-            Run(t->cpu, done);
+            for (;;) {
+                Done d;
+                {
+                    std::lock_guard<std::recursive_mutex> lock(g_lock);
+                    if (g_done.empty() || NowMs() - g_pumped < kPumpMs) break;
+                    d = g_done.front();
+                    g_done.pop_front();
+                }
+                rt::GuestCall(t->cpu, d.callback, {d.context, d.packet_context, d.status});
+            }
             rt::ReleaseCpu();
         }
     }).detach();

@@ -19,14 +19,16 @@
 //
 // Shadow cascades (GitHub #16): the pass picks its casters and their level of detail by their size in the map, so
 // with the square k times larger it leaves out small casters (ferns) and draws palm crowns with their low detail
-// meshes: near the player the shadows no longer match the objects. With shadow_cascades (and k >= 2) the pass
-// alternates per view: one frame with the console's radius, which the renderer draws into a near map of its own,
-// the next with k times it, as before (a second pass in the same frame draws no casters: tried first, the far map
-// stayed empty). After each pass the pass's sun camera (a local of the pass, read where its frame was) gives its
-// view-projection; the renderer gets the map from this pass's texture coordinates to the other map's, drawn the
-// frame before (gpu/renderer.cpp, "shadow cascades"). The radius goes back to k times the game's after every pass:
-// the rest of the frame reads it too, and with the console's radius left there after a near pass the receivers a few
-// metres away were shaded without their shadow in every other frame (GitHub #16, flicker in 0.1.5).
+// meshes: near the player the shadows no longer match the objects. With shadow_cascades (and k >= 2) the pass runs
+// twice per frame and view: first with the console's radius, which the renderer draws into a near map of its own,
+// then with k times it, as before. (Until 0.1.10 the passes alternated, one per frame: a second pass in the same
+// frame drew nothing because the game's texture pool had no room for a second map - see "Both passes in every frame"
+// below; FCI_CASCADE_ALTERNATE=1 brings that back.) After each pass the pass's sun camera (a local of the pass, read
+// where its frame was) gives its view-projection; the renderer gets the map from this pass's texture coordinates to
+// the other map's, drawn by the pass before (gpu/renderer.cpp, "shadow cascades"). The radius goes back to k times
+// the game's after every pass: the rest of the frame reads it too, and with the console's radius left there after a
+// near pass the receivers a few metres away were shaded without their shadow in every other frame (GitHub #16,
+// flicker in 0.1.5).
 // The near pass finds no casters in the game's visibility areas (bunkers, buildings with inside areas: its caster query
 // enters them through portals in the sun camera's frustum, which the console's square misses); the renderer adds the far
 // pass's opaque casters near the player from a map of their own (gpu/renderer.cpp, kSolidsMargin).
@@ -302,7 +304,7 @@ HLE_STDCALL(Game_ShadowPass, 7) {
                     xdk::GF(engine + kEngineRadius), k, SquareSide(env, radius * k));
         }
     }
-    // ---- shadow cascades: the near pass (the console's radius) and the far one on alternate frames ----
+    // ---- shadow cascades: the near pass (the console's radius) and the far one, both in every frame ----
     const bool cascades = gpu::render::ShadowCascades();
     static bool cascades_before = false;
     if (cascades_before && !cascades) {  // switched off in the F10 menu: the game's own maps from here on
@@ -313,7 +315,6 @@ HLE_STDCALL(Game_ShadowPass, 7) {
     if (k >= 2.0f && radius > 0 && cascades) {
         View* v = &ViewOf(env);
         const int view = int(v - g_views);
-        const uint64_t pass = ++v->passes;
         // 0: near, 1: far. While the view's passes draw more than the sun's map (spot lights besides it, the game's
         // four map mode) or no sun, the renderer cannot pair them and its receivers read each pass's own map: the far
         // square in every frame then, as without cascades (alternating, every other frame had the console's square)
@@ -322,7 +323,7 @@ HLE_STDCALL(Game_ShadowPass, 7) {
             char v[16] = {};
             return GetEnvironmentVariableA("FCI_CASCADE_MULTI", v, sizeof v) && !std::strcmp(v, "alternate");
         }();
-        const int which = always || gpu::render::SunCascadesUsable(view) ? int(pass & 1) : 1;
+        const bool usable = always || gpu::render::SunCascadesUsable(view);
         // diagnostics: FCI_CASCADE_NEAR_SCALE=<f>: the near pass with f times the console's radius (the near map's
         // square f times larger; the renderer's matrices follow the cameras)
         static const float near_scale = [] {
@@ -330,62 +331,100 @@ HLE_STDCALL(Game_ShadowPass, 7) {
             const float f = GetEnvironmentVariableA("FCI_CASCADE_NEAR_SCALE", v, sizeof v) ? float(std::atof(v)) : 1.0f;
             return f > 0 ? f : 1.0f;
         }();
-        const float r_pass = which ? radius * k : radius * std::fmin(near_scale, k);
-        const uint32_t cam = c.esp - kPassCamera;
-        SetF(cam + kCamWidth, 0);  // (so that a pass without the sun is told apart)
-        SetF(env + kEnvRadius, r_pass);
-        xdk::RenderMark([view, which] { gpu::render::BeginSunShadowPass(view, !which); });
-        const uint32_t r = RunShadowPass(c, a[1], engine);
-        TraceCasterQuery(engine, cam, which ? "far" : "near");
-        // the rest of the frame sees the far radius in every frame, whichever pass ran: the receivers' shading
-        // depends on it (GitHub #16, second report: with the near pass's radius left there, objects and ground a few
-        // metres away lost their shadow in every other frame although both maps held it).
         // FCI_SHADOW_CASCADE_RADIUS=pass keeps the pass's radius (0.1.5, to reproduce)
         static const bool pass_radius = [] {
             char v[16] = {};
             return GetEnvironmentVariableA("FCI_SHADOW_CASCADE_RADIUS", v, sizeof v) && !std::strcmp(v, "pass");
         }();
-        if (!pass_radius) SetF(env + kEnvRadius, radius * k);
-        double clip[4][4];
-        const bool sun = SunCamera(cam, SquareSide(env, r_pass), clip);
-        bool ok = sun;
-        const float far_plane = xdk::GF(cam + 0x34);
-        // the other map's texture coordinates from this one's: T other_clip this_clip^-1 T^-1 (the other map was drawn
-        // by the view's pass before, with its camera)
-        float m[3][4] = {};
-        if (ok) {
-            std::memcpy(v->clip[which], clip, sizeof clip);
-            v->done[which] = pass;
-            double ot[4][4], tt[4][4], ti[4][4], map[4][4];
-            ok = v->done[!which] && v->done[!which] == pass - 1;
+        const uint32_t cam = c.esp - kPassCamera;
+        // one pass of the game's with the radius of cascade `which`, marked for the renderer
+        auto one = [&](int which) {
+            const uint64_t pass = ++v->passes;
+            const float r_pass = which ? radius * k : radius * std::fmin(near_scale, k);
+            SetF(cam + kCamWidth, 0);  // (so that a pass without the sun is told apart)
+            SetF(env + kEnvRadius, r_pass);
+            xdk::RenderMark([view, which] { gpu::render::BeginSunShadowPass(view, !which); });
+            const uint32_t r = RunShadowPass(c, a[1], engine);
+            TraceCasterQuery(engine, cam, which ? "far" : "near");
+            // the rest of the frame sees the far radius in every frame, whichever pass ran: the receivers' shading
+            // depends on it (GitHub #16, second report: with the near pass's radius left there, objects and ground a
+            // few metres away lost their shadow in every other frame although both maps held it)
+            if (!pass_radius) SetF(env + kEnvRadius, radius * k);
+            double clip[4][4];
+            const bool sun = SunCamera(cam, SquareSide(env, r_pass), clip);
+            bool ok = sun;
+            const float far_plane = xdk::GF(cam + 0x34);
+            // the other map's texture coordinates from this one's: T other_clip this_clip^-1 T^-1 (the other map was
+            // drawn by the view's pass before, with its camera)
+            float m[3][4] = {};
             if (ok) {
-                ToTexture(v->clip[!which], ot), ToTexture(clip, tt);
-                ok = Invert(tt, ti);
+                std::memcpy(v->clip[which], clip, sizeof clip);
+                v->done[which] = pass;
+                double ot[4][4], tt[4][4], ti[4][4], map[4][4];
+                ok = v->done[!which] && v->done[!which] == pass - 1;
+                if (ok) {
+                    ToTexture(v->clip[!which], ot), ToTexture(clip, tt);
+                    ok = Invert(tt, ti);
+                }
+                if (ok) {
+                    Mul(ot, ti, map);
+                    for (int i = 0; i < 3; i++)
+                        for (int j = 0; j < 4; j++) m[i][j] = float(map[i][j]);
+                }
+            } else {
+                v->done[which] = 0;
             }
-            if (ok) {
-                Mul(ot, ti, map);
-                for (int i = 0; i < 3; i++)
-                    for (int j = 0; j < 4; j++) m[i][j] = float(map[i][j]);
+            static int logged = 0;
+            if (logged < 4) {
+                logged++;
+                // (far plane: the depth range, over which the game's constant depth bias spreads)
+                rt::Log("shadows: cascades: %s pass, camera %s (square %.1f m, far plane %.1f m); the other map: u = %.4f "
+                        "u %+.4f v %+.4f d %+.4f, v = %.4f u %+.4f v %+.4f d %+.4f, d = %.4f u %+.4f v %+.4f d %+.4f",
+                        which ? "far" : "near", ok ? "sun" : "not the sun (or no other map)", SquareSide(env, r_pass),
+                        far_plane, m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0],
+                        m[2][1], m[2][2], m[2][3]);
             }
-        } else {
-            v->done[which] = 0;
+            float cf[4][4] = {};  // (diagnostics: FCI_DUMP_CASCADE_MAPS)
+            if (sun)
+                for (int i = 0; i < 4; i++)
+                    for (int j = 0; j < 4; j++) cf[i][j] = float(clip[i][j]);
+            xdk::RenderMark([sun, ok, m, cf] { gpu::render::EndSunShadowPass(sun, ok, m, cf); });
+            return r;
+        };
+        // Both passes in every frame, near then far (GitHub #16, last report: with one pass per frame, what moves - a
+        // vehicle, an NPC, a pushed barrel - was a frame old in the map not drawn that frame; a boat's front cover
+        // that shadows itself turned dark in every other frame while driving). The pass takes its map from a pool of
+        // dynamic textures that the frame fills from its start ([[engine + 0x1148] + 4] + 0x2CDC: base +0x10, limit
+        // +0x14 = 3.1 MB, offset +0x18, frames pushed +0x30, allocations +0x34; the device's +0x1A0 pushes a frame
+        // when none is open, 0x00253A80 allocates, the frame's end pops). One 1024x1024 16 bit map is 2 MB: a second
+        // pass in the same frame got no memory and drew nothing ("draws no casters", the reason the passes alternated
+        // until now). The near map's memory goes back to the pool after its pass (device vtbl +0x164 pops the frame
+        // the pass pushed, as the frame's end would), and the far pass gets it again: the guest's map memory is never
+        // drawn into with HLE graphics (the renderer's host targets stand in, told apart by the passes' marks), and
+        // after the far pass the pool is as after a single pass. Only when the near pass opened the pool's frame and
+        // allocated just its map; otherwise this frame keeps to one pass (alternating). FCI_CASCADE_ALTERNATE=1: one
+        // pass per frame, alternating, as until 0.1.10 (A/B)
+        static const bool alternate = [] {
+            char v[8] = {};
+            return GetEnvironmentVariableA("FCI_CASCADE_ALTERNATE", v, sizeof v) && v[0] == '1';
+        }();
+        const uint32_t dev = R32(engine + 0x1148), d4 = dev ? R32(dev + 4) : 0, pool = d4 ? R32(d4 + 0x2CDC) : 0;
+        if (usable && !alternate && pool && R32(pool + 0x30) == 0) {
+            const uint32_t r0 = one(0);
+            const uint32_t frames = R32(pool + 0x30), maps = R32(pool + 0x34);
+            if (frames == 1 && maps == 1) {
+                rt::Cpu g = c;
+                g.ecx = dev;
+                xdk::CallGuest(g, R32(R32(dev) + 0x164), {});
+            }
+            if (frames == 0 || (maps == 1 && R32(pool + 0x30) == 0)) return one(1);
+            static int logged = 0;  // (more than the near map in the pool's frame: no far pass this frame)
+            if (logged++ < 8)
+                rt::Log("shadows: cascades: the near pass left %u frames / %u maps in the texture pool: no far pass "
+                        "this frame", frames, maps);
+            return r0;
         }
-        static int logged = 0;
-        if (logged < 4) {
-            logged++;
-            // (far plane: the depth range, over which the game's constant depth bias spreads)
-            rt::Log("shadows: cascades: %s pass, camera %s (square %.1f m, far plane %.1f m); the other map: u = %.4f u "
-                    "%+.4f v %+.4f d %+.4f, v = %.4f u %+.4f v %+.4f d %+.4f, d = %.4f u %+.4f v %+.4f d %+.4f",
-                    which ? "far" : "near", ok ? "sun" : "not the sun (or no other map)", SquareSide(env, r_pass),
-                    far_plane, m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0],
-                    m[2][1], m[2][2], m[2][3]);
-        }
-        float cf[4][4] = {};  // (diagnostics: FCI_DUMP_CASCADE_MAPS)
-        if (sun)
-            for (int i = 0; i < 4; i++)
-                for (int j = 0; j < 4; j++) cf[i][j] = float(clip[i][j]);
-        xdk::RenderMark([sun, ok, m, cf] { gpu::render::EndSunShadowPass(sun, ok, m, cf); });
-        return r;
+        return one(usable ? int((v->passes + 1) & 1) : 1);
     }
     if (k >= 2.0f && cascades) {  // no sun this frame: the receivers read the game's maps
         View& v = ViewOf(env);
