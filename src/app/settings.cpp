@@ -125,7 +125,10 @@ struct DevicePreset {
 };
 
 // the Steam Deck: board vendor Valve, product Jupiter (LCD) or Galileo (OLED), from the registry (Windows, Wine) or the
-// DMI files (Linux through Z:), else SteamDeck=1 (Steam sets it for games on the Deck); FCI_DEVICE=deck|pc forces it
+// DMI files (Linux through Z:), else SteamDeck=1 (Steam sets it for games on the Deck). The ROG Ally X: product name
+// with ASUS's model RC73XA (ROG Xbox Ally X, 2025) or RC72LA (ROG Ally X, 2024), from the same places (the firmware's
+// "ROG Xbox Ally X RC73XA_RC73XA" under Windows; SteamOS's DMI has the same SMBIOS name). FCI_DEVICE=deck|ally|pc
+// forces it
 const DevicePreset& Preset() {
     static const DevicePreset preset = [] {
         DevicePreset p;
@@ -142,8 +145,23 @@ const DevicePreset& Preset() {
         const bool valve = Lower(vendor) == "valve";
         const std::string model = Lower(product);
         bool deck = (valve && (model == "jupiter" || model == "galileo")) || steam_deck_env;
-        if (!_stricmp(forced, "deck")) deck = true;
-        if (!_stricmp(forced, "pc")) deck = false;
+        // the ROG Ally X by ASUS's model number in the product name (the vendor string differs between firmwares:
+        // "ASUSTeK COMPUTER INC." on the board, "ASUSTeK COMPUTER INC" elsewhere); not the ROG Ally (RC71L) or the ROG
+        // Xbox Ally (RC73YA), whose GPUs are slower
+        const bool xbox_ally_x = model.find("rc73xa") != std::string::npos;
+        bool ally = !deck && (xbox_ally_x || model.find("rc72la") != std::string::npos);
+        if (!_stricmp(forced, "deck")) deck = true, ally = false;
+        if (!_stricmp(forced, "ally")) ally = true, deck = false;
+        if (!_stricmp(forced, "pc")) deck = false, ally = false;
+        if (ally) {
+            p.device = !xbox_ally_x && model.find("rc72la") != std::string::npos ? "ROG Ally X" : "ROG Xbox Ally X";
+            // measured on the ROG Xbox Ally X (Windows 11, Radeon 890M, 1920x1080 120 Hz, the PC defaults otherwise):
+            // the GPU limits at 4x MSAA (rock faces at the cliffs ~109 fps, the beach after the boat ride drops to
+            // 25-70); 2x holds 120 there (rock faces uncapped 163 fps). The rest stays the PC's: the full output
+            // resolution (85 % of it with 4x was worse), SMAA, SSAO (GTAO costs the same), shadows, detail distances,
+            // one frame ahead (two changed nothing: 1 % lows 108.6 against 109.2 over two rounds each)
+            p.defaults = {{"msaa", "2"}};
+        }
         if (deck) {
             p.device = model == "galileo" ? "Steam Deck OLED" : model == "jupiter" ? "Steam Deck LCD" : "Steam Deck";
             // the high preset measured on the Deck OLED: 90 fps with 1 % lows of 86-90; two
@@ -155,8 +173,8 @@ const DevicePreset& Preset() {
                           {"lod_distance", "1"}, {"view_distance", "1"}};
         }
         rt::Log("settings: device %s (%s: vendor '%s', product '%s', SteamDeck=%s%s%s)",
-                deck ? p.device.c_str() : "not a Steam Deck", how.c_str(), vendor.c_str(), product.c_str(),
-                steam_deck_env ? "1" : "-", forced[0] ? ", FCI_DEVICE=" : "", forced);
+                deck || ally ? p.device.c_str() : "not a Steam Deck or ROG Ally X", how.c_str(), vendor.c_str(),
+                product.c_str(), steam_deck_env ? "1" : "-", forced[0] ? ", FCI_DEVICE=" : "", forced);
         for (const auto& [k, v] : p.defaults) rt::Log("settings: %s default %s = %s", p.device.c_str(), k.c_str(), v.c_str());
         return p;
     }();

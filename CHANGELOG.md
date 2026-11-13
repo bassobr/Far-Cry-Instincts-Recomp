@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.0 (2026-11-13)
+
+0.9 is the feature freeze before 1.0: no new features from here on, only fixes from a full playthrough and from your
+reports, on PC and Steam Deck. It follows 0.1.11; there was no separate 0.1.12.
+
+- **Exit Game in the F10 menu (#40):** a button at the bottom left of the menu quits to the desktop after a
+  confirmation (A or Enter exits, B or Escape goes back; keyboard, mouse and controller). It ends the program the
+  same way as closing the window: the settings are saved, a save the game is writing is finished first, and on the
+  Steam Deck Proton ends with it. Closing the window while the menu or the pause on focus loss holds the game now
+  also lets a save that the pause interrupted finish before the program ends.
+- **No more launches when strafing diagonally on the keyboard (#31):** two movement keys at once (W+A, W+D, ...)
+  pushed both axes of the left stick to full. The game doesn't limit that, so the player ran at 7.3 m/s instead of
+  the 5.15 m/s top speed, and above the top speed the game's collision flings a character moving up against an
+  edge (pallets, tank traps) at 10 to 22 m/s. A keyboard diagonal now deflects the stick as far as a fully pushed
+  stick counts after the game's dead zone, so diagonal running is as fast as straight running and never faster.
+  `FCI_KEY_DIAGONAL_FULL=1` brings back the old diagonal. Controllers are unchanged.
+- **ROG Ally X preset:** on a ROG Xbox Ally X (RC73XA) or a 2024 ROG Ally X (RC72LA), detected from the firmware's
+  product name under Windows or Proton, the default multisampling is now 2x instead of 4x; everything else stays at
+  the PC defaults. On a ROG Xbox Ally X under Windows 11 (1920x1080, 120 Hz) the story opening ran at 119.8 fps with
+  a 1 % low of 109.1 fps, against 112.4 / 87.0 with 0.1.11; at rock faces it holds 120 fps (about 109 with 4x).
+  `msaa` in the ini file or the F10 menu still wins, and the menu marks 2x as the device's default. `FCI_DEVICE=ally`
+  or `FCI_DEVICE=pc` overrides the detection. The 2024 model and SteamOS on the Ally are not tested yet.
+- **Faster multisampling on AMD graphics under Windows:** the terrain reads the pixels around its own from the
+  finished frame (the fix for the seams of #19). Until now that meant resolving the whole multisampled frame once
+  per terrain piece, 7 to 10 times a frame; on the Radeon 890M of the ROG Xbox Ally X each of those costs about
+  0.2 ms at 1080p 4x. The game now draws the piece once more just before, without colour, and averages only the
+  pixels it will read. The picture is the same (single pixels differ by a few levels). On the Ally X at 4x and an
+  unlimited frame rate: 98.6 -> 108.6 fps at a rock face, 118.1 -> 141.0 fps in the story opening. It is used on
+  AMD graphics under Windows and on a detected ROG Ally X; NVIDIA, Intel and the Steam Deck keep the resolve as
+  before. `FCI_MIRROR_TAPS=resolve` brings back the old way, `FCI_MIRROR_TAPS=pass` forces the new one.
+- The recompiler now treats the game's frame-pointer accesses (`[ebp + offset]` in functions that keep their local
+  variables there) like stack accesses and skips the hardware-register check for them. The game code is 2.4 %
+  smaller; on the Steam Deck the frame rate is unchanged. `FCI_RECOMP_EBP_FRAME=0` brings back the old code.
+- The game code is rebuilt once on the first start after updating (about 1 min on a desktop PC, about 5.5 min on the
+  Steam Deck); saves carry over.
+
 ## 0.1.11 (2026-11-12)
 
 - **Shadow cascades: moving objects (#16):** with `shadow_cascades = on`, the shadows on and of things that move (a

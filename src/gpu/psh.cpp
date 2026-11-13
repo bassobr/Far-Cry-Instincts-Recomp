@@ -205,6 +205,7 @@ uint64_t Key(const State& s, const Config& config) {
     if (config.mirror_write || config.mirror_read)  // GitHub #19: the target's mirror
         mix(0x1919u << 16 | uint32_t(config.mirror_write) << 8 | uint32_t(config.mirror_resolved) << 12 |
             config.mirror_read);
+    if (config.taps_pass) mix(0x7A95u << 16 | config.mirror_read);  // performance: the taps' pass
     return h;
 }
 
@@ -235,7 +236,59 @@ bool StageAlphaUsed(const State& s, int stage) {
 }
 // ---- end GitHub #19 ----
 
+// ---- performance: the taps' pass (Config::taps_pass, renderer.cpp). The same inputs as the draw's shader (the same
+// vertex shader before it) and the same coordinates, position and filter as its kTargetMS stages compute below, so
+// every texel those stages read from t6 is one this pass stored, from the target as it is before the draw. Runs at
+// least where the draw's shader runs (the same rasterization and depth test, without the shader's depth: early) ----
+std::string GenerateTapsPass(const State& s, const Config& config) {
+    std::string out = kPrelude;
+    std::string input = vsh::kOutputStruct;
+    if (s.Reg(SET_SHADE_MODE) == 0x1D00) {
+        for (const char* member : {"float4 d0", "float4 d1", "float4 b0", "float4 b1"}) {
+            size_t at = input.find(member);
+            if (at != std::string::npos) input.insert(at, "nointerpolation ");
+        }
+    }
+    input.insert(input.find("float4 wdepth_c"), "centroid ");
+    out += input;
+    out += "Texture2DMS<float4> frame_ms : register(t9);\n"
+           "RWTexture2D<unorm float4> taps : register(u0);\n";
+    out += std::string(config.depth == Depth::kNone ? "[earlydepthstencil]\n" : "") + "void main(VSOut input) {\n"
+           "    float4 T[4] = {input.t0, input.t1, input.t2, input.t3};\n"
+           "    uint w, h, n;\n"
+           "    frame_ms.GetDimensions(w, h, n);\n";
+    for (int i = 0; i < 4; i++) {
+        if (!((config.mirror_read >> i) & 1)) continue;
+        const bool point = ((s.Reg(SET_TEXTURE_FILTER + 0x40 * i) >> 24) & 0xF) == 1;
+        char code[2048];
+        snprintf(code, sizeof code,
+                 "    {\n"
+                 "        float2 hp = (T[%d].xy / (T[%d].w == 0 ? 1 : T[%d].w)) * tex_scale[%d].xy + float2(0, tex_scale[%d].z);\n"
+                 "        int2 lo = int2(0, int(tex_scale[%d].z)), hi = int2(int(w), int(tex_scale[%d].w)) - 1;\n"
+                 // the texels the draw's filter starts at, floor(q): its shader is compiled on its own and may get
+                 // q a rounding step apart, so where q is within 0.01 of a texel's edge both sides are stored (the
+                 // own pixel's texel as well: the draw takes it from the mirror, unless it finds q not its own)
+                 "        float2 q = hp - %s;\n"
+                 "        int2 first = clamp(int2(floor(q - 0.01)), lo, hi), last = clamp(int2(floor(q + 0.01)) + %d, lo, hi);\n"
+                 "        [loop] for (int y = first.y; y <= last.y; y++)\n"
+                 "            [loop] for (int x = first.x; x <= last.x; x++) {\n"
+                 "                float4 sum = 0;\n"
+                 "                [loop] for (uint m = 0; m < n; m++) sum += frame_ms.Load(int2(x, y), m);\n"
+                 // (stored through the format's own conversion, as a resolve and a render target store it: an exact
+                 // average rounded half up moved 5x as many pixels against the resolve)
+                 "                taps[int2(x, y)] = sum / max(n, 1u);\n"
+                 "            }\n"
+                 "    }\n",
+                 i, i, i, i, i, i, i, point ? "0" : "0.5", point ? 0 : 1);
+        out += code;
+    }
+    out += "}\n";
+    return out;
+}
+// ---- end performance ----
+
 std::string Generate(const State& s, const Config& config) {
+    if (config.taps_pass) return GenerateTapsPass(s, config);  // performance: the taps' pass
     std::string out = kPrelude;
     static const char* const kTextureType[] = {"Texture2D",        "Texture2D", "TextureCube", "Texture3D",
                                                "Texture2D",        "Texture2D<float>", "Texture2DMS<float>",

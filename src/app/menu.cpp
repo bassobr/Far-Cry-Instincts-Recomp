@@ -682,6 +682,13 @@ const char* g_hint = "";            // the focused row's help, this frame
 bool g_hint_restart = false;        // the focused row's change waits for a restart
 bool g_hint_env = false;            // the focused row's value comes from the environment
 std::atomic<bool> g_close{false};  // closing was asked for this frame
+// Exit Game: the confirmation shows (under g_ui), the program is to end after this frame, the buttons' places are
+// logged in that many frames, once the panel's size has settled (for FCI_MENU_SCRIPT clicks)
+bool g_confirm_exit = false;
+std::atomic<bool> g_exit{false};
+constexpr int kLogButtonsAfter = 3;
+int g_log_buttons = 0;
+int g_focus_exit = 0;  // the Exit Game button takes the focus in that many frames (back from the confirmation)
 // the page's first row takes the keyboard / controller focus in that many frames (after a page switch the tab bar
 // settles first, a focus asked for at once was lost)
 int g_focus_first = 0;
@@ -952,8 +959,80 @@ void DrawNotice() {
     ImGui::PopStyleColor(int(std::size(kPanelColors)));
 }
 
+// ---- Exit Game: asks first, then the window closes (display.cpp's WM_CLOSE: the menu closes, a save in progress
+// finishes, the process ends) ----
+void LogButton(const char* name) {
+    ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    rt::Log("settings menu: button %s at %.0f,%.0f", name, (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+}
+
+void AskExit() {
+    g_confirm_exit = true;
+    g_focus_first = 2;
+    g_log_buttons = kLogButtonsAfter;
+    rt::Log("settings menu: exit game, asking to confirm");
+}
+
+void CancelExit() {
+    g_confirm_exit = false;
+    g_focus_first = 0;
+    g_focus_exit = 2;
+    rt::Log("settings menu: exit game cancelled");
+}
+
+void DrawConfirmExit() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    float em = ImGui::GetFontSize();
+    float w = std::min(em * 34, vp->Size.x - 16);
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
+    for (const auto& [col, color] : kPanelColors) ImGui::PushStyleColor(col, color);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em * 1.6f, em * 1.2f));
+    constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar |
+                                        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("##exit", nullptr, kFlags)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kHeading);
+        ImGui::TextUnformatted("EXIT TO DESKTOP?");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, em * 0.3f));
+        ImGui::PushTextWrapPos(w - em * 1.6f);
+        ImGui::TextUnformatted("The game ends. Progress since the last save is lost; the settings are kept.");
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextUnformatted("A or Enter exits, B or Escape goes back.");
+        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, em * 0.5f));
+        float bw = em * 8;
+        float pad = ImGui::GetContentRegionAvail().x - bw * 2 - ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(pad, 0.0f));
+        if (g_focus_first > 0 && --g_focus_first == 0) ImGui::SetKeyboardFocusHere();
+        bool leave = ImGui::Button("Exit", ImVec2(bw, 0));
+        bool log = g_log_buttons > 0 && --g_log_buttons == 0;
+        if (log) LogButton("Exit");
+        ImGui::SameLine();
+        bool cancel = ImGui::Button("Cancel", ImVec2(bw, 0));
+        bool cancel_focused = ImGui::IsItemFocused();
+        if (log) LogButton("Cancel");
+        // A and Enter wherever ImGui's navigation stands: Exit, unless Cancel has the focus (B and Escape go back)
+        for (ImGuiKey key : {ImGuiKey_GamepadFaceDown, ImGuiKey_Enter, ImGuiKey_KeypadEnter})
+            if (ImGui::IsKeyPressed(key, false)) (cancel_focused ? cancel : leave) = true;
+        if (cancel) CancelExit();
+        else if (leave && !g_exit.exchange(true)) rt::Log("settings menu: exit game confirmed");
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(int(std::size(kPanelColors)));
+}
+// ---- end Exit Game ----
+
 void DrawPanel() {
     if (!g_notice_text.empty()) return DrawNotice();
+    if (g_confirm_exit) return DrawConfirmExit();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     float em = ImGui::GetFontSize();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -999,6 +1078,11 @@ void DrawPanel() {
         ImGui::TextUnformatted(note.c_str());
         ImGui::PopStyleColor();
         float bw = em * 8;
+        // Exit Game at the left, Back and Defaults at the right
+        if (g_focus_exit > 0 && --g_focus_exit == 0) ImGui::SetKeyboardFocusHere();
+        if (ImGui::Button("Exit Game", ImVec2(bw, 0))) AskExit();
+        if (!g_confirm_exit && g_log_buttons > 0 && --g_log_buttons == 0) LogButton("Exit Game");
+        ImGui::SameLine();
         float buttons_pad = ImGui::GetContentRegionAvail().x - bw * 2 - ImGui::GetStyle().ItemSpacing.x;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(buttons_pad, 0.0f));
         if (ImGui::Button("Back", ImVec2(bw, 0))) g_close = true;
@@ -1140,8 +1224,11 @@ ImDrawData* Build() {
     ImGui::NewFrame();
     PollCapture();
     DrawPanel();
-    // B closes, as Escape does, unless it answers a capture
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) && g_capture < 0) g_close = true;
+    // B closes, as Escape does, unless it answers a capture; on Exit Game's question it goes back
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) && g_capture < 0) {
+        if (g_confirm_exit) CancelExit();
+        else g_close = true;
+    }
     ImGui::Render();
     return ImGui::GetDrawData();
 }
@@ -1358,6 +1445,9 @@ void ToggleMenu() {
         g_close = false;
         g_pad_armed = false;
         g_focus_first = open ? 1 : 0;
+        g_confirm_exit = false;  // Exit Game
+        g_focus_exit = 0;
+        g_log_buttons = open ? kLogButtonsAfter : 0;
         if (!open) g_notice_title.clear(), g_notice_text.clear();
         if (g_context) {
             ImGuiIO& io = ImGui::GetIO();
@@ -1420,7 +1510,11 @@ bool MenuWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
         if (msg == WM_CHAR) return true;
     }
     if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
-        if (!(lp & (1 << 30))) ToggleMenu();
+        if (!(lp & (1 << 30))) {
+            std::unique_lock lock(g_ui);
+            if (g_confirm_exit) CancelExit();  // Exit Game's question: back to the settings
+            else lock.unlock(), ToggleMenu();
+        }
         return true;
     }
     {
@@ -1438,6 +1532,14 @@ void MenuFrame() {
         if (!EnsureContext()) return;
     }
     gpu::present::MenuFrame(Build);
+    // Exit Game confirmed: the window closes as by its close button (display.cpp's WM_CLOSE: the menu closes and
+    // saves, a save in progress finishes, the process ends with 0)
+    if (g_exit.exchange(false)) {
+        SaveSettings();
+        rt::Log("settings menu: exit game, closing the window");
+        if (HWND w = static_cast<HWND>(display::Window())) PostMessageW(w, WM_CLOSE, 0, 0);
+        return;
+    }
     if (g_close) {
         g_close = false;
         if (MenuOpen()) ToggleMenu();

@@ -13,11 +13,11 @@ std::string String(const char* key, const char* fallback);
 // ---- PC comfort features: 1/0, true/false, yes/no, on/off ----
 bool Bool(const char* key, bool fallback);
 
-// ---- device presets: defaults of the device the game runs on (the Steam Deck: GTAO, shadow_scale 4), used where
-// neither the environment, the file nor the menu sets a key ----
+// ---- device presets: defaults of the device the game runs on (the Steam Deck: GTAO, shadow_scale 4; the ROG Ally X),
+// used where neither the environment, the file nor the menu sets a key ----
 // the device's default for key, else fallback (the settings menu shows and resets to it)
 std::string Default(const char* key, const char* fallback);
-// "Steam Deck OLED", "Steam Deck LCD", "Steam Deck" or "" (none detected)
+// "Steam Deck OLED", "Steam Deck LCD", "Steam Deck", "ROG Xbox Ally X", "ROG Ally X" or "" (none detected)
 const std::string& Device();
 // ---- end device presets ----
 

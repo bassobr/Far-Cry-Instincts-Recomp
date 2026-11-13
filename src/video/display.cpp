@@ -595,20 +595,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (app::MenuWndProc(hwnd, msg, wp, lp, &menu_result)) return menu_result;
     // ---- end settings menu ----
     switch (msg) {
-    case WM_CLOSE:
+    case WM_CLOSE: {
+        // once (ResumeForExit and LeaveExclusiveForExit handle messages while they wait: a second close meanwhile
+        // is the same end)
+        static bool closing = false;
+        if (closing) return 0;
+        closing = true;
         rt::Log("window closed");
         // during a level change: no new process starts, one already started ends too (it would bring the game back)
         kernel::CancelRelaunch("window closed");
+        // the settings menu closes and a pause ends: a save the pause held must be able to finish
+        app::ResumeForExit(2000);
         hle::host::StopRumble();
         // a save in progress (checkpoint, level end) is finished first and no new one starts (GitHub #29)
         kernel::FinishSaves("window closed", 5000, 400);
         LeaveExclusiveForExit();  // display output options
+        rt::Log("the program ends (exit code 0)");
         rt::FlushLog();
         ExitProcess(0);
+    }
     case WM_ENDSESSION:  // Windows shuts down or the user logs off: the process ends after this message
         if (wp) {
             rt::Log("Windows ends the session");
             kernel::CancelRelaunch("Windows ends the session");
+            app::ResumeForExit(1000);
             kernel::FinishSaves("Windows ends the session", 4000, 400);
             rt::FlushLog();
         }

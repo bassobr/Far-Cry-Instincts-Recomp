@@ -57,6 +57,11 @@ struct Config {
     // as from the multisampled copy; false: from the mirror's samples with the marker (no resolve, a texel beyond the
     // surface's edge gives its weight to the others)
     bool mirror_resolved = false;
+    // ---- performance: the filter's texels without a resolve of the whole target (renderer.cpp, "the taps' pass"):
+    // this is not the draw's shader but a pass over the same geometry just before it, with the target multisampled
+    // as t9 and no colour target, which stores the texels the mirror_read stages will take from t6 (the average of
+    // their samples, as the resolve stores it) into u0 (RGBA8), at each texel of the filter those stages read ----
+    bool taps_pass = false;
 };
 
 // GitHub #19, the target's mirror: whether the shader uses the alpha of a stage's texture (combiner inputs, the

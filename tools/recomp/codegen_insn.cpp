@@ -258,6 +258,10 @@ bool FunctionWriter::EmitInsn(const Decoded& d) {
             const int64_t disp = m.disp.value;
             if (m.segment != ZYDIS_REGISTER_FS) {
                 if (m.base == ZYDIS_REGISTER_ESP && disp >= -0x10000 && disp < 0x100000) ea_ram_ = true;
+                // the same through ebp where it is a frame pointer (FramePointer): the locals of code with frames
+                if (m.base == ZYDIS_REGISTER_EBP && m.index == ZYDIS_REGISTER_NONE && d.ebp_frame && disp >= -0x10000 &&
+                    disp < 0x100000)
+                    ea_ram_ = true;
                 if (m.base == ZYDIS_REGISTER_NONE && m.index == ZYDIS_REGISTER_NONE && disp >= 0 &&
                     disp + 16 <= int64_t(0xFD000000))
                     ea_ram_ = true;

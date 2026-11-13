@@ -488,10 +488,25 @@ void ApplyKeyboardMouse(Pad& p, bool focused) {
         if (t.axis >= 0) (t.sign > 0 ? axis_pos : axis_neg)[t.axis] = 1;
     }
     int16_t keys[4];
-    for (int i = 0; i < 4; i++) {
-        keys[i] = int16_t((axis_pos[i] ? 32767 : 0) - (axis_neg[i] ? 32767 : 0));
-        if (keys[i]) p.thumb[i] = keys[i];
+    for (int i = 0; i < 4; i++) keys[i] = int16_t((axis_pos[i] ? 32767 : 0) - (axis_neg[i] ? 32767 : 0));
+    // ---- keyboard diagonals of the left stick (GitHub #31) ----
+    // The game reads each axis of the left stick through its own dead zone, (|x| - 0.35) / 0.65 per axis, and does
+    // not limit the vector. Two movement keys held (W+A, W+D, ...) put both axes at full: the stick vector is 1.41
+    // long and the player asks for 1.41 times the top running speed (7.3 instead of 5.15 m/s), more than the stick
+    // gives in any direction at its rim. Above the top speed the living entity's collision sweep, moving up against
+    // geometry, cuts the velocity to the top speed and then adds the old horizontal velocity on top of it: the player
+    // is flung at 10-22 m/s (pallets, tank traps, box edges; at every frame rate, harder above 30 fps). So a
+    // keyboard diagonal deflects both axes to kKeyDiagonal: after the dead zone 0.706 per axis, a vector of 0.998,
+    // the top running speed in every direction as straight on. FCI_KEY_DIAGONAL_FULL=1: both axes at full as before.
+    static const bool diagonal_full = GetEnvironmentVariableA("FCI_KEY_DIAGONAL_FULL", nullptr, 0) > 0;
+    constexpr int16_t kKeyDiagonal = 26500;  // 0.8087 of full deflection: (0.8087 - 0.35) / 0.65 = 0.706
+    if (!diagonal_full && keys[0] && keys[1]) {
+        keys[0] = keys[0] > 0 ? kKeyDiagonal : int16_t(-kKeyDiagonal);
+        keys[1] = keys[1] > 0 ? kKeyDiagonal : int16_t(-kKeyDiagonal);
     }
+    // ---- end keyboard diagonals ----
+    for (int i = 0; i < 4; i++)
+        if (keys[i]) p.thumb[i] = keys[i];
 
     // direct mouse look: the game's look input took the motion since the previous poll (hle/mouse_look.cpp), so
     // the scripted counts wait there for the next one. Where it does not run (menus, no player in control), the

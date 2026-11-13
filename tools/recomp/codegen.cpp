@@ -202,6 +202,51 @@ void FunctionWriter::Liveness() {
     entry_flags_ = index_.count(fn_.start) ? live_in[index_[fn_.start]] : 0;
 }
 
+// forward dataflow: where ebp holds a stack address for sure, so [ebp + small displacement] is RAM like [esp + ...].
+// It does from `mov ebp, esp` (or `lea ebp, [esp + small]`) until anything else writes ebp; calls keep it (ebp is
+// callee-saved in the x86 conventions; helpers that set ebp, like the CRT's SEH prologs, set it to a frame too).
+// On entry ebp is the caller's and unknown; an instruction without a path from the entry stays unknown.
+void FunctionWriter::FramePointer() {
+    if (!EbpFrameOn() || !index_.count(fn_.start)) return;
+    const size_t n = insns_.size();
+    std::vector<char> in(n, 0), has_pred(n, 0);
+    for (const auto& d : insns_)
+        for (uint32_t s : d.succ) has_pred[index_[s]] = 1;
+    for (size_t i = 0; i < n; i++) in[i] = has_pred[i];
+    in[index_[fn_.start]] = 0;
+    auto transfer = [](const Decoded& d, bool frame) {
+        const auto& ins = d.ins;
+        const auto* o = d.ops;
+        bool writes = ins.mnemonic == ZYDIS_MNEMONIC_POPAD || ins.mnemonic == ZYDIS_MNEMONIC_POPA;
+        for (int k = 0; k < ins.operand_count && !writes; k++)
+            writes = o[k].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                     (o[k].reg.value == ZYDIS_REGISTER_EBP || o[k].reg.value == ZYDIS_REGISTER_BP) &&
+                     (o[k].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE);
+        if (!writes) return frame;
+        if (ins.mnemonic == ZYDIS_MNEMONIC_MOV && ins.operand_count_visible == 2 && o[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            o[0].reg.value == ZYDIS_REGISTER_EBP && o[1].type == ZYDIS_OPERAND_TYPE_REGISTER && o[1].reg.value == ZYDIS_REGISTER_ESP)
+            return true;
+        if (ins.mnemonic == ZYDIS_MNEMONIC_LEA && o[0].reg.value == ZYDIS_REGISTER_EBP && o[1].mem.base == ZYDIS_REGISTER_ESP &&
+            o[1].mem.index == ZYDIS_REGISTER_NONE && o[1].mem.segment != ZYDIS_REGISTER_FS && o[1].mem.disp.value > -0x10000 &&
+            o[1].mem.disp.value < 0x10000)
+            return true;
+        return false;
+    };
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t i = 0; i < n; i++) {
+            const bool out = transfer(insns_[i], in[i]);
+            if (out) continue;
+            for (uint32_t s : insns_[i].succ) {
+                char& t = in[index_[s]];
+                if (t) t = 0, changed = true;
+            }
+        }
+    }
+    for (size_t i = 0; i < n; i++) insns_[i].ebp_frame = in[i];
+}
+
 uint32_t FunctionWriter::FlagSummary(std::vector<std::pair<uint32_t, uint32_t>>* returns,
                                      std::vector<uint32_t>* targets, std::vector<uint32_t>* tails) {
     Prepare();
@@ -416,6 +461,7 @@ std::string FunctionWriter::EmitOne(Decoded d) {
 std::string FunctionWriter::Write() {
     Prepare();
     Liveness();
+    FramePointer();
 
     ZydisFormatter fmt;
     ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL);

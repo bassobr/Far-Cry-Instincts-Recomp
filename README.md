@@ -52,6 +52,7 @@ the other open-source projects listed under [Credits](#credits).
 
 **Comfort**
 - Settings menu on **F10** (controller: **Back + Start**), applied at once where possible and saved to the ini file
+- **Exit Game** in the F10 menu: quits to the desktop after a confirmation, like closing the window
 - Windowed, borderless or exclusive fullscreen, monitor and resolution selection, **F11** / **Alt+Enter** toggles
   fullscreen
 - Skip the intro videos, pause when the window loses focus
@@ -187,6 +188,9 @@ Run `out\build\release\FarCryInstincts.exe`. To use a build from source elsewher
 mouse), right / left mouse button = left / right trigger, Space = A, C = B, E = X, Q = Y, F = White, G = Black,
 Enter = Start, Escape = Back, arrow keys = D-pad, IJKL = right stick, Left Shift / V = stick clicks. Controllers map
 as on the Xbox, with LB = White and RB = Black.
+Two movement keys at once (W+A, W+D, ...) move diagonally as fast as straight, like a fully pushed stick; before
+0.9 they ran faster than any stick, and above the top speed the game's collision could fling the player off edges
+(#31). `FCI_KEY_DIAGONAL_FULL=1` brings back the old diagonal.
 
 **Dual-wielding (akimbo):** pick up a second MP5, P90, Desert Eagle, Glock or Beretta, then press the D-pad
 direction of its slot twice (left: primary, right: pistols) to switch between one and two guns. As on the Xbox,
@@ -200,10 +204,16 @@ can also be set as an environment variable `FCI_<KEY>` (upper case), which takes
 of them, applies what can change at run time and saves to the ini file; settings that need a restart are marked
 there.
 
+The menu's **Exit Game** button (bottom left; with the keyboard or a controller: down past the last row, then left)
+asks "EXIT TO DESKTOP?" first: A or Enter exits, B or Escape goes back to the settings. It ends the program the same
+way as closing the window: the settings are saved, a save the game is writing (checkpoint, level end) is finished
+first, and the process ends with exit code 0. Progress since the last checkpoint is lost, as when closing the window.
+On the Steam Deck, Proton and its processes end with the game.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `scale` | `auto` | Render resolution: `auto` = the output's height, `<n>%` = share of it (20–200 %), a number = multiple of 640x480 (0.5–6) |
-| `msaa` | `4` | Multisampling: 1, 2, 4, 8 (limited to what the GPU supports) |
+| `msaa` | `4` (ROG Ally X `2`) | Multisampling: 1, 2, 4, 8 (limited to what the GPU supports) |
 | `smaa` | `1` | SMAA on the final image (0 = off) |
 | `aniso` | `16` | Anisotropic filtering, 1–16 (1 = off) |
 | `shadow_scale` | `2` (Steam Deck `4`) | Shadow map resolution, 1–8 times the console's |
@@ -313,8 +323,26 @@ non-Steam shortcut appears as `Non-Steam shortcut: FarCryInstincts.exe (<id>)`),
 `protontricks <id> d3dcompiler_47`. The log's `render: HLSL compiler …` line names the compiler in use.
 
 On a Steam Deck (detected from the firmware's board and product names, or `SteamDeck=1`) some defaults change:
-`ao = gtao`, `shadow_scale = 4`, `frame_queue = 2`, `lod_distance = 1`, `view_distance = 1`. Values set in the ini
-file, the environment or the menu still win. `FCI_DEVICE=deck` or `FCI_DEVICE=pc` overrides the detection.
+`ao = gtao`, `shadow_scale = 4`, `frame_queue = 2`, `lod_distance = 1`, `view_distance = 1`.
+
+On a ROG Ally X (ASUS model RC73XA, the ROG Xbox Ally X, or RC72LA, the 2024 ROG Ally X, in the firmware's product
+name, under Windows or Proton) the default is `msaa = 2`; everything else stays at the PC defaults (full output
+resolution, SMAA, SSAO, shadows, detail distances, one frame ahead). Measured on a ROG Xbox Ally X under Windows 11
+at 1920x1080, 120 Hz: with 4x MSAA the GPU is the limit (about 109 fps at rock faces, lows down to 25–70 fps on the
+beach after the opening boat ride); with 2x it holds 120 fps there. 85 % render resolution with 4x was worse, and
+`frame_queue = 2` changed nothing. The 2024 model (Radeon 780M) and SteamOS on the Ally are not tested yet. The ROG
+Ally (RC71L) and the ROG Xbox Ally (RC73YA) keep the PC defaults.
+
+On both, values set in the ini file, the environment or the menu still win; the menu marks the device's value as its
+default. `FCI_DEVICE=deck`, `FCI_DEVICE=ally` or `FCI_DEVICE=pc` overrides the detection.
+
+**Multisampling on AMD graphics.** The terrain's colour pass reads the frame's pixels around its own (the fix for
+the seams of #19). On AMD graphics under Windows and on a detected ROG Ally X the game draws the terrain piece once
+more just before it and averages only the pixels it will read, instead of resolving the whole multisampled frame for
+every terrain piece (7–10 times a frame, about 0.2 ms each at 1080p 4x on the Ally X's Radeon 890M). Same picture
+(single pixels differ by a few levels); on the Ally X at 4x it saves 0.9–1.4 ms a frame (+10–19 % frame rate).
+Everything else (NVIDIA, Intel, the Steam Deck) keeps the resolve. `FCI_MIRROR_TAPS=resolve` brings back the
+resolve, `FCI_MIRROR_TAPS=pass` forces the pass.
 
 ## Frame rate and game logic
 

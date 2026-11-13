@@ -113,6 +113,31 @@ bool g_depth_stencil = GetEnvironmentVariableA("FCI_DEPTH_STENCIL", nullptr, 0) 
 uint64_t g_generation = 1;  // advances at every flush; caches re-check guest memory once per generation
 uint64_t g_draws = 0, g_clears = 0;
 uint64_t g_fast_clears = 0, g_resolves = 0;  // performance: clears through the clear calls, MSAA resolves
+// ---- performance: MSAA resolves by what they are for (FCI_GPU_TIMING shows each kind's count and GPU time) ----
+enum class ResolveUse : uint8_t {
+    kMirrorTaps,  // GitHub #19: the filter's texels of a pass that reads the target it draws into (one per read)
+    kPresent,     // the frame shown
+    kTexture,     // a draw samples the target as a texture (TargetSnapshot)
+    kRows,        // the same, rows further down the target (split screen's lower view)
+    kGuestCopy,   // GitHub #27: post processing reads the target at the console's size
+    kStaging,     // a CPU read of the target (guest memory)
+    kWater,       // PC water's copy of the scene (its time counts as the water's)
+    kOther,
+    kTapsPass,    // not a resolve: the taps' pass that replaces kMirrorTaps (below, "the taps' pass")
+    kCount
+};
+uint64_t g_resolve_uses[int(ResolveUse::kCount)] = {};
+// ---- performance: the taps' pass. A pass that reads the target it draws into (GitHub #19, the target's mirror)
+// takes the filter's texels from the target's resolved copy, one resolve of the whole target per such draw (7-10 a
+// frame). On the ROG Ally X (Radeon 890M, Windows) each resolve of a 1080p 4x target costs ~0.2 ms (ResolveSubresource
+// and a shader that averages the samples alike: the memory traffic of every sample), 1.4-1.7 ms a frame in all. The
+// taps' pass draws the draw's geometry just before it with a shader of its own (psh::GenerateTapsPass) and no colour
+// target, which stores the average of the samples at exactly the texels the draw will read into a texture of their
+// own (Target::taps): the same values, from a fraction of the target. On where it pays (DecideTapsPass): AMD under
+// Windows, a detected ROG Ally X; FCI_MIRROR_TAPS=resolve the resolve as before, =pass the pass anywhere ----
+bool g_taps_pass = false;
+bool g_taps_flip_on = true;  // diagnostics: FCI_TARGET_MS_FLIP with FCI_TARGET_MS_FLIP_TAPS=1 (Present)
+// ---- end performance ----
 uint64_t g_target_copies = 0;  // GitHub #19: multisampled copies of the target a draw reads while drawing into it
 uint64_t g_mirror_reads = 0, g_mirror_writes = 0;  // GitHub #19: such reads from the target's mirror, draws into it
 uint64_t g_writebacks = 0;  // render target write-backs into guest memory; texture caches must look again
@@ -181,6 +206,7 @@ struct GpuTiming {
     struct Mark {
         ComPtr<ID3D11Query> query;
         Pass pass;  // the kind of work from this timestamp to the next
+        int use;    // kResolve: its ResolveUse, else -1
     };
     struct Frame {
         ComPtr<ID3D11Query> disjoint;
@@ -193,8 +219,11 @@ struct GpuTiming {
     Frame frames[4];
     uint32_t current = 0;
     Pass pass = Pass::kNone;
+    int use = -1;
     std::vector<ComPtr<ID3D11Query>> spare;
     double total[int(Pass::kCount)] = {}, frame_total = 0;
+    double resolve_by[int(ResolveUse::kCount)] = {};  // GPU time of the resolves by use
+    uint64_t uses_before[int(ResolveUse::kCount)] = {};  // g_resolve_uses at the last line
     uint32_t counted = 0;
 
     ComPtr<ID3D11Query> Timestamp() {
@@ -208,15 +237,15 @@ struct GpuTiming {
         g_device->CreateQuery(&desc, &q);
         return q;
     }
-    void Begin(Pass p) {
+    void Begin(Pass p, int u = -1) {
         Frame& f = frames[current];
         if (!f.open) return;
-        if (p == pass) return;
+        if (p == pass && u == use) return;
         ComPtr<ID3D11Query> q = Timestamp();
         if (!q) return;
         g_context->End(q.Get());
-        f.marks.push_back({std::move(q), p});
-        pass = p;
+        f.marks.push_back({std::move(q), p, u});
+        pass = p, use = u;
     }
     // the frames whose results are in; then this frame ends and the next begins
     void FrameEnd() {
@@ -250,8 +279,11 @@ struct GpuTiming {
         for (size_t i = 0; i < f.marks.size(); i++)
             while (g_context->GetData(f.marks[i].query.Get(), &t[i], sizeof t[i], 0) == S_FALSE) {}
         if (!dj.Disjoint && dj.Frequency) {
-            for (size_t i = 0; i + 1 < f.marks.size(); i++)
-                total[int(f.marks[i].pass)] += double(t[i + 1] - t[i]) * 1000.0 / double(dj.Frequency);
+            for (size_t i = 0; i + 1 < f.marks.size(); i++) {
+                const double ms = double(t[i + 1] - t[i]) * 1000.0 / double(dj.Frequency);
+                total[int(f.marks[i].pass)] += ms;
+                if (f.marks[i].pass == Pass::kResolve && f.marks[i].use >= 0) resolve_by[f.marks[i].use] += ms;
+            }
             const double ms = double(t.back() - t.front()) * 1000.0 / double(dj.Frequency);
             frame_total += ms;
             counted++;
@@ -279,6 +311,18 @@ struct GpuTiming {
                     total[6] / counted, total[7] / counted, total[2] / counted, (total[8] + total[10]) / counted,
                     total[10] / counted, total[3] / counted, total[4] / counted, total[5] / counted, total[0] / counted,
                     total[9] / counted);
+            // per kind: resolves a frame (counted on the CPU over the same frames, give or take the 3 frames the
+            // results lag) and their GPU time
+            double n[int(ResolveUse::kCount)];
+            for (int i = 0; i < int(ResolveUse::kCount); i++)
+                n[i] = double(g_resolve_uses[i] - uses_before[i]) / counted, uses_before[i] = g_resolve_uses[i];
+            rt::Log("render: resolves per frame by use (count, ms): mirror taps %.1f %.3f, present %.1f %.3f, textures "
+                    "%.1f %.3f, rows %.1f %.3f, guest copies %.1f %.3f, CPU reads %.1f %.3f, other %.1f %.3f, PC water "
+                    "%.1f (in its time); taps' passes instead %.1f %.3f",
+                    n[0], resolve_by[0] / counted, n[1], resolve_by[1] / counted, n[2], resolve_by[2] / counted, n[3],
+                    resolve_by[3] / counted, n[4], resolve_by[4] / counted, n[5], resolve_by[5] / counted, n[7],
+                    resolve_by[7] / counted, n[6], n[8], resolve_by[8] / counted);
+            for (double& v : resolve_by) v = 0;
             for (double& v : total) v = 0;
             frame_total = 0, counted = 0;
         }
@@ -482,6 +526,11 @@ struct Target {
     ComPtr<ID3D11ShaderResourceView> resolved_srv, upload_srv;
     ComPtr<ID3D11RenderTargetView> shrunk_rtv;
     uint64_t resolved_version = ~0ull;
+    // performance: the taps' pass (g_taps_pass): the multisampled texture read (t9), the texels stored (RGBA8)
+    ComPtr<ID3D11ShaderResourceView> ms_srv;
+    ComPtr<ID3D11Texture2D> taps;
+    ComPtr<ID3D11ShaderResourceView> taps_srv;
+    ComPtr<ID3D11UnorderedAccessView> taps_uav;
     // GitHub #19: multisampled, a multisampled copy for a draw that reads this target while drawing into it
     ComPtr<ID3D11Texture2D> ms_copy;
     ComPtr<ID3D11ShaderResourceView> ms_copy_srv;
@@ -796,8 +845,11 @@ Target* GetTarget(uint32_t address, uint32_t format, uint32_t width, uint32_t he
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc.Count = samples;
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET | (samples == 1 ? D3D11_BIND_SHADER_RESOURCE : 0);
+    // (performance: with the taps' pass a multisampled target is a shader resource too)
+    const bool ms_read = samples > 1 && g_taps_pass;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | (samples == 1 || ms_read ? D3D11_BIND_SHADER_RESOURCE : 0);
     if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &t->texture))) return nullptr;
+    if (ms_read) g_device->CreateShaderResourceView(t->texture.Get(), nullptr, &t->ms_srv);
     desc.Width = width, desc.Height = height, desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_STAGING, desc.BindFlags = 0, desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &t->staging))) return nullptr;
@@ -1743,7 +1795,7 @@ bool DirtyOverlap(uint32_t address, uint32_t size) {
 
 // a linear texture that is exactly a render target's surface: sample a GPU-side snapshot of the host copy
 // instead of a round trip through guest memory
-ID3D11ShaderResourceView* Resolved(Target& t);
+ID3D11ShaderResourceView* Resolved(Target& t, ResolveUse use);
 ID3D11ShaderResourceView* GuestCopy(Target& t);  // GitHub #27
 
 // ---- GitHub #19: a draw that reads the multisampled target it draws into ----
@@ -1962,7 +2014,7 @@ ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[4],
                 g_device->CreateShaderResourceView(r.texture.Get(), nullptr, &r.srv);
             }
             if (r.version != t->version) {
-                ID3D11ShaderResourceView* whole = Resolved(*t);
+                ID3D11ShaderResourceView* whole = Resolved(*t, ResolveUse::kRows);
                 ComPtr<ID3D11Resource> src;
                 whole->GetResource(&src);
                 D3D11_BOX box{0, row0, 0, t->HostWidth(), row1, 1};
@@ -1989,7 +2041,7 @@ ID3D11ShaderResourceView* TargetSnapshot(const texture::Desc& d, float scale[4],
             return g;
         }
     if (Target* t = found; t && t->samples > 1) {  // performance: one resolve serves snapshots and the present
-        ID3D11ShaderResourceView* r = Resolved(*t);
+        ID3D11ShaderResourceView* r = Resolved(*t, ResolveUse::kTexture);
         if (r && linear) scale[0] = 1.0f / t->width, scale[1] = 1.0f / t->height;
         return r;
     }
@@ -2681,6 +2733,31 @@ void LogShaderCompiler() {
     }
 }
 
+// ---- performance: the taps' pass or the resolve for the mirror's filter texels (g_taps_pass, above) ----
+void DecideTapsPass() {
+    char v[16] = {};
+    GetEnvironmentVariableA("FCI_MIRROR_TAPS", v, sizeof v);
+    UINT vendor = 0;
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC desc{};
+    if (SUCCEEDED(g_device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)))
+        vendor = desc.VendorId;
+    const bool wine = UnderWine();
+    // the ROG Ally X's GPU (RDNA 3.5) under SteamOS as well (not measured there); the Steam Deck (RDNA 2, Proton)
+    // resolves cheaply (0.2-0.4 ms a frame in all at 800 lines) and keeps the resolve
+    const bool ally = settings::Device().find("Ally") != std::string::npos;
+    const char* why;
+    if (!_stricmp(v, "resolve")) g_taps_pass = false, why = "FCI_MIRROR_TAPS=resolve";
+    else if (!_stricmp(v, "pass")) g_taps_pass = true, why = "FCI_MIRROR_TAPS=pass";
+    else if (ally) g_taps_pass = true, why = "auto: ROG Ally X";
+    else if (vendor == 0x1002 && !wine) g_taps_pass = true, why = "auto: AMD under Windows";
+    else g_taps_pass = false, why = "auto";
+    rt::Log("render: GitHub #19's filter texels: %s (%s; GPU vendor %04X%s)",
+            g_taps_pass ? "the taps' pass" : "a resolve of the target per draw", why, vendor, wine ? ", Wine/Proton" : "");
+}
+// ---- end performance ----
+
 bool Ready() {
     if (g_init_done) return !g_failed;
     g_init_done = true;
@@ -2701,6 +2778,7 @@ bool Ready() {
     }
     if (flags & D3D11_CREATE_DEVICE_DEBUG) g_device.As(&g_info);
     LogShaderCompiler();
+    DecideTapsPass();  // performance: before the first target
     PrefetchShaderCache();  // performance: shaders off the render thread
     if (g_hle) ao::Prepare(g_device.Get());  // ambient occlusion shaders compile in the background
     g_clear_constants = MakeConstantBuffer(32);
@@ -2845,7 +2923,7 @@ void DumpDrawStep(Target* t) {
                !GetEnvironmentVariableA("FCI_DUMP_DRAWS_PROBE", nullptr, 0);
     }();
     if (host) {
-        ID3D11ShaderResourceView* view = Resolved(*t);
+        ID3D11ShaderResourceView* view = Resolved(*t, ResolveUse::kOther);
         if (!view) return;
         ComPtr<ID3D11Resource> res;
         view->GetResource(&res);
@@ -3039,8 +3117,28 @@ void ScaleDraw(ID3D11RenderTargetView* rtv, uint32_t w, uint32_t h, ID3D11Shader
     g_context->OMSetRenderTargets(0, nullptr, nullptr);
 }
 
+// ---- performance: the taps' pass (g_taps_pass): the texture its texels go to, made the first time ----
+bool TapsTexture(Target& t) {
+    if (t.taps) return t.taps_srv && t.taps_uav;
+    D3D11_TEXTURE2D_DESC desc{t.HostWidth(), t.HostHeight(), 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+                              D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0};
+    if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &t.taps))) {
+        rt::Log("render: the taps' texture (%ux%u) could not be made: resolves for target %08X", desc.Width,
+                desc.Height, t.address);
+        return false;
+    }
+    if (FAILED(g_device->CreateShaderResourceView(t.taps.Get(), nullptr, &t.taps_srv)) ||
+        FAILED(g_device->CreateUnorderedAccessView(t.taps.Get(), nullptr, &t.taps_uav))) {
+        rt::Log("render: the taps' texture's views could not be made: resolves for target %08X", t.address);
+        t.taps_srv.Reset(), t.taps_uav.Reset();
+        return false;
+    }
+    return true;
+}
+// ---- end performance ----
+
 // a single sampled view of the target's current contents at host size
-ID3D11ShaderResourceView* Resolved(Target& t) {
+ID3D11ShaderResourceView* Resolved(Target& t, ResolveUse use) {
     if (t.samples == 1) {
         if (!t.srv) g_device->CreateShaderResourceView(t.texture.Get(), nullptr, &t.srv);
         return t.srv.Get();
@@ -3054,10 +3152,11 @@ ID3D11ShaderResourceView* Resolved(Target& t) {
     if (t.resolved_version != t.version) {
         g_context->OMSetRenderTargets(0, nullptr, nullptr);
         // performance: FCI_GPU_TIMING (the PC water's copy of the scene counts as the water's)
-        if (g_gpu_timing.enabled && g_gpu_timing.pass != Pass::kWater) g_gpu_timing.Begin(Pass::kResolve);
+        if (g_gpu_timing.enabled && g_gpu_timing.pass != Pass::kWater) g_gpu_timing.Begin(Pass::kResolve, int(use));
         g_context->ResolveSubresource(t.resolved.Get(), 0, t.texture.Get(), 0, DXGI_FORMAT_B8G8R8A8_UNORM);
         t.resolved_version = t.version;
         g_resolves++;
+        g_resolve_uses[int(use)]++;
     }
     return t.resolved_srv.Get();
 }
@@ -3078,7 +3177,7 @@ void ToStagingTexture(Target& t, ID3D11Texture2D* staging) {
         if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &t.shrunk))) return;
         g_device->CreateRenderTargetView(t.shrunk.Get(), nullptr, &t.shrunk_rtv);
     }
-    ID3D11ShaderResourceView* src = Resolved(t);
+    ID3D11ShaderResourceView* src = Resolved(t, ResolveUse::kStaging);
     g_context->OMSetRenderTargets(0, nullptr, nullptr);
     ScaleDraw(t.shrunk_rtv.Get(), t.width, t.height, src, Scaler().shrink.Get(), float(t.HostHeight()) / float(t.height),
               float(t.HostWidth()) / float(t.width));
@@ -3096,7 +3195,7 @@ ID3D11ShaderResourceView* GuestCopy(Target& t) {
         g_device->CreateShaderResourceView(t.guest_copy.Get(), nullptr, &t.guest_copy_srv);
     }
     if (t.guest_copy_version != t.version) {
-        ID3D11ShaderResourceView* src = Resolved(t);
+        ID3D11ShaderResourceView* src = Resolved(t, ResolveUse::kGuestCopy);
         if (!src) return nullptr;
         g_context->OMSetRenderTargets(0, nullptr, nullptr);
         ScaleDraw(t.guest_copy_rtv.Get(), t.width, t.height, src, Scaler().shrink.Get(),
@@ -3486,7 +3585,7 @@ bool PrepareWater(const State& s, const Draw& d, const Surfaces& surf, WaterPass
     if (quality >= water::kHigh) {
         Target& t = *surf.color;
         if (t.samples > 1) {
-            scene = Resolved(t);  // (unbinds the targets when it resolves)
+            scene = Resolved(t, ResolveUse::kWater);  // (unbinds the targets when it resolves)
         } else {
             // without MSAA Resolved is the target itself, which the draw writes: a copy (the snapshot, as for textures)
             if (!t.snapshot) {
@@ -4019,9 +4118,23 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     // samples with the marker (no resolve, a few levels apart at the edges of surfaces)
     static const bool mirror_marked = GetEnvironmentVariableA("FCI_TARGET_MIRROR_MARKED", nullptr, 0) > 0;
     ID3D11ShaderResourceView* mirror_taps = nullptr;
+    // performance: the taps' pass instead of the resolve where its shader is ready (until then, or without a depth
+    // target to rasterize alike, the resolve)
+    Target* taps_target = nullptr;
+    ID3D11PixelShader* taps_ps = nullptr;
     for (int i = 0; i < 4 && config.mirror_read && !mirror_marked && !mirror_taps; i++)
-        if ((config.mirror_read >> i) & 1)
-            if ((mirror_taps = Resolved(*g_stage_target_ms[i]))) config.mirror_resolved = true, Rebind(surf);
+        if ((config.mirror_read >> i) & 1) {
+            Target& t = *g_stage_target_ms[i];
+            if (g_taps_pass && g_taps_flip_on && t.ms_srv && surf.depth && TapsTexture(t)) {
+                psh::Config pass = config;
+                pass.mirror_resolved = true, pass.taps_pass = true;
+                if ((taps_ps = GetPixelShader(s, pass))) {
+                    mirror_taps = t.taps_srv.Get(), taps_target = &t, config.mirror_resolved = true;
+                    break;
+                }
+            }
+            if ((mirror_taps = Resolved(t, ResolveUse::kMirrorTaps))) config.mirror_resolved = true, Rebind(surf);
+        }
     // ---- end GitHub #19 ----
     // a stage reads the depth target this draw tests against (the ocean, DepthTexture): bound read-only for the draw
     // (the game writes no depth there); were it written, the stage reads nothing
@@ -4115,6 +4228,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         }
     }
     if (!vs || !vs->layout || !ps) return;
+    if (!config.mirror_read || !config.mirror_resolved) taps_ps = nullptr;  // (the copy after all: no taps' pass)
     // ---- PC water ----
     WaterPass wpass;
     if (g_hle && water::Current() && IsOcean(s, d, surf)) PrepareWater(s, d, surf, wpass, vs, ps);
@@ -4859,6 +4973,42 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         if (!needed) bound_ps = nullptr;
     }
 
+    // ---- performance: the taps' pass (above, "the taps' pass"), right before each draw call of the draw: its geometry
+    // with the taps' shader, no colour target, the target multisampled as t9 and the taps' texture as u0. The same depth
+    // target keeps the rasterization (the samples) and the depth test the draw's, without writes; a draw whose shader
+    // writes the depth tests nothing here (the pass runs at least where the draw's shader does) ----
+    auto taps_before = [&](auto&& issue) {
+        if (!taps_ps) return;
+        if (g_gpu_timing.enabled) g_gpu_timing.Begin(Pass::kResolve, int(ResolveUse::kTapsPass));
+        ID3D11RenderTargetView* rtvs[2] = {};
+        ID3D11DepthStencilView* dsv = nullptr;
+        g_context->OMGetRenderTargets(2, rtvs, &dsv);
+        D3D11_DEPTH_STENCIL_DESC tap_ds = ds;
+        tap_ds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO, tap_ds.StencilWriteMask = 0;
+        if (config.depth != psh::Depth::kNone) tap_ds.DepthFunc = D3D11_COMPARISON_ALWAYS, tap_ds.StencilEnable = FALSE;
+        g_context->OMSetDepthStencilState(GetDepthState(tap_ds), g_ds.ref);
+        ID3D11ShaderResourceView* none = nullptr;
+        g_context->PSSetShaderResources(6, 1, &none);  // (the taps' texture: written now, read by the draw after)
+        ID3D11UnorderedAccessView* uav = taps_target->taps_uav.Get();
+        g_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, dsv, 0, 1, &uav, nullptr);
+        ID3D11ShaderResourceView* frame = taps_target->ms_srv.Get();
+        g_context->PSSetShaderResources(9, 1, &frame);
+        g_context->PSSetShader(taps_ps, nullptr, 0);
+        issue();
+        g_context->PSSetShaderResources(9, 1, &none);
+        const UINT n = rtvs[1] ? 2 : rtvs[0] ? 1 : 0;
+        g_context->OMSetRenderTargetsAndUnorderedAccessViews(n, rtvs, dsv, n, 0, nullptr, nullptr);
+        for (auto* v : rtvs)
+            if (v) v->Release();
+        if (dsv) dsv->Release();
+        g_context->OMSetDepthStencilState(g_ds.depth, g_ds.ref);
+        g_context->PSSetShader(bound_ps, nullptr, 0);
+        g_context->PSSetShaderResources(6, 1, &mirror_taps);
+        g_resolve_uses[int(ResolveUse::kTapsPass)]++;
+        begin_timing();
+    };
+    // ---- end performance ----
+
     // geometry
     UINT issued = 0;  // screen masks: the draw call, to issue again for the sides
     bool issued_indexed = false;
@@ -4940,6 +5090,7 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
         g_context->IASetVertexBuffers(0, last, vbs, strides, offsets);
         BindPipeline(vs, topology, bound_ps, vcb, pcb, srvs, samplers);
         g_context->IASetIndexBuffer(vb, short_ids ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, at_piece[n]);
+        taps_before([&] { g_context->DrawIndexed(UINT(count), 0, 0); });  // performance: the taps' pass
         g_context->DrawIndexed(UINT(count), 0, 0);
         issued = UINT(count), issued_indexed = true;  // screen masks
         // ---- end performance ----
@@ -4957,11 +5108,13 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
     g_context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
     BindPipeline(vs, topology, bound_ps, vcb, pcb, srvs, samplers);
     if (indices.empty()) {
+        taps_before([&] { g_context->Draw(d.count, 0); });  // performance: the taps' pass
         g_context->Draw(d.count, 0);
         issued = d.count;  // screen masks
     } else {
         UINT at = index_ring.Push(indices.data(), UINT(indices.size() * 4));
         g_context->IASetIndexBuffer(index_ring.buffer.Get(), DXGI_FORMAT_R32_UINT, at);
+        taps_before([&] { g_context->DrawIndexed(UINT(indices.size()), 0, 0); });  // performance: the taps' pass
         g_context->DrawIndexed(UINT(indices.size()), 0, 0);
         issued = UINT(indices.size()), issued_indexed = true;  // screen masks
     }
@@ -4982,8 +5135,12 @@ void DrawOne(const State& s, const Draw& d) {  // (DrawPrimitives, below, adds f
             vc.hud[0] = kMaskStretch, vc.hud[1] = middle - at * kMaskStretch, vc.hud[2] = 1.0f, vc.hud[3] = 0.0f;
             vertex_constants.Update(vc);  // (the same buffer, bound)
             g_context->RSSetScissorRects(1, &strip);
-            if (issued_indexed) g_context->DrawIndexed(issued, 0, 0);
-            else g_context->Draw(issued, 0);
+            auto again = [&] {
+                if (issued_indexed) g_context->DrawIndexed(issued, 0, 0);
+                else g_context->Draw(issued, 0);
+            };
+            taps_before(again);  // performance: the taps' pass (the stretched draw reads other texels)
+            again();
         }
     }
     // ---- end screen masks ----
@@ -5355,12 +5512,12 @@ void Flush() {
     if (g_generation % 600 == 0)
         rt::Log("render: generation %llu, %llu draws, %llu clears (%llu fast), %llu resolves, %zu targets, %zu textures, "
                 "%zu+%zu shaders, display %08X, %llu multisampled copies of the target being drawn, %llu reads of "
-                "its mirror, %llu draws into it",
+                "its mirror, %llu draws into it, %llu taps' passes",
                 (unsigned long long)g_generation, (unsigned long long)g_draws, (unsigned long long)g_clears,
                 (unsigned long long)g_fast_clears, (unsigned long long)g_resolves,
                 g_targets.size(), g_textures.size(), g_vertex_shaders.size(), g_pixel_shaders.size(),
                 DisplayAddress(), (unsigned long long)g_target_copies, (unsigned long long)g_mirror_reads,
-                (unsigned long long)g_mirror_writes);
+                (unsigned long long)g_mirror_writes, (unsigned long long)g_resolve_uses[int(ResolveUse::kTapsPass)]);
     if (g_generation % 600 == 0 && (g_left_out || g_held_frames))  // performance: shaders off the render thread
         rt::Log("render: draws left out until their shaders were ready: %llu, in %llu shown frames (%llu for a vertex "
                 "shader, %llu for a pixel shader); %llu long frames held back",
@@ -5442,7 +5599,7 @@ void Present(uint32_t front) {
     ID3D11ShaderResourceView* srv = nullptr;
     uint32_t w = 0, h = 0;
     if (shown) {
-        srv = Resolved(*shown);
+        srv = Resolved(*shown, ResolveUse::kPresent);
         w = shown->HostWidth(), h = shown->HostHeight();
     }
     g_context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -5485,9 +5642,11 @@ void Present(uint32_t front) {
        // the first frame) the draws that read the target they draw into alternate every n shown frames between its
        // multisampled copy and the resolved copy (as before), each frame dumped as frame_<vblank>_<k>_ms / _res.bmp
        // (A/B in one run); outside them the multisampled copy. With FCI_TARGET_MS_FLIP_COPY=1 between the target's
-       // mirror (_ms) and the multisampled copy (_res) instead, the current fix's two ways
+       // mirror (_ms) and the multisampled copy (_res) instead, the current fix's two ways; with
+       // FCI_TARGET_MS_FLIP_TAPS=1 (and the taps' pass on) between the taps' pass (_ms) and the resolve (_res)
         static const bool flip_copy = GetEnvironmentVariableA("FCI_TARGET_MS_FLIP_COPY", nullptr, 0) > 0;
-        bool& flip = flip_copy ? g_target_mirror_flip_on : g_target_ms_flip_on;
+        static const bool flip_taps = GetEnvironmentVariableA("FCI_TARGET_MS_FLIP_TAPS", nullptr, 0) > 0;
+        bool& flip = flip_taps ? g_taps_flip_on : flip_copy ? g_target_mirror_flip_on : g_target_ms_flip_on;
         static const ULONGLONG start = GetTickCount64();
         static int n = 0;
         static std::vector<std::pair<double, double>> windows = [] {

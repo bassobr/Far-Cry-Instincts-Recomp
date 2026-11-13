@@ -17,4 +17,10 @@ void MenuPause(bool open);
 void SetPauseOnFocusLoss(bool on);
 // ---- end settings menu ----
 
+// the program ends (window closed, the menu's Exit Game, the session ends): the settings menu closes (its settings
+// saved), a pause ends and none starts again, so a save the pause held between two of its steps can finish
+// (kernel::FinishSaves). From the window procedure: waits at most max_ms for the game to run again, handling the
+// window's messages meanwhile (the menu's last frame may wait on them)
+void ResumeForExit(unsigned max_ms);
+
 }  // namespace app

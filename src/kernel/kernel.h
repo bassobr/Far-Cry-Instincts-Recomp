@@ -123,7 +123,9 @@ void NoteSaveChange(const std::filesystem::path& host);
 void SaveWriterOpened();
 void SaveWriterClosed();
 // before the process ends (window closed, relaunch, quit): waits up to max_ms until no save file is open for
-// writing and none changed for quiet_ms, then lets no new save start
+// writing and none changed for quiet_ms, then lets no new save start. quiet_ms counts in guest time, which stands
+// still while the game is held (focus pause, settings menu): the window's end lets the game run first
+// (app::ResumeForExit)
 void FinishSaves(const char* why, uint32_t max_ms, uint32_t quiet_ms);
 // FCI_SAVE_GUARD=0: none of the above but the check and the log (tests; a way out)
 bool SaveGuardOff();

@@ -1,7 +1,8 @@
 // The settings menu: F10 (or Back + Start on a controller) opens and closes it, Escape / B / the Back button close
 // it. While it is open the game is held as by the focus pause (app/focus_pause.h) and gets no input; changes are
 // written to FarCryInstincts.ini at once, those that can apply while running do so, the others are marked for a
-// restart. Dear ImGui on the Direct3D 11 presenter (gpu/present.h).
+// restart. Dear ImGui on the Direct3D 11 presenter (gpu/present.h). Its Exit Game button asks first, then closes the
+// window as its close button does (video/display.cpp: the menu closes, a save in progress finishes, exit code 0).
 #pragma once
 
 #include <windows.h>

@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "kernel/kernel.h"
+#include "runtime/guest_time.h"
 #include "runtime/scheduler.h"
 
 namespace kernel {
@@ -62,11 +63,23 @@ bool g_have_key = false;
 std::mutex g_lock;
 std::condition_variable g_changed;
 int g_writers = 0;              // save files open for writing
-uint64_t g_last_change = 0;     // GetTickCount64 of the last change
+uint64_t g_last_change = 0;     // GuestMs() of the last change
 std::set<fs::path> g_dirty;     // profile folders changed since their last backup
 bool g_ending = false;          // FinishSaves: no new save starts
 uint32_t g_ending_quiet = 0;    // ... once none changed for this long
 bool g_guard_started = false;
+
+// the quiet times count in guest time (ms, runtime/guest_time.h): it stands still while the game is held (pause on
+// focus loss, the settings menu), so a save the hold stopped between two of its steps never looks finished only
+// because nothing changed while the game stood still
+uint64_t GuestMs() {
+    static const int64_t frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    return uint64_t(rt::GuestQpc()) * 1000 / uint64_t(frequency);
+}
 
 std::wstring Lower(std::wstring s) {
     for (auto& ch : s) ch = wchar_t(towlower(ch));
@@ -266,7 +279,7 @@ void Guard() {
             std::unique_lock lock(g_lock);
             g_changed.wait(lock, [] { return !g_dirty.empty(); });
             for (;;) {
-                uint64_t quiet = GetTickCount64() - g_last_change;
+                uint64_t quiet = GuestMs() - g_last_change;
                 if (g_writers == 0 && quiet >= kBackupQuietMs) break;
                 g_changed.wait_for(lock, std::chrono::milliseconds(kBackupQuietMs - std::min<uint64_t>(quiet, kBackupQuietMs) + 50));
             }
@@ -352,7 +365,9 @@ bool Restore(const fs::path& profile, const fs::path& backup) {
 
 // Tests of an end in the middle of a save, at the n-th change of a save file of this process (counted from 1):
 //   FCI_TEST_KILL_SAVE=<n>   the process is killed right there (as by a crash, the task manager, power loss);
-//   FCI_TEST_CLOSE_SAVE=<n>  the window gets WM_CLOSE right there (the player closes it while the game saves).
+//   FCI_TEST_CLOSE_SAVE=<n>  the window gets WM_CLOSE right there (the player closes it while the game saves);
+//   FCI_TEST_MENU_SAVE=<n>   the window gets F10 right there: the settings menu holds the game in the middle of the
+//                            save (then FCI_MENU_SCRIPT ends the program from the menu, or the window is closed).
 // With "<n>+" the n-th change of the first process; plain <n> counts in every process (a relaunch starts at 1).
 void TestEnd(const fs::path& host) {
     static const auto setting = [](const char* name) {
@@ -361,10 +376,31 @@ void TestEnd(const fs::path& host) {
         if (std::strchr(v, '+') && GetEnvironmentVariableA("FCI_RELAUNCHED", nullptr, 0) > 0) return 0;
         return std::atoi(v);
     };
-    static const int kill = setting("FCI_TEST_KILL_SAVE"), close = setting("FCI_TEST_CLOSE_SAVE");
+    static const int kill = setting("FCI_TEST_KILL_SAVE"), close = setting("FCI_TEST_CLOSE_SAVE"),
+                     menu = setting("FCI_TEST_MENU_SAVE");
     static int count = 0;
-    if (!kill && !close) return;
+    if (!kill && !close && !menu) return;
     count++;
+    // to this process's window: WM_CLOSE, or F10 pressed and let go (any other message)
+    static const auto post = [](UINT msg) {
+        EnumWindows(
+            [](HWND w, LPARAM m) -> BOOL {
+                DWORD pid = 0;
+                wchar_t cls[32] = {};
+                GetWindowThreadProcessId(w, &pid);
+                if (pid != GetCurrentProcessId() || !GetClassNameW(w, cls, 32) || wcscmp(cls, L"FarCryInstincts")) return TRUE;
+                if (m == WM_CLOSE) return PostMessageW(w, WM_CLOSE, 0, 0), FALSE;
+                const LPARAM scan = LPARAM(MapVirtualKeyW(VK_F10, MAPVK_VK_TO_VSC)) << 16;
+                PostMessageW(w, WM_SYSKEYDOWN, VK_F10, 1 | scan);
+                PostMessageW(w, WM_SYSKEYUP, VK_F10, 1 | scan | LPARAM(0xC0000000u));
+                return FALSE;
+            },
+            LPARAM(msg));
+    };
+    if (count == menu) {
+        rt::Log("save: FCI_TEST_MENU_SAVE: settings menu opened at change %d (%s)", count, Narrow(host.wstring()).c_str());
+        post(WM_SYSKEYDOWN);
+    }
     if (count == kill) {
         rt::Log("save: FCI_TEST_KILL_SAVE: killed at change %d (%s)", count, Narrow(host.wstring()).c_str());
         rt::FlushLog();
@@ -372,16 +408,7 @@ void TestEnd(const fs::path& host) {
     }
     if (count == close) {
         rt::Log("save: FCI_TEST_CLOSE_SAVE: window closed at change %d (%s)", count, Narrow(host.wstring()).c_str());
-        EnumWindows(
-            [](HWND w, LPARAM) -> BOOL {
-                DWORD pid = 0;
-                wchar_t cls[32] = {};
-                GetWindowThreadProcessId(w, &pid);
-                if (pid != GetCurrentProcessId() || !GetClassNameW(w, cls, 32) || wcscmp(cls, L"FarCryInstincts")) return TRUE;
-                PostMessageW(w, WM_CLOSE, 0, 0);
-                return FALSE;
-            },
-            0);
+        post(WM_CLOSE);
     }
 }
 
@@ -466,7 +493,7 @@ void CheckSaves() {
 
 void NoteSaveChange(const fs::path& host) {
     std::unique_lock lock(g_lock);
-    if (!SaveGuardOff() && g_ending && g_writers == 0 && GetTickCount64() - g_last_change >= g_ending_quiet) {
+    if (!SaveGuardOff() && g_ending && g_writers == 0 && GuestMs() - g_last_change >= g_ending_quiet) {
         // the process ends and the last save is done: a new one would be cut, so it never starts (a change right
         // after the last one is the next step of the same save and goes on)
         lock.unlock();
@@ -474,7 +501,7 @@ void NoteSaveChange(const fs::path& host) {
         rt::CpuUnlock unlock;
         Sleep(INFINITE);
     }
-    g_last_change = GetTickCount64();
+    g_last_change = GuestMs();
     TestEnd(host);
     // the profile folder: UDATA\55530008\<id>\<file> (the host path is the device folder and the guest's path)
     const std::wstring root = Lower(UserData().wstring()) + L"\\", path = Lower(host.wstring());
@@ -488,13 +515,13 @@ void NoteSaveChange(const fs::path& host) {
 void SaveWriterOpened() {
     std::lock_guard lock(g_lock);
     g_writers++;
-    g_last_change = GetTickCount64();
+    g_last_change = GuestMs();
 }
 
 void SaveWriterClosed() {
     std::lock_guard lock(g_lock);
     g_writers--;
-    g_last_change = GetTickCount64();
+    g_last_change = GuestMs();
     g_changed.notify_all();
 }
 
@@ -508,7 +535,7 @@ void FinishSaves(const char* why, uint32_t max_ms, uint32_t quiet_ms) {
     bool waited = false;
     for (;;) {
         const uint64_t now = GetTickCount64();
-        if (g_writers == 0 && now - g_last_change >= quiet_ms) break;
+        if (g_writers == 0 && GuestMs() - g_last_change >= quiet_ms) break;
         if (now - start >= max_ms) {
             rt::Log("save: %s: a save still runs after %u ms (%d files open), ending anyway", why, max_ms, g_writers);
             return;

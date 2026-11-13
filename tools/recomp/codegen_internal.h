@@ -24,7 +24,16 @@ constexpr uint32_t kBaseDispLimit = 0x01000000;
 //                            the base register (BaseR32 ...; default on: 5 % less code, Deck guest -2.4 %)
 //   FCI_RECOMP_XMM_LIVE=1    xmm liveness across calls/returns (xmm_live.cpp; off: no measurable gain:
 //                            the unions over indirect calls keep nearly every register live)
+//   FCI_RECOMP_EBP_FRAME=0   [ebp + disp] accesses where ebp is a frame pointer checked again like any other base
+//                            (default: RAM without a check, as through esp)
 inline bool XmmLiveOn() { static const bool on = std::getenv("FCI_RECOMP_XMM_LIVE") != nullptr; return on; }
+inline bool EbpFrameOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("FCI_RECOMP_EBP_FRAME");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
 inline bool BaseCheckOn() {
     static const bool on = [] {
         const char* v = std::getenv("FCI_RECOMP_BASE_CHECK");
@@ -44,6 +53,7 @@ struct Decoded {
     bool falls_through = true;
     bool exits = false;     // control may leave the function without a call (flags pass through Cpu)
     uint32_t live_out = 0;  // status flags read after this instruction
+    bool ebp_frame = false;  // FramePointer: ebp holds a stack address (set from esp) on every path to here
 };
 
 class FunctionWriter {
@@ -62,6 +72,7 @@ public:
 private:
     void Prepare();
     void Liveness();
+    void FramePointer();
     uint32_t ExitFlags(const Decoded& d) const;  // flags live where d leaves the function without a call
 
     // instruction level, codegen_insn.cpp; false when the instruction has no translation

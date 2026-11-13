@@ -815,6 +815,9 @@ const float* trace_swim = [] {
 }();
 float g_edge_trace = 1.0f;  // the traced entity's last step-down factor (Game_LivingMove)
 bool g_hold_trace = false;  // and whether its landing was held
+float g_mv_trace[12];       // the traced entity's move: velocity before/after, the move, the ground normal before
+uint32_t g_mv_fly[2];       // and its flying flag before/after
+float g_step_v0[8];         // at the step's start: velocity, ground normal, +0x1C8, +0x1C4
 uint32_t g_swim_living = 0, g_swim_player = 0;  // the local player's living entity and CPlayer (camera update)
 
 // FCI_TRACE_SWIM_NAME=<entity name>: trace that entity (e.g. an AI) instead of the local player
@@ -867,6 +870,14 @@ void TraceSwim(uint32_t living, float dt, float z0, float vz0, float scale) {
     const uint32_t ground = R32(living + 0x200);
     std::fprintf(out, " gnd %08X %08X gv %.3f %.3f %.3f", ground, ground ? R32(ground) : 0u, f(0x214), f(0x218),
                  f(0x21C));
+    // the move of this step: velocity before -> after it, the move vector, the ground normal before, flying
+    const float* m = g_mv_trace;
+    std::fprintf(out, " | mv v %.3f %.3f %.3f -> %.3f %.3f %.3f d %.4f %.4f %.4f n0 %.3f %.3f %.3f fly %u>%u", m[0], m[1],
+                 m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], g_mv_fly[0], g_mv_fly[1]);
+    const float* s0 = g_step_v0;
+    std::fprintf(out, " | v0 %.3f %.3f %.3f n %.3f %.3f %.3f c8 %.3f c4 %.3f", s0[0], s0[1], s0[2], s0[3], s0[4], s0[5],
+                 s0[6], s0[7]);
+    std::fprintf(out, " | 740 %.3f 744 %.3f", f(0x740), f(0x744));
     std::fprintf(out, "\n");
 }
 }  // namespace
@@ -926,6 +937,13 @@ HLE_THISCALL(Game_LivingStep, 1) {
     const bool trace = trace_swim && living == g_swim_living && xdk::LevelSeconds() >= trace_swim[0] &&
                        xdk::LevelSeconds() <= trace_swim[1];
     const float z0 = trace ? xdk::GF(living + 0x120) : 0, vz0 = trace ? xdk::GF(living + 0x12C) : 0;
+    if (trace) {  // "v0": the state at the step's start
+        for (int i = 0; i < 3; i++) {
+            g_step_v0[i] = xdk::GF(living + 0x124 + 4 * i);
+            g_step_v0[3 + i] = xdk::GF(living + 0x148 + 4 * i);
+        }
+        g_step_v0[6] = xdk::GF(living + 0x1C8), g_step_v0[7] = xdk::GF(living + 0x1C4);
+    }
     const uint32_t r = xdk::CallOriginal(c, GUEST_ORIG(Game_LivingStep));
     if (scale != 1.0f)
         for (int i = 0; i < 3; i++) SetF(living + 0x13C + 4 * i, keep[i]);
@@ -984,7 +1002,20 @@ HLE_STDCALL(Game_LivingMove, 3) {
                       double(xdk::GF(living + 0x1C4)) + 1.5 * dt < double(kConsoleStep);
     if (living == g_swim_living) g_hold_trace = hold;
     if (hold) rt::W32(living + 0x73C, 1);
+    const bool tr_mv = trace_swim && living == g_swim_living;  // FCI_TRACE_SWIM: "mv", the move of this step
+    if (tr_mv) {
+        for (int i = 0; i < 3; i++) {
+            g_mv_trace[i] = xdk::GF(living + 0x124 + 4 * i);
+            g_mv_trace[6 + i] = xdk::GF(pmove + 4 * i);
+            g_mv_trace[9 + i] = xdk::GF(living + 0x148 + 4 * i);
+        }
+        g_mv_fly[0] = R32(living + 0x1A8);
+    }
     const uint32_t r = LivingMoveSwim(c, living, pdt, pmove);
+    if (tr_mv) {
+        for (int i = 0; i < 3; i++) g_mv_trace[3 + i] = xdk::GF(living + 0x124 + 4 * i);
+        g_mv_fly[1] = R32(living + 0x1A8);
+    }
     if (hold) rt::W32(living + 0x73C, 0);
     if (edge) std::memcpy(rt::Host(kEdgeAngleAt), &game_angle, 8);
     return r;
