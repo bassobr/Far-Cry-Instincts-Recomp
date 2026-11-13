@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.1 (2026-11-13)
+
+- **F10 menu with a controller:** after you changed a value with left or right (for example FIELD OF VIEW), down
+  stopped at the first row the list had to scroll for (HDR10 OUTPUT on a 1440p screen), and the next left or right
+  changed that row instead of moving on, so Exit Game at the bottom couldn't be reached. Each row's focus box was a
+  few pixels wider than the list, so with a controller the menu took every row for one outside the view and lost its
+  place after a value change. The rows now end at the list's edges; down goes all the way to the last row and on to
+  Exit Game. The keyboard and the mouse weren't affected, and the menu looks the same.
+- The game code is rebuilt once on the first start after updating (about 1 min on a desktop PC, about 5.5 min on the
+  Steam Deck); saves carry over.
+
 ## 0.9.0 (2026-11-13)
 
 0.9 is the feature freeze before 1.0: no new features from here on, only fixes from a full playthrough and from your

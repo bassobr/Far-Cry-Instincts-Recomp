@@ -589,7 +589,16 @@ int OptionRow(const char* label, const char* value, const char* note, bool* focu
     RowBox box = MeasureRow();
     ImGui::PushID(label);
     int step = 0;
-    if (ImGui::Selectable("##row", false, ImGuiSelectableFlags_AllowOverlap, ImVec2(box.row_w, box.row_h))) step = 1;
+    // the row's box ends at the list's edges: a Selectable reaches half the item spacing further each side (clipped,
+    // so neither drawn nor hovered there). With a controller ImGui took such a row for one outside the view on every
+    // move, dropped the focus and started from the visible part of the row; after a Left / Right (a value changed)
+    // its own row then counted as the next row down at the first row the list had to scroll for (HDR10 OUTPUT on a
+    // 1440 line window), and Down stopped there.
+    const float half_x = std::floor(style.ItemSpacing.x * 0.5f);
+    ImGui::SetCursorPosX(box.row_x + half_x);
+    if (ImGui::Selectable("##row", false, ImGuiSelectableFlags_AllowOverlap,
+                          ImVec2(box.row_w - style.ItemSpacing.x, box.row_h)))
+        step = 1;
     *focused = ImGui::IsItemFocused() || ImGui::IsItemHovered();
     if (ImGui::IsItemFocused()) {
         ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
@@ -1062,6 +1071,11 @@ void DrawPanel() {
         if (g_page == kKeyboardPage) DrawKeyboard();
         else if (g_page == kControllerPage) DrawController();
         else DrawSettings();
+        // the list ends where the last row's box does (half the item spacing below it, see OptionRow): scrolled to
+        // the end, the last row is in view for the controller's moves too
+        const float below = ImGui::GetStyle().ItemSpacing.y - std::floor(ImGui::GetStyle().ItemSpacing.y * 0.5f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - ImGui::GetStyle().ItemSpacing.y + below);
+        ImGui::Dummy(ImVec2(0, 0));
         ImGui::EndChild();
         ImGui::Separator();
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
